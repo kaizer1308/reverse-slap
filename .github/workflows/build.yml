@@ -1,0 +1,73 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 120
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # the runner image has neither the wdk nor this exact sdk, the driver
+      # compiles straight against the kit headers with cl and the mapper
+      # links ntdll.lib out of it, so both installs are needed
+      # exit codes are only logged, the verify step below is the real gate
+      # since setup exes like returning 3010 for reboot required
+      - name: install windows sdk 26100
+        shell: pwsh
+        run: |
+          curl.exe -L -o sdksetup.exe "https://go.microsoft.com/fwlink/?linkid=2338977"
+          $p = Start-Process -FilePath ".\sdksetup.exe" -ArgumentList "/q","/norestart","/ceip","off" -Wait -PassThru
+          Write-Host "sdksetup exit code: $($p.ExitCode)"
+
+      - name: install wdk 26100
+        shell: pwsh
+        run: |
+          curl.exe -L -o wdksetup.exe "https://go.microsoft.com/fwlink/?linkid=2335869"
+          $p = Start-Process -FilePath ".\wdksetup.exe" -ArgumentList "/q","/norestart","/ceip","off" -Wait -PassThru
+          Write-Host "wdksetup exit code: $($p.ExitCode)"
+
+      # fail here in seconds instead of an hour into the c++ build
+      - name: verify the kit files
+        shell: pwsh
+        run: |
+          $kit = 'C:\Program Files (x86)\Windows Kits\10'
+          foreach ($p in @(
+              "$kit\Include\10.0.26100.0\km\ntifs.h",
+              "$kit\Include\10.0.26100.0\shared\ntdef.h",
+              "$kit\Lib\10.0.26100.0\km\x64\ntoskrnl.lib",
+              "$kit\Lib\10.0.26100.0\km\x64\libcntpr.lib",
+              "$kit\Lib\10.0.26100.0\um\x64\ntdll.lib")) {
+            if (-not (Test-Path -LiteralPath $p)) { throw "kit file missing: $p" }
+          }
+
+      # the one true build, full mode so a missing component fails the run
+      # instead of quietly shipping a lesser bundle
+      - name: build everything
+        shell: pwsh
+        run: powershell -NoProfile -File tools\build.ps1 -Full
+
+      - name: upload the portable app
+        uses: actions/upload-artifact@v4
+        with:
+          name: reverse-slop-portable
+          path: |
+            dist/reverse-slop/reverse-slop.exe
+            dist/reverse-slop/engine
+          if-no-files-found: error
+
+      - name: upload the installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: reverse-slop-setup
+          path: app/src-tauri/target/release/bundle/nsis/*-setup.exe
+          if-no-files-found: error
