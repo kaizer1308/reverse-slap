@@ -4,6 +4,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { Check, Copy, X } from "lucide-react";
+import logoUrl from "@/assets/reverse-slop-icon.png";
 import { call, getEndpoint } from "@/lib/rpc";
 import { copyText } from "@/lib/clipboard";
 import { useEngine } from "@/store/engine";
@@ -84,6 +85,14 @@ export default function SettingsModal({ onClose }: Props) {
         </div>
 
         <div className="modal-body">
+          <div className="settings-brand">
+            <img src={logoUrl} alt="reverse-slop" draggable={false} />
+            <div className="settings-brand-name">reverse-slop</div>
+            <div className="settings-brand-sub">
+              v0.1.0 · {backend.badge} engine
+            </div>
+          </div>
+
           <div className="settings-group">
             <div className="settings-label">Theme</div>
             <div style={{ display: "flex", gap: "var(--pad-sm)" }}>

@@ -1013,6 +1013,32 @@ input {
   color: var(--text-dim);
 }
 
+/* brand header, the ida about style: centered logo, name and a live sub line */
+.settings-brand {
+  display: grid;
+  justify-items: center;
+  gap: 6px;
+  margin-bottom: var(--pad-lg);
+  padding-bottom: var(--pad-lg);
+  border-bottom: 1px solid var(--border);
+}
+
+.settings-brand img {
+  width: 56px;
+  height: 56px;
+}
+
+.settings-brand-name {
+  font-size: var(--type-body);
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.settings-brand-sub {
+  font-size: 11px;
+  color: var(--text-faint);
+}
+
 .settings-rows {
   margin-top: var(--pad-sm);
   font-size: 12px;
