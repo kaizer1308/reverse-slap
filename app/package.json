@@ -1,0 +1,36 @@
+{
+  "name": "reverse-slop-ui",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit",
+    "check:api": "node scripts/check-api.mjs",
+    "icons": "node scripts/gen-icons.mjs",
+    "tauri": "tauri"
+  },
+  "dependencies": {
+    "@fontsource-variable/inter": "^5.1.1",
+    "@fontsource/jetbrains-mono": "^5.1.2",
+    "@tanstack/react-query": "5.62.11",
+    "@tanstack/react-virtual": "3.11.2",
+    "@tauri-apps/api": "2.2.0",
+    "@tauri-apps/plugin-dialog": "2.2.0",
+    "cmdk": "1.0.4",
+    "lucide-react": "0.469.0",
+    "react": "18.3.1",
+    "react-dom": "18.3.1",
+    "zustand": "5.0.2"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "2.2.2",
+    "@types/react": "18.3.18",
+    "@types/react-dom": "18.3.5",
+    "@vitejs/plugin-react": "4.3.4",
+    "typescript": "5.7.2",
+    "vite": "6.0.7"
+  }
+}

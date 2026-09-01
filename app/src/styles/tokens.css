@@ -1,0 +1,92 @@
+/* app/src/styles/tokens.css
+ *
+ * Direct port of src/ui/tokens.hpp and the three palettes in src/ui/theme.cpp.
+ * The ImGui theme engine already stored the design system as data (16 named
+ * colours plus spacing/radius/type scales per theme), so this is a transcription
+ * rather than a redesign, same values, converted from 0..1 floats to sRGB.
+ *
+ * Swap themes by setting `data-theme` on <html>. The accent override the Theme
+ * menu offered maps to setting --accent inline on the same element; the hover
+ * and active steps derive from it in CSS, matching WriteStyle()'s +0.06/+0.12
+ * lightening
+ */
+
+:root {
+  /* Tokens{}, identical across themes today, kept per-theme-able */
+  --pad-xs: 4px;
+  --pad-sm: 6px;
+  --pad-md: 10px;
+  --pad-lg: 16px;
+
+  --radius-sm: 3px;
+  --radius-md: 5px;
+  --radius-lg: 8px;
+
+  --type-body: 15px;
+  --type-small: 13px;
+  --type-header: 18px;
+  --type-mono: 14px;
+
+  /* Shell metrics the mockup implies */
+  --titlebar-h: 32px;
+  --statusbar-h: 24px;
+  --rail-w: 46px;
+  --tabbar-h: 34px;
+
+  --font-ui: "Inter Variable", "Inter", "Segoe UI Variable Text", "Segoe UI",
+    system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", "Cascadia Mono", "Consolas", ui-monospace, monospace;
+
+  /* Derived from --accent so an override stays consistent */
+  --accent-hover: color-mix(in srgb, var(--accent) 82%, white);
+  --accent-active: color-mix(in srgb, var(--accent) 64%, white);
+  --selection: color-mix(in srgb, var(--accent) 35%, transparent);
+}
+
+[data-theme="obsidian"] {
+  --bg-0: #08080a;
+  --bg-1: #0e0f11;
+  --bg-2: #131416;
+  --surface: rgb(22 23 27 / 98%);
+  --border: #242529;
+  --border-soft: #1a1b1d;
+  --text: #dbdee6;
+  --text-dim: #9ea2a8;
+  --text-faint: #7a7e85;
+  --accent: #2eb8a6;
+  --success: #59c76b;
+  --warning: #f2bf33;
+  --danger: #e65959;
+}
+
+[data-theme="nord-slop"] {
+  --bg-0: #2e3440;
+  --bg-1: #3b4252;
+  --bg-2: #434c5e;
+  --surface: rgb(76 86 106 / 98%);
+  --border: #374051;
+  --border-soft: #323845;
+  --text: #eceff4;
+  --text-dim: #bdc3d0;
+  --text-faint: #838ca2;
+  --accent: #88c0d0;
+  --success: #a3be8c;
+  --warning: #ebcb8b;
+  --danger: #bf616a;
+}
+
+[data-theme="blood-orange"] {
+  --bg-0: #0e0b0b;
+  --bg-1: #161212;
+  --bg-2: #1c1717;
+  --surface: rgb(33 27 27 / 98%);
+  --border: #302525;
+  --border-soft: #241c1c;
+  --text: #f0e6e0;
+  --text-dim: #b8a69e;
+  --text-faint: #8a7a73;
+  --accent: #f26b38;
+  --success: #99c76b;
+  --warning: #facc52;
+  --danger: #e64d4d;
+}

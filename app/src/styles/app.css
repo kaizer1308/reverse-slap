@@ -1,0 +1,1367 @@
+/* app/src/styles/app.css, the shell. Mirrors the layout in rework_ui.png:
+ * rail | targets | (scanner | workspace) over output | inspector, with a
+ * titlebar above and a status bar below.
+ *
+ * Deliberately a fixed shell rather than free docking. ImGui's DockBuilder
+ * allowed arbitrary rearrangement, but the target design is a VS Code-style
+ * layout with splitters, and a CSS grid expresses that directly
+ */
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+  overflow: hidden;
+}
+
+body {
+  /* Opaque on purpose. An acrylic backdrop (transparent window + window-vibrancy)
+     makes DWM re-blur behind the frame on every move, and on Windows 10 that
+     path throttles window dragging badly, the window trails the cursor. The
+     mockup has no desktop bleed-through anyway, so translucency bought nothing.
+     Windows 11 Mica does not have this problem if we ever want the effect back */
+  background: var(--bg-0);
+  color: var(--text);
+  font-family: var(--font-ui);
+  font-size: var(--type-body);
+  -webkit-font-smoothing: antialiased;
+  user-select: none;
+  cursor: default;
+}
+
+button {
+  font: inherit;
+  color: inherit;
+  background: none;
+  border: none;
+  cursor: default;
+}
+
+input {
+  font: inherit;
+  color: inherit;
+}
+
+.mono {
+  font-family: var(--font-mono);
+  font-size: var(--type-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.dim {
+  color: var(--text-dim);
+}
+
+.faint {
+  color: var(--text-faint);
+}
+
+/* --- app frame ----------------------------------------------------------- */
+
+.app {
+  display: grid;
+  grid-template-rows: var(--titlebar-h) 1fr var(--statusbar-h);
+  height: 100%;
+  background: var(--bg-0);
+}
+
+.app-body {
+  display: grid;
+  /* Splitters occupy their own tracks so they never overlap panel content */
+  grid-template-columns:
+    var(--rail-w) var(--left-w, 300px) 4px
+    minmax(0, 1fr) 4px var(--right-w, 320px);
+  min-height: 0;
+}
+
+.center-col {
+  display: grid;
+  grid-template-rows: minmax(0, 1fr) 4px var(--bottom-h, 260px);
+  min-height: 0;
+  min-width: 0;
+}
+
+.center-top {
+  display: grid;
+  grid-template-columns: var(--scan-w, 316px) 4px minmax(0, 1fr);
+  min-height: 0;
+  min-width: 0;
+}
+
+/* --- titlebar ------------------------------------------------------------ */
+
+.titlebar {
+  display: flex;
+  align-items: center;
+  gap: var(--pad-sm);
+  padding-left: var(--pad-sm);
+  background: color-mix(in srgb, var(--bg-1) 82%, transparent);
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.titlebar-drag {
+  flex: 1;
+  align-self: stretch;
+}
+
+.brand {
+  display: grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  color: var(--accent);
+}
+
+.menu-root {
+  position: relative;
+}
+
+.menu-button {
+  padding: 3px var(--pad-md);
+  font-size: var(--type-small);
+  color: var(--text-dim);
+  border-radius: var(--radius-sm);
+}
+
+.menu-button:hover,
+.menu-button[data-open="true"] {
+  color: var(--text);
+  background: var(--bg-2);
+}
+
+.menu-pop {
+  position: absolute;
+  top: calc(100% + 2px);
+  left: 0;
+  z-index: 40;
+  min-width: 210px;
+  padding: var(--pad-xs);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  box-shadow: 0 10px 28px rgb(0 0 0 / 45%);
+}
+
+.menu-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--pad-lg);
+  width: 100%;
+  padding: 5px var(--pad-sm);
+  font-size: var(--type-small);
+  text-align: left;
+  border-radius: var(--radius-sm);
+}
+
+.menu-item:hover:not(:disabled) {
+  background: var(--accent);
+  color: var(--bg-0);
+}
+
+.menu-item:disabled {
+  color: var(--text-faint);
+}
+
+.menu-sep {
+  height: 1px;
+  margin: var(--pad-xs) var(--pad-sm);
+  background: var(--border-soft);
+}
+
+.win-buttons {
+  display: flex;
+}
+
+.win-button {
+  display: grid;
+  place-items: center;
+  width: 46px;
+  height: var(--titlebar-h);
+  color: var(--text-dim);
+}
+
+.win-button:hover {
+  color: var(--text);
+  background: var(--bg-2);
+}
+
+.win-button.close:hover {
+  color: #fff;
+  background: var(--danger);
+}
+
+/* --- activity rail ------------------------------------------------------- */
+
+.rail {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--pad-xs);
+  padding: var(--pad-sm) 0;
+  background: color-mix(in srgb, var(--bg-1) 70%, transparent);
+  border-right: 1px solid var(--border-soft);
+}
+
+.rail-spacer {
+  flex: 1;
+}
+
+.rail-button {
+  position: relative;
+  display: grid;
+  place-items: center;
+  width: 34px;
+  height: 34px;
+  color: var(--text-faint);
+  border-radius: var(--radius-md);
+}
+
+.rail-button:hover {
+  color: var(--text);
+  background: var(--bg-2);
+}
+
+.rail-button[data-active="true"] {
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+}
+
+/* The active marker in the mockup: a short accent bar on the rail's edge. It is
+   always present so its scale can be transitioned; see the motion section */
+.rail-button::before {
+  content: "";
+  position: absolute;
+  left: -6px;
+  width: 2px;
+  height: 18px;
+  background: var(--accent);
+  border-radius: 1px;
+}
+
+/* --- panels -------------------------------------------------------------- */
+
+.panel {
+  display: grid;
+  grid-template-rows: auto 1fr;
+  min-width: 0;
+  min-height: 0;
+  background: color-mix(in srgb, var(--bg-1) 62%, transparent);
+  border-right: 1px solid var(--border-soft);
+}
+
+.panel:last-child {
+  border-right: none;
+}
+
+.panel-head {
+  display: flex;
+  align-items: center;
+  gap: var(--pad-sm);
+  height: var(--tabbar-h);
+  padding: 0 var(--pad-sm) 0 var(--pad-md);
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.panel-title {
+  font-size: var(--type-small);
+  font-weight: 500;
+}
+
+.panel-body {
+  min-width: 0;
+  min-height: 0;
+  overflow: auto;
+}
+
+.icon-button {
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  color: var(--text-faint);
+  border-radius: var(--radius-sm);
+}
+
+.icon-button:hover {
+  color: var(--text);
+  background: var(--bg-2);
+}
+
+.spacer {
+  flex: 1;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.spin {
+  animation: spin 900ms linear infinite;
+}
+
+/* --- search / select ----------------------------------------------------- */
+
+.search {
+  display: flex;
+  align-items: center;
+  gap: var(--pad-sm);
+  margin: var(--pad-sm) var(--pad-md);
+  padding: 0 var(--pad-sm);
+  color: var(--text-faint);
+  background: var(--bg-0);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+}
+
+.search:focus-within {
+  border-color: var(--accent);
+}
+
+.search input {
+  flex: 1;
+  padding: 5px 0;
+  font-size: var(--type-small);
+  background: none;
+  border: none;
+  outline: none;
+}
+
+.search input::placeholder {
+  color: var(--text-faint);
+}
+
+.select {
+  padding: 3px var(--pad-sm);
+  font-size: var(--type-small);
+  color: var(--text-dim);
+  background: var(--bg-0);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  outline: none;
+}
+
+.select:hover {
+  color: var(--text);
+  border-color: var(--accent);
+}
+
+/* --- tables -------------------------------------------------------------- */
+
+.table {
+  width: 100%;
+  font-size: var(--type-small);
+  border-collapse: collapse;
+}
+
+.table thead th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  padding: var(--pad-xs) var(--pad-sm);
+  font-weight: 500;
+  color: var(--text-faint);
+  text-align: left;
+  background: var(--bg-1);
+  border-bottom: 1px solid var(--border);
+}
+
+.table tbody td {
+  padding: 3px var(--pad-sm);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.table tbody tr:nth-child(even) {
+  background: rgb(255 255 255 / 3%);
+}
+
+.table tbody tr:hover {
+  background: var(--selection);
+}
+
+.table tbody tr[data-selected="true"] {
+  background: var(--selection);
+}
+
+.pill {
+  padding: 1px 5px;
+  font-size: 11px;
+  color: var(--text-dim);
+  background: var(--bg-2);
+  border-radius: var(--radius-sm);
+}
+
+.row-action {
+  padding: 1px var(--pad-sm);
+  font-size: 11px;
+  color: var(--text-dim);
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+
+.row-action:hover {
+  color: var(--bg-0);
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+/* --- tab strips ---------------------------------------------------------- */
+
+.tabs {
+  display: flex;
+  align-items: stretch;
+  height: var(--tabbar-h);
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.tab {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: var(--pad-sm);
+  padding: 0 var(--pad-md);
+  font-size: var(--type-small);
+  color: var(--text-faint);
+}
+
+.tab:hover {
+  color: var(--text-dim);
+}
+
+.tab[data-active="true"] {
+  color: var(--text);
+}
+
+/* Always rendered so the underline can animate its width; scaled to 0 unless
+   the tab is active (see the motion section) */
+.tab::after {
+  content: "";
+  position: absolute;
+  inset: auto 0 -1px;
+  height: 2px;
+  background: var(--accent);
+}
+
+/* --- empty states -------------------------------------------------------- */
+
+.empty {
+  display: grid;
+  place-content: center;
+  justify-items: center;
+  gap: var(--pad-md);
+  height: 100%;
+  padding: var(--pad-lg);
+  text-align: center;
+}
+
+.empty-glyph {
+  display: grid;
+  place-items: center;
+  width: 72px;
+  height: 72px;
+  color: var(--text-faint);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+}
+
+.empty-title {
+  color: var(--text-dim);
+}
+
+.empty-hint {
+  font-size: var(--type-small);
+  color: var(--text-faint);
+}
+
+/* --- output pane --------------------------------------------------------- */
+
+.log {
+  padding: var(--pad-sm) var(--pad-md);
+  font-family: var(--font-mono);
+  font-size: var(--type-mono);
+  line-height: 1.45;
+  user-select: text;
+  cursor: text;
+}
+
+.log-row {
+  display: flex;
+  gap: var(--pad-md);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.log-time {
+  flex: none;
+  color: var(--accent);
+  opacity: 0.75;
+}
+
+.log-level {
+  flex: none;
+  width: 42px;
+  text-transform: uppercase;
+  font-size: 11px;
+}
+
+.log-level[data-level="warn"] {
+  color: var(--warning);
+}
+
+.log-level[data-level="error"] {
+  color: var(--danger);
+}
+
+.log-tag {
+  flex: none;
+  color: var(--text-faint);
+}
+
+/* --- status bar ---------------------------------------------------------- */
+
+.statusbar {
+  display: flex;
+  align-items: center;
+  gap: var(--pad-lg);
+  padding: 0 var(--pad-sm) 0 var(--pad-md);
+  font-size: 12px;
+  color: var(--text-dim);
+  background: color-mix(in srgb, var(--bg-1) 82%, transparent);
+  border-top: 1px solid var(--border-soft);
+}
+
+.status-pill {
+  display: flex;
+  align-items: center;
+  gap: var(--pad-sm);
+  white-space: nowrap;
+}
+
+.dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--text-faint);
+}
+
+.dot[data-state="ok"] {
+  background: var(--success);
+}
+
+.dot[data-state="busy"] {
+  background: var(--warning);
+}
+
+.dot[data-state="bad"] {
+  background: var(--danger);
+}
+
+.status-actions {
+  display: flex;
+  gap: 2px;
+}
+
+/* --- splitters ----------------------------------------------------------- */
+
+.splitter {
+  position: relative;
+  z-index: 5;
+  flex: none;
+  background: transparent;
+}
+
+.splitter[data-axis="x"] {
+  cursor: col-resize;
+}
+
+.splitter[data-axis="y"] {
+  cursor: row-resize;
+}
+
+.splitter:hover,
+.splitter[data-dragging="true"] {
+  background: var(--accent);
+}
+
+/* --- boot splash --------------------------------------------------------- */
+
+.splash {
+  display: grid;
+  place-items: center;
+  height: 100%;
+  background: var(--bg-0);
+}
+
+.splash-card {
+  width: min(620px, 86vw);
+  padding: var(--pad-lg);
+  background: var(--bg-1);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+}
+
+.splash-logo {
+  display: block;
+  width: 72px;
+  height: 72px;
+  margin-bottom: var(--pad-md);
+  border-radius: var(--radius-md);
+  user-select: none;
+}
+
+.splash-title {
+  font-size: var(--type-header);
+  font-weight: 600;
+}
+
+.splash-rows {
+  margin: var(--pad-md) 0;
+  font-family: var(--font-mono);
+  font-size: var(--type-mono);
+  line-height: 1.7;
+}
+
+.splash-row[data-status="ok"] {
+  color: var(--success);
+}
+
+.splash-row[data-status="run"] {
+  color: var(--warning);
+}
+
+.splash-row[data-status="wait"] {
+  color: var(--text-faint);
+}
+
+.progress {
+  height: 4px;
+  overflow: hidden;
+  background: var(--bg-2);
+  border-radius: 2px;
+}
+
+.progress-fill {
+  height: 100%;
+  background: var(--accent);
+  transition: width 180ms ease-out;
+}
+
+/* --- disassembly view ---------------------------------------------------- */
+
+.disasm {
+  display: grid;
+  grid-template-columns: minmax(180px, 260px) minmax(0, 1fr);
+  min-height: 0;
+  height: 100%;
+}
+
+.fn-list {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  min-height: 0;
+  border-right: 1px solid var(--border-soft);
+}
+
+.fn-row {
+  position: absolute;
+  left: 0;
+  display: flex;
+  align-items: center;
+  gap: var(--pad-sm);
+  width: 100%;
+  padding: 0 var(--pad-sm) 0 var(--pad-md);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+
+.fn-row:hover {
+  color: var(--text);
+  background: rgb(255 255 255 / 4%);
+}
+
+.fn-row[data-selected="true"] {
+  color: var(--text);
+  background: var(--selection);
+}
+
+.fn-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  flex: 1;
+}
+
+.fn-edit {
+  flex: none;
+  opacity: 0;
+}
+
+.fn-row:hover .fn-edit {
+  opacity: 0.6;
+}
+
+.fn-rename {
+  width: 100%;
+  padding: 0 2px;
+  font-size: 12px;
+  background: var(--bg-0);
+  border: 1px solid var(--accent);
+  border-radius: var(--radius-sm);
+  outline: none;
+}
+
+.listing {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  min-width: 0;
+  min-height: 0;
+}
+
+.listing-head {
+  display: flex;
+  align-items: center;
+  gap: var(--pad-md);
+  padding: var(--pad-sm) var(--pad-md);
+  font-size: 12px;
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.insn-row {
+  position: absolute;
+  left: 0;
+  display: flex;
+  align-items: center;
+  gap: var(--pad-md);
+  width: 100%;
+  padding: 0 var(--pad-md);
+  font-size: 12.5px;
+  white-space: pre;
+}
+
+.insn-row:hover {
+  background: rgb(255 255 255 / 4%);
+}
+
+.insn-va {
+  flex: none;
+  color: var(--text-faint);
+}
+
+.insn-text {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.insn-target {
+  flex: none;
+  padding: 0 var(--pad-sm);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-faint);
+  border-radius: var(--radius-sm);
+}
+
+.insn-target:hover {
+  color: var(--bg-0);
+  background: var(--accent);
+}
+
+/* --- shared view scaffolding --------------------------------------------- */
+
+.stack {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  min-height: 0;
+  height: 100%;
+}
+
+.view-bar {
+  display: flex;
+  align-items: center;
+  gap: var(--pad-md);
+  padding: var(--pad-sm) var(--pad-md);
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.view-label {
+  display: flex;
+  align-items: center;
+  gap: var(--pad-xs);
+  font-size: var(--type-small);
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+
+.view-label input[type="checkbox"] {
+  accent-color: var(--accent);
+}
+
+.link {
+  color: var(--text-faint);
+  text-decoration: none;
+}
+
+.link:hover {
+  color: var(--accent);
+  text-decoration: underline;
+}
+
+.tree > summary {
+  display: flex;
+  align-items: center;
+  gap: var(--pad-md);
+  padding: 3px var(--pad-md);
+  font-size: var(--type-small);
+  cursor: default;
+}
+
+.tree > summary:hover {
+  background: rgb(255 255 255 / 4%);
+}
+
+.tree > summary::marker {
+  color: var(--text-faint);
+}
+
+.tree-leaf {
+  padding: 2px var(--pad-md) 2px 32px;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.tree-leaf:hover {
+  background: rgb(255 255 255 / 3%);
+}
+
+/* --- hex editor ---------------------------------------------------------- */
+
+.mem {
+  display: grid;
+  grid-template-columns: 190px minmax(0, 1fr);
+  min-height: 0;
+  height: 100%;
+}
+
+.mem-regions {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  min-height: 0;
+  border-right: 1px solid var(--border-soft);
+}
+
+.addr-input {
+  width: 130px;
+  padding: 2px var(--pad-sm);
+  font-size: 12px;
+  background: var(--bg-0);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  outline: none;
+}
+
+.addr-input:focus {
+  border-color: var(--accent);
+}
+
+.hex-row {
+  position: absolute;
+  left: 0;
+  display: flex;
+  align-items: center;
+  gap: var(--pad-md);
+  width: 100%;
+  padding: 0 var(--pad-md);
+  font-size: 12.5px;
+  white-space: pre;
+}
+
+.hex-row:hover {
+  background: rgb(255 255 255 / 3%);
+}
+
+.hex-cells {
+  display: flex;
+  gap: 1px;
+}
+
+.hex-cell {
+  width: 20px;
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  color: var(--text);
+  text-align: center;
+  border-radius: 2px;
+}
+
+.hex-cell[data-zero="true"] {
+  color: var(--text-faint);
+}
+
+.hex-cell:hover {
+  color: var(--bg-0);
+  background: var(--accent);
+}
+
+.hex-edit {
+  width: 20px;
+  padding: 0;
+  font-size: 12.5px;
+  text-align: center;
+  color: var(--bg-0);
+  background: var(--accent);
+  border: none;
+  border-radius: 2px;
+  outline: none;
+}
+
+.hex-ascii {
+  color: var(--text-dim);
+  user-select: text;
+}
+
+/* --- debugger ------------------------------------------------------------ */
+
+.dbg {
+  display: grid;
+  grid-template-columns: 220px 1fr 1.4fr;
+  min-height: 0;
+  height: 100%;
+}
+
+.dbg-col {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  min-width: 0;
+  min-height: 0;
+  border-right: 1px solid var(--border-soft);
+}
+
+.dbg-col:last-child {
+  border-right: none;
+}
+
+.dbg-head {
+  display: flex;
+  align-items: center;
+  gap: var(--pad-sm);
+  padding: var(--pad-sm) var(--pad-md);
+  font-size: var(--type-small);
+  color: var(--text-dim);
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.code-area {
+  width: 100%;
+  height: 100%;
+  padding: var(--pad-sm) var(--pad-md);
+  font-size: var(--type-mono);
+  line-height: 1.5;
+  color: var(--text);
+  background: var(--bg-0);
+  border: none;
+  outline: none;
+  resize: none;
+  user-select: text;
+}
+
+/* --- modal / settings ---------------------------------------------------- */
+
+.modal-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: grid;
+  place-items: center;
+  background: rgb(0 0 0 / 55%);
+}
+
+.modal {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  width: min(620px, 88vw);
+  max-height: 76vh;
+  background: var(--bg-1);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  box-shadow: 0 18px 48px rgb(0 0 0 / 55%);
+}
+
+.modal-body {
+  padding: var(--pad-lg);
+  overflow: auto;
+}
+
+.settings-group {
+  margin-bottom: var(--pad-lg);
+}
+
+.settings-label {
+  margin-bottom: var(--pad-sm);
+  font-size: var(--type-small);
+  color: var(--text-dim);
+}
+
+.settings-rows {
+  margin-top: var(--pad-sm);
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--text-faint);
+}
+
+/* The MCP row carries a copy button beside the URL; the URL itself may
+   outrun a narrow modal, so it ellipsizes instead of wrapping */
+.settings-copy-row {
+  display: flex;
+  align-items: center;
+  gap: var(--pad-xs);
+}
+
+.settings-copy-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.settings-copy-row .icon-button {
+  flex: none;
+}
+
+.settings-status {
+  padding: var(--pad-sm) var(--pad-md);
+  font-size: var(--type-small);
+  color: var(--warning);
+  background: var(--bg-2);
+  border-radius: var(--radius-md);
+}
+
+.row-action[data-active="true"] {
+  color: var(--bg-0);
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+/* --- scrollbars ----------------------------------------------------------- */
+/* WebView2 ships Chromium's default chunky light scrollbar, which reads as a
+ * different application bolted onto the side of the panels. Thin, dark, and
+ * accent-on-drag instead. `scrollbar-gutter: stable` keeps content from
+ * shifting sideways when a list crosses the overflow threshold */
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border) transparent;
+}
+
+.panel-body,
+.modal-body,
+.code-area {
+  scrollbar-gutter: stable;
+}
+
+::-webkit-scrollbar {
+  width: 11px;
+  height: 11px;
+  background: transparent;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  /* Border trick: a transparent border with background-clip gives the thumb
+     inset padding without a wrapper element, so it floats clear of the edge */
+  background: var(--border);
+  background-clip: padding-box;
+  border: 3px solid transparent;
+  border-radius: 6px;
+  transition: background-color 120ms ease-out;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--text-faint);
+  background-clip: padding-box;
+}
+
+::-webkit-scrollbar-thumb:active {
+  background: var(--accent);
+  background-clip: padding-box;
+}
+
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+/* Chromium draws these as blank squares once the thumb is restyled */
+::-webkit-scrollbar-button {
+  display: none;
+}
+
+/* --- motion --------------------------------------------------------------- */
+/* One timing scale for the whole app so nothing feels out of step. Short
+ * enough that a workbench never feels like it is waiting on an animation */
+
+:root {
+  --ease: cubic-bezier(0.2, 0, 0.2, 1);
+  --fast: 90ms;
+  --med: 190ms;
+  --slow: 260ms;
+}
+
+@keyframes view-in {
+  from {
+    opacity: 0;
+    transform: translateY(7px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+/* Panels slide in from the rail side rather than upward, the horizontal motion
+   reads as "this replaced the thing next to the rail" */
+@keyframes panel-in {
+  from {
+    opacity: 0;
+    transform: translateX(-10px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes pop-in {
+  from {
+    opacity: 0;
+    transform: scale(0.97);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes tip-in {
+  from {
+    opacity: 0;
+    transform: translateY(3px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+/* --- tooltip -------------------------------------------------------------- */
+
+.tooltip {
+  position: fixed;
+  z-index: 90;
+  max-width: 320px;
+  padding: 4px var(--pad-sm);
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--text);
+  white-space: pre-line;
+  pointer-events: none;
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  box-shadow: 0 6px 18px rgb(0 0 0 / 45%);
+  /* The keyframe cannot animate transform here, the inline style owns it for
+     placement, so only opacity moves */
+  animation: tip-fade var(--fast) var(--ease);
+}
+
+@keyframes tip-fade {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+/* Keyed on the active view, so switching tabs replays it */
+.view-swap {
+  height: 100%;
+  min-height: 0;
+  animation: view-in var(--slow) var(--ease);
+}
+
+/* Panels are keyed by the activity rail, so this replays on every rail switch
+   as well as on first paint */
+.panel {
+  animation: panel-in var(--slow) var(--ease);
+}
+
+/* Animation only, no layout, for elements that already own their sizing
+   (a scrolling .panel-body, a table body) and just need the enter transition */
+.swap-fade {
+  animation: view-in var(--slow) var(--ease);
+}
+
+.modal {
+  animation: pop-in var(--med) var(--ease);
+}
+
+.modal-scrim {
+  animation: view-in var(--fast) var(--ease);
+}
+
+.menu-pop {
+  animation: pop-in var(--fast) var(--ease);
+  transform-origin: top left;
+}
+
+.empty {
+  animation: view-in var(--med) var(--ease);
+}
+
+/* --- press feedback ------------------------------------------------------- */
+/* Every clickable surface acknowledges the press. Scale is deliberately tiny
+ * (2-3%), enough to feel mechanical, not enough to look bouncy */
+
+.menu-button,
+.win-button,
+.rail-button,
+.icon-button,
+.row-action,
+.tab,
+.hex-cell,
+.insn-target,
+.select,
+.link {
+  transition:
+    background-color var(--fast) var(--ease),
+    color var(--fast) var(--ease),
+    border-color var(--fast) var(--ease),
+    transform var(--fast) var(--ease),
+    opacity var(--fast) var(--ease);
+}
+
+.icon-button:active,
+.row-action:active:not(:disabled),
+.rail-button:active,
+.hex-cell:active,
+.insn-target:active {
+  transform: scale(0.94);
+}
+
+.tab:active,
+.menu-button:active,
+.menu-item:active:not(:disabled) {
+  transform: scale(0.985);
+}
+
+.row-action:disabled,
+.icon-button:disabled {
+  opacity: 0.4;
+}
+
+.menu-item {
+  transition:
+    background-color var(--fast) var(--ease),
+    color var(--fast) var(--ease);
+}
+
+/* Rows are hovered constantly while scanning a list; keep theirs even shorter
+   so the highlight tracks the cursor instead of trailing it */
+.fn-row,
+.insn-row,
+.hex-row,
+.table tbody tr {
+  transition: background-color 60ms linear;
+}
+
+/* The rail's active marker grows from the centre rather than popping in */
+.rail-button::before {
+  transform: scaleY(0);
+  transition: transform var(--med) var(--ease);
+}
+
+.rail-button[data-active="true"]::before {
+  transform: scaleY(1);
+}
+
+/* The tab underline slides its width in from the active edge */
+.tab::after {
+  transform: scaleX(0);
+  transform-origin: center;
+  transition: transform var(--med) var(--ease);
+}
+
+.tab[data-active="true"]::after {
+  transform: scaleX(1);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  /* Only when the user has not explicitly asked for motion. This machine's
+     Windows animation setting is off, which Chromium reports here, honouring it
+     unconditionally meant the app could never animate at all */
+  html:not([data-motion="on"]) *,
+  html:not([data-motion="on"]) *::before,
+  html:not([data-motion="on"]) *::after {
+    animation-duration: 1ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 1ms !important;
+  }
+}
+
+html[data-motion="off"] *,
+html[data-motion="off"] *::before,
+html[data-motion="off"] *::after {
+  animation-duration: 1ms !important;
+  animation-iteration-count: 1 !important;
+  transition-duration: 1ms !important;
+}
+
+/* --- native control theming ---------------------------------------------- */
+/* The dropdown popup, selection highlight and focus ring are the remaining
+ * surfaces the platform draws in its own colours */
+
+.select option {
+  color: var(--text);
+  background: var(--bg-1);
+}
+
+::selection {
+  color: var(--text);
+  background: color-mix(in srgb, var(--accent) 45%, transparent);
+}
+
+/* Keyboard focus only, a visible ring on every mouse click would be noise */
+:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.search:focus-within,
+.addr-input:focus,
+.code-area:focus,
+.fn-rename:focus {
+  outline: none;
+}
+
+/* Chromium's default caret is fine, but the text cursor in the code panes reads
+   better at the accent colour against the dark editor background */
+.code-area,
+.addr-input,
+.search input,
+.fn-rename {
+  caret-color: var(--accent);
+}

@@ -1,0 +1,32 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 25,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    },
+    {
+      "name": "ninja-msvc-release",
+      "inherits": "base",
+      "displayName": "Ninja + MSVC Release",
+      "description": "Primary supported configuration for reverse-slop"
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "ninja-msvc-release",
+      "displayName": "Ninja + MSVC Release",
+      "configurePreset": "ninja-msvc-release"
+    }
+  ]
+}

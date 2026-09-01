@@ -1,0 +1,4 @@
+// src/app/app.rc — embeds the application manifest as RT_MANIFEST (ID 1).
+#include <winres.h>
+
+1 24 "app.manifest"
