@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="app/src-tauri/icons/256x256.png" width="144" alt="reverse-slop" />
+</p>
+
 # reverse-slop
 
 Windows reverse-engineering workbench with desktop interfaces, live process and
