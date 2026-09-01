@@ -24,6 +24,16 @@ reverse-slop is heavily inspired by [AiDA Private](https://github.com/sigwl/AiDA
 created by [sigwl](https://github.com/sigwl) (ruarridh). Most, if not almost all,
 of reverse-slop's feature set and feature concepts are based on that project.
 
+## Screenshots
+
+The main workspace, process list and disassembly side by side under the kernel badge:
+
+![main workspace](docs/reverse-slop-main.png)
+
+The strings view with search, UTF-16 flagging and xref counts:
+
+![strings view](docs/reverse-slop-strings.png)
+
 ## Highlights
 
 - **Two desktop interfaces, one core:** native ImGui/DX11 shell and Tauri v2 +
