@@ -1,5 +1,7 @@
+<!-- logo pinned to a commit so github's image cache can't serve a stale one,
+     bump the sha whenever the icon changes -->
 <p align="center">
-  <img src="app/src-tauri/icons/256x256.png" width="144" alt="reverse-slop" />
+  <img src="https://raw.githubusercontent.com/kaizer1308/reverse-slap/a61180fb51fc19141104a13a2caf6c33b9661bcc/app/src-tauri/icons/256x256.png" width="144" alt="reverse-slop" />
 </p>
 
 # reverse-slop
