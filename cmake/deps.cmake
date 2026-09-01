@@ -96,6 +96,13 @@ FetchContent_Declare(lua
     URL https://www.lua.org/ftp/lua-5.4.7.tar.gz
 )
 
+# httplib grabs openssl or zlib off the host when they happen to be installed,
+# which dragged libssl and libcrypto runtime dlls into the engine on the ci
+# runner, we serve plain loopback http so none of that is ever wanted
+set(HTTPLIB_USE_OPENSSL_IF_AVAILABLE OFF CACHE BOOL "" FORCE)
+set(HTTPLIB_USE_ZLIB_IF_AVAILABLE OFF CACHE BOOL "" FORCE)
+set(HTTPLIB_USE_BROTLI_IF_AVAILABLE OFF CACHE BOOL "" FORCE)
+
 FetchContent_MakeAvailable(freetype nlohmann_json zydis imgui httplib unicorn sqlite lua fmt spdlog capstone zlib_kr)
 
 # frida-core devkit
