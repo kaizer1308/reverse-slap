@@ -109,6 +109,11 @@ powershell -File tools/build.ps1 -PlanOnly
 
 # Select another preset if one has been added to CMakePresets.json
 powershell -File tools/build.ps1 -Preset ninja-msvc-release
+
+# Full installer: bundle the kernel driver, Magicmida, and the WebView2
+# runtime so the target machine needs nothing but Windows (no internet,
+# no WebView2, no dev tools). Fails instead of skipping a missing component
+powershell -File tools/build.ps1 -Full
 ```
 
 Default CMake options are all enabled:
@@ -157,6 +162,13 @@ The portable folder carries its own `engine\` directory, so it runs from a copy
 with no installer and no build tree. It needs the Microsoft Edge WebView2
 runtime, which ships with Windows 11 and current Windows 10; the NSIS installer
 downloads it when missing.
+
+Run the same command with `-Full` for a self-contained release installer: the
+setup exe embeds the WebView2 runtime (offline install, no download on the
+target machine) and hard-requires every optional component, so `slopdrvr.sys`,
+the Magicmida sidecars, and `slop_frida.dll` are always inside. The build fails
+loudly instead of silently shipping a degraded bundle when the WDK, network, or
+Magicmida is missing.
 
 Use `-NoFrontend` for a fast C++-only loop (skips Rust, npm, and the bundle).
 

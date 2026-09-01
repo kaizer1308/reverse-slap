@@ -4,6 +4,7 @@ param(
     [switch]$PlanOnly,
     [switch]$NoFrontend,
     [switch]$Test,
+    [switch]$Full,
     [string]$Preset = 'ninja-msvc-release'
 )
 
@@ -33,6 +34,9 @@ $vcvars = Join-Path $vsRoot 'VC\Auxiliary\Build\vcvars64.bat'
 Write-Host "==> repo:     $repoRoot"
 Write-Host "==> vs root:  $vsRoot"
 Write-Host "==> logs:     $logDir"
+if ($Full) {
+    Write-Host '==> full installer mode: driver, magicmida and the webview2 runtime are all required' -ForegroundColor Cyan
+}
 
 cmd /c "call `"$vcvars`" > NUL 2>&1 && set" | ForEach-Object {
     if ($_ -match '^([A-Za-z_][A-Za-z0-9_]*)=(.*)$') {
@@ -103,6 +107,7 @@ if (-not $NoFrontend) {
     # it when possible; the tauri resource filter below skips it when absent
     & powershell -NoProfile -File (Join-Path $PSScriptRoot 'build_slopdrvr.ps1')
     if ($LASTEXITCODE -ne 0) {
+        if ($Full) { throw 'driver build failed, the full installer bundles slopdrvr.sys (install the WDK)' }
         Write-Host '==> driver build failed (WDK missing?), bundling app without driver' -ForegroundColor Yellow
     }
 
@@ -114,6 +119,7 @@ if (-not $NoFrontend) {
     $magicmidaVersion = '2026-05-14' # sync with kVersion (magicmida.cpp) and $release (install_magicmida.ps1)
     & powershell -NoProfile -File (Join-Path $PSScriptRoot 'install_magicmida.ps1')
     if ($LASTEXITCODE -ne 0) {
+        if ($Full) { throw 'magicmida install failed, the full installer bundles the unpacker (network access needed)' }
         Write-Host '==> magicmida install failed (offline?), bundling without the unpacker' -ForegroundColor Yellow
     }
     $magicmidaLocal = Join-Path $env:LOCALAPPDATA "reverse-slop\tools\magicmida\$magicmidaVersion"
@@ -124,6 +130,7 @@ if (-not $NoFrontend) {
         Copy-Item -LiteralPath $magicmidaLocal -Destination $magicmidaStaged -Recurse
         Write-Host "==> magicmida staged: $magicmidaStaged"
     } else {
+        if ($Full) { throw "magicmida not installed at $magicmidaLocal, run tools/install_magicmida.ps1 first" }
         Write-Host '==> magicmida not installed, bundling without the unpacker' -ForegroundColor Yellow
     }
 
@@ -162,6 +169,7 @@ if (-not $NoFrontend) {
         foreach ($prop in $conf.bundle.resources.PSObject.Properties) {
             $src = Join-Path $repoRoot ($prop.Name -replace '^(\.\./)+', '')
             if (Test-Path -LiteralPath $src) { $resources[$prop.Name] = $prop.Value }
+            elseif ($Full) { throw "resource missing: $($prop.Name), the full installer bundles everything" }
             else { Write-Host "==> resource missing, skipping: $($prop.Name)" }
         }
         # The driver stays out of tauri.conf.json (tauri-build hard-fails on
@@ -170,15 +178,25 @@ if (-not $NoFrontend) {
         $driverSys = Join-Path $repoRoot 'build\driver\slopdrvr.sys'
         if (Test-Path -LiteralPath $driverSys) {
             $resources['../../build/driver/slopdrvr.sys'] = 'engine/slopdrvr.sys'
+        } elseif ($Full) {
+            throw 'slopdrvr.sys absent, the full installer bundles the kernel driver (WDK required)'
         } else {
             Write-Host '==> slopdrvr.sys absent, bundling without kernel driver'
         }
         if (Test-Path -LiteralPath $magicmidaStaged) {
             $resources['../../build/tools/magicmida'] = 'engine/tools/magicmida'
+        } elseif ($Full) {
+            throw 'magicmida absent, the full installer bundles the themida unpacker'
         } else {
             Write-Host '==> magicmida absent, bundling without the Themida unpacker'
         }
-        $override = @{ bundle = @{ resources = $resources } }
+        $bundleOverride = @{ resources = $resources }
+        if ($Full) {
+            # embed the whole webview2 runtime so a machine with neither
+            # webview2 nor internet still installs, adds ~130 MB to the setup exe
+            $bundleOverride['windows'] = @{ webviewInstallMode = @{ type = 'offlineInstaller' } }
+        }
+        $override = @{ bundle = $bundleOverride }
         $overridePath = Join-Path $appDir 'src-tauri\tauri.build.conf.json'
         $override | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $overridePath
         # The tauri CLI logs its progress to stderr, which under
@@ -191,7 +209,23 @@ if (-not $NoFrontend) {
         $ErrorActionPreference = $prevEap
         if ($tauriExit -ne 0) { throw "tauri build failed (exit $tauriExit), log: $(Join-Path $logDir 'tauri.log')" }
     } finally { Pop-Location }
-    Write-Host "==> installer: $(Join-Path $appDir 'src-tauri\target\release\bundle')"
+    $nsisDir = Join-Path $appDir 'src-tauri\target\release\bundle\nsis'
+    Write-Host "==> installer: $nsisDir"
+    if ($Full) {
+        # one place to see everything the setup exe carries, the whole point of
+        # the full build is that the target machine needs nothing else
+        $setup = Get-ChildItem -LiteralPath $nsisDir -Filter '*-setup.exe' -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime | Select-Object -Last 1
+        if ($setup) {
+            Write-Host "==> full setup exe: $($setup.Name) ($('{0:N1}' -f ($setup.Length / 1MB)) MB)" -ForegroundColor Cyan
+        }
+        Write-Host '==> full installer contents:'
+        Write-Host '    app + webview (offline runtime embedded, no download at install)'
+        Write-Host '    engine/reverse-slop-engine.exe, slop_frida.dll, slop_mapper.exe'
+        Write-Host '    engine/slopdrvr.sys (kernel driver)'
+        Write-Host '    engine/tools/magicmida (themida unpacker)'
+        Write-Host '    target machine needs: nothing but windows'
+    }
 
     # Portable layout: the exe plus the engine\ resource dir it looks for next to
     # itself, so the app runs off a copied folder with no installer and no build
