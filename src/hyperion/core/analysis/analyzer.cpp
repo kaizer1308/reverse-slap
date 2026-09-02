@@ -125,17 +125,36 @@ void Analyzer::run() {
     recursive_descent();   if (bail()) return; progress_ = 0.25f;
     detect_functions();    if (bail()) return; progress_ = 0.38f;
     rtti_.parse(img_, db_); if (bail()) return;
-    for (const auto& cls : rtti_.classes()) {
-        for (va_t method : cls.methods) {
-            if (!db_.funcs.count(method)) {
-                Function function;
-                function.entry = method;
-                auto name = db_.names.find(method);
-                function.name = name != db_.names.end() ? name->second : fmt::format("sub_{:X}", method - img_.base);
-                db_.add_func(std::move(function));
+    // Share the visited set across every RTTI descend call. The old code
+    // reset it per-method, so on huge binaries (300MB UE builds) we would
+    // re-decode the entire reachable graph tens of thousands of times.
+    // Skip descend outright when the method entry already has an insn
+    // decoded — .pdata + call-target discovery already covered it.
+    {
+        std::unordered_set<va_t> rtti_visited;
+        const auto& classes = rtti_.classes();
+        const size_t total = classes.size();
+        size_t seen_cls = 0;
+        const size_t report_step = total > 40 ? (total / 40) : 1;
+        for (const auto& cls : classes) {
+            for (va_t method : cls.methods) {
+                if (!db_.funcs.count(method)) {
+                    Function function;
+                    function.entry = method;
+                    auto name = db_.names.find(method);
+                    function.name = name != db_.names.end() ? name->second : fmt::format("sub_{:X}", method - img_.base);
+                    db_.add_func(std::move(function));
+                }
+                if (rtti_visited.count(method)) continue;
+                if (db_.insns.count(method)) { rtti_visited.insert(method); continue; }
+                descend(method, rtti_visited);
             }
-            std::unordered_set<va_t> visited;
-            descend(method, visited);
+            ++seen_cls;
+            if ((seen_cls % report_step) == 0) {
+                // slide progress from 0.38 -> 0.41 as classes are consumed
+                progress_ = 0.38f + 0.03f * (float(seen_cls) / float(total));
+                if (bail()) return;
+            }
         }
     }
     detect_thunks();       if (bail()) return; progress_ = 0.42f;

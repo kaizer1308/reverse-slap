@@ -150,14 +150,14 @@ TEST_CASE(mcp_ping_and_health) {
     REQUIRE_EQ(h.value("ok", false), true);
 }
 
-TEST_CASE(mcp_tools_list_twenty_two_consolidated) {
+TEST_CASE(mcp_tools_list_twenty_three_consolidated) {
     server_fixture_t fx;
     json res = fx.rpc("tools/list");
     const auto& tools = res.at("result").at("tools");
-    REQUIRE_EQ(tools.size(), 22u);
+    REQUIRE_EQ(tools.size(), 23u);
 
     bool seen_target = false, seen_memory = false, seen_disasm = false,
-         seen_debugger = false, seen_driver = false,
+         seen_debugger = false, seen_driver = false, seen_inject = false,
          seen_emulate = false, seen_analyze = false,
          seen_network = false, seen_proxy = false,
          seen_persist = false, seen_re = false, seen_script = false,
@@ -171,6 +171,7 @@ TEST_CASE(mcp_tools_list_twenty_two_consolidated) {
         if (n == "disasm")   seen_disasm = true;
         if (n == "debugger") seen_debugger = true;
         if (n == "driver")   seen_driver = true;
+        if (n == "inject")   seen_inject = true;
         if (n == "emulate")  seen_emulate = true;
         if (n == "analyze")  seen_analyze = true;
         if (n == "network")  seen_network = true;
@@ -202,6 +203,7 @@ TEST_CASE(mcp_tools_list_twenty_two_consolidated) {
     REQUIRE(seen_disasm);
     REQUIRE(seen_debugger);
     REQUIRE(seen_driver);
+    REQUIRE(seen_inject);
     REQUIRE(seen_emulate);
     REQUIRE(seen_analyze);
     REQUIRE(seen_network);

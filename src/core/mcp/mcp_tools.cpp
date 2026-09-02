@@ -50,6 +50,7 @@
 #include "core/process/process_icon.hpp"
 #include "core/re/rtti.hpp"
 #include "core/runtime/kernel_service.hpp"
+#include "core/runtime/kernel_injector.hpp"
 #include "core/runtime/kernel_symbols.hpp"
 #include "core/runtime/voyager_comm.h"
 #include "core/script/lua_engine.hpp"
@@ -2985,6 +2986,153 @@ json tool_driver(const json& args) {
          "integrity_checks|sniff_buffers)");
 }
 
+
+
+// tool: inject
+//
+// Kernel-assisted dll injection over slopdrvr. Every touch on the target
+// rides ioctls (allocate through KeStackAttachProcess, write via dtb physical
+// paths, execute via thread hijack with spoofed return), so the user-mode
+// side never opens the target and never spawns a remote thread. Two modes:
+//   loadlibrary -> resolve kernel32!LoadLibraryW in target, hijack a running
+//                  thread to call it. still fires PsSetLoadImageNotifyRoutine
+//                  because it goes through LdrLoadDll
+//   manual_map  -> map the DLL by hand: headers, sections, relocs, imports,
+//                  tls, DllMain via thread hijack. no LDR entry, no LoadImage
+//                  notify, optional PE header wipe and per-section reprotect
+//                  so the mapped image doesn't stand out to scan-based ac
+static json inject_result_to_json(const runtime::injector::inject_result_t& r) {
+    json log = json::array();
+    for (const auto& l : r.log)
+        log.push_back({{"stage", l.stage}, {"message", l.message}});
+    json out = {
+        {"ok", r.ok},
+        {"mode", r.mode},
+        {"pid", r.pid},
+        {"module_base", r.module_base},
+        {"module_size", r.module_size},
+        {"entry_point", r.entry_point},
+        {"dllmain_return", r.dllmain_return},
+        {"imports_resolved", r.imports_resolved},
+        {"imports_failed", r.imports_failed},
+        {"relocations_applied", r.relocations_applied},
+        {"sections_protected", r.sections_protected},
+        {"header_erased", r.header_erased},
+        {"peb_unlinked", r.peb_unlinked},
+        {"log", log},
+    };
+    if (!r.error.empty()) out["error"] = r.error;
+    return out;
+}
+
+static runtime::injector::inject_options_t parse_inject_options(const json& args) {
+    runtime::injector::inject_options_t o{};
+    if (args.contains("erase_pe_header"))
+        o.erase_pe_header = args.at("erase_pe_header").get<bool>();
+    if (args.contains("protect_sections"))
+        o.protect_sections = args.at("protect_sections").get<bool>();
+    if (args.contains("call_dllmain"))
+        o.call_dllmain = args.at("call_dllmain").get<bool>();
+    if (args.contains("call_tls_callbacks"))
+        o.call_tls_callbacks = args.at("call_tls_callbacks").get<bool>();
+    if (args.contains("unlink_peb"))
+        o.unlink_peb = args.at("unlink_peb").get<bool>();
+    if (args.contains("timeout_ms"))
+        o.call_timeout_ms = static_cast<uint32_t>(args.at("timeout_ms").get<uint32_t>());
+    return o;
+}
+
+json tool_inject(const json& args) {
+    const std::string action = require_action(args);
+
+    if (action == "status") {
+        auto* k = dynamic_cast<runtime::backend_kernel_t*>(&runtime::active());
+        return {{"kernel_active", k != nullptr},
+                {"driver_connected", k && k->device() && k->device()->is_connected()},
+                {"modes", json::array({"loadlibrary", "manual_map"})},
+                {"actions", json::array({"status", "find_module",
+                                         "resolve_export", "loadlibrary",
+                                         "manual_map", "unload"})}};
+    }
+
+    if (action == "find_module") {
+        if (!args.contains("pid")) fail("missing pid");
+        if (!args.contains("name")) fail("missing module name");
+        const uint32_t pid = static_cast<uint32_t>(parse_addr(args, "pid"));
+        std::string err;
+        auto b = runtime::injector::find_module_base(pid, args.at("name").get<std::string>(), &err);
+        if (!b) fail(err.empty() ? "module not found" : err);
+        return {{"pid", pid},
+                {"name", args.at("name")},
+                {"base", *b}};
+    }
+
+    if (action == "resolve_export") {
+        if (!args.contains("pid")) fail("missing pid");
+        if (!args.contains("module")) fail("missing module");
+        if (!args.contains("name")) fail("missing export name");
+        const uint32_t pid = static_cast<uint32_t>(parse_addr(args, "pid"));
+        std::string err;
+        auto va = runtime::injector::resolve_export(pid,
+                                           args.at("module").get<std::string>(),
+                                           args.at("name").get<std::string>(),
+                                           &err);
+        if (!va) fail(err.empty() ? "resolve failed" : err);
+        return {{"pid", pid},
+                {"module", args.at("module")},
+                {"name", args.at("name")},
+                {"address", *va}};
+    }
+
+    if (action == "loadlibrary") {
+        if (!args.contains("pid")) fail("missing pid");
+        if (!args.contains("dll_path"))
+            fail("missing dll_path (utf8, absolute path visible to target)");
+        const uint32_t pid = static_cast<uint32_t>(parse_addr(args, "pid"));
+        const std::string p = args.at("dll_path").get<std::string>();
+        const int wn = MultiByteToWideChar(CP_UTF8, 0, p.data(),
+                                           static_cast<int>(p.size()),
+                                           nullptr, 0);
+        std::wstring wp(wn > 0 ? static_cast<size_t>(wn) : 0, L'\0');
+        if (wn > 0)
+            MultiByteToWideChar(CP_UTF8, 0, p.data(), static_cast<int>(p.size()),
+                                wp.data(), wn);
+        auto opts = parse_inject_options(args);
+        auto r = runtime::injector::inject_loadlibrary(pid, wp, opts);
+        return inject_result_to_json(r);
+    }
+
+    if (action == "manual_map") {
+        if (!args.contains("pid")) fail("missing pid");
+        const uint32_t pid = static_cast<uint32_t>(parse_addr(args, "pid"));
+        auto opts = parse_inject_options(args);
+        runtime::injector::inject_result_t r;
+        if (args.contains("dll_hex") && args.at("dll_hex").is_string()) {
+            auto bytes = hex_decode(args.at("dll_hex").get<std::string>());
+            r = runtime::injector::inject_manual_map(pid, bytes, opts);
+        } else if (args.contains("dll_path") && args.at("dll_path").is_string()) {
+            r = runtime::injector::inject_manual_map_file(
+                pid, args.at("dll_path").get<std::string>(), opts);
+        } else {
+            fail("manual_map requires dll_hex OR dll_path");
+        }
+        return inject_result_to_json(r);
+    }
+
+    if (action == "unload") {
+        if (!args.contains("pid")) fail("missing pid");
+        if (!args.contains("base")) fail("missing module base");
+        const uint32_t pid = static_cast<uint32_t>(parse_addr(args, "pid"));
+        const uint64_t base = parse_addr(args, "base");
+        const bool mm = args.value("manual_mapped", false);
+        auto opts = parse_inject_options(args);
+        auto r = runtime::injector::unload(pid, base, mm, opts);
+        return inject_result_to_json(r);
+    }
+
+    fail("inject: unknown action (status|find_module|resolve_export|"
+         "loadlibrary|manual_map|unload)");
+}
 
 
 
@@ -6414,6 +6562,8 @@ void list_tools(json& out) {
         R"({"type":"object","properties":{"action":{"type":"string","enum":["read_file","write_file","list_directory","create_directory","delete_path","search_files","grep_in_files"]},"path":{"type":"string"},"hex":{"type":"string"},"text":{"type":"string"},"append":{"type":"boolean"},"root":{"type":"string"},"needle":{"type":"string"},"suffix":{"type":"string"},"limit":{"type":"integer"},"max_bytes":{"type":"integer"}},"required":["action"]})";
     const char* web_schema =
         R"({"type":"object","properties":{"action":{"type":"string","enum":["fetch","post"]},"url":{"type":"string"},"body":{"type":"string"},"content_type":{"type":"string"},"timeout_ms":{"type":"integer"}},"required":["action"]})";
+    const char* inject_schema =
+        R"({"type":"object","properties":{"action":{"type":"string","enum":["status","find_module","resolve_export","loadlibrary","manual_map","unload"]},"pid":{"type":"integer","minimum":1},"name":{"type":"string"},"module":{"type":"string"},"dll_path":{"type":"string"},"dll_hex":{"type":"string"},"base":{"type":"integer"},"manual_mapped":{"type":"boolean"},"erase_pe_header":{"type":"boolean"},"protect_sections":{"type":"boolean"},"call_dllmain":{"type":"boolean"},"call_tls_callbacks":{"type":"boolean"},"unlink_peb":{"type":"boolean"},"timeout_ms":{"type":"integer","minimum":100,"maximum":60000}},"required":["action"]})";
 
     out.push_back({{"name", "target"},
                    {"description", "Select and inspect the live process used by memory, debugger, and other runtime tools. Start with action='status' to read the active backend plus attached-target and shared-image context; use action='list' to find a pid, then action='attach' with pid. Attach uses the kernel DTB path when slopdrvr is active and best-effort loads the process's main module from disk at its runtime base, unless the UI already has a binary loaded. dump_module selects a loaded module by base or exact name, reconstructs a conventional PE from its mapped bytes to output path, and optionally load=true opens it in the shared Hyperion analysis session. strict defaults true; false zero-fills unreadable section spans and reports complete=false. Actions modules, dump_module, threads, regions, and handles require an attached target. Detach clears the live target but does not unload a separately UI-loaded image."},
@@ -6430,6 +6580,9 @@ void list_tools(json& out) {
     out.push_back({{"name", "driver"},
                    {"description", "Inspect and control the optional slopdrvr kernel bridge. Start with status to discover connection, capabilities, and active backend. backend reads or sets pref='auto'|'kernel'|'user', but cannot switch while a target or debugger session is live. Kernel actions include modules, memory read/write/search, driver dump, calls, virtual-to-physical translation, SSDT/PEB/TEB/loader views, exports, windows, heaps, references, symbols, deferred calls, integrity checks, anti-debug spoofing, sandboxing, logs, and network-buffer sniffing. Kernel-address operations lazily resolve the kernel DTB and return structured errors when unavailable; a symbols_load response with ntos_base=0 means the kernel context was not established and symbol lookups will fail. sniff_buffers uses op to start/get/store/stop capture. Use status rather than assuming the driver is installed."},
                    {"inputSchema", json::parse(driver_schema)}, {"read_only", false}});
+    out.push_back({{"name", "inject"},
+                   {"description", "Kernel-assisted DLL injection over slopdrvr. Every touch on the target rides IOCTLs (kernel-side NtAllocateVirtualMemory via KeStackAttachProcess, DTB physical writes, thread-hijack execution with a spoofed return address), so the user-mode side never opens the target, never calls VirtualAllocEx/WriteProcessMemory, and never spawns a remote thread — none of the ObRegisterCallbacks / PsSetCreateThreadNotifyRoutine hooks a kernel anticheat subscribes to fire from us. Two modes: action='loadlibrary' resolves kernel32!LoadLibraryW in the target and hijacks a resident thread to call it (still fires PsSetLoadImageNotifyRoutine because it goes through LdrLoadDll — the callstack from the AC's view is a clean legitimate thread). action='manual_map' maps the DLL by hand — headers, sections, relocs, imports resolved against the target's already-loaded modules (LoadLibrary'ing missing deps recursively), TLS callbacks, then DllMain(DLL_PROCESS_ATTACH) — no LDR entry, no LoadImageNotify, and by default the PE header is zeroed and each section re-protected with its true RWX chars so scan-based ac won't spot a fresh RWX region with an MZ. dll_path OR dll_hex; dll_path is a host filesystem path (bytes read locally). find_module and resolve_export are helpers that walk the target's PEB LDR through the driver. unload frees a loadlibrary DLL via FreeLibrary or, for a manual-mapped base, calls DllMain(DETACH) then kernel-frees. Requires slopdrvr active; check inject.status first. Options: erase_pe_header (default true), protect_sections (default true), call_dllmain (default true), call_tls_callbacks (default true), unlink_peb (loadlibrary only, default false — unlinks from all three LDR lists so toolhelp snapshots and hidden-module walks miss it), timeout_ms (per-hijack call budget)."},
+                   {"inputSchema", json::parse(inject_schema)}, {"read_only", false}});
     out.push_back({{"name", "xray"},
                    {"description", "Run focused read-only static-analysis queries on the shared image or an explicit path. For cfg, complexity, cff, obfuscation, strings_recon, indirect_calls, and anti_analysis, pass addr as a function-start VA; known functions use indexed bounds and unknown addresses fall back to linear decode. Whole-image actions detect hooks, direct syscalls and SSNs, imported-API hashes, entropy windows, page classes, crypto constants, and ROP gadgets. apihash only searches imports of this image, including bare API and 'DLL!API' forms; it is not a global hash dictionary. Use disasm.loaded/functions first to establish image state and valid function VAs."},
                    {"inputSchema", json::parse(xray_schema)}, {"read_only", true}});
@@ -6500,6 +6653,7 @@ nlohmann::json call_tool(const std::string& name, const nlohmann::json& args,
         if (name == "disasm")   return tool_disasm(args);
         if (name == "debugger") return tool_debugger(args);
         if (name == "driver")   return tool_driver(args);
+        if (name == "inject")   return tool_inject(args);
         if (name == "emulate")  return tool_emulate(args);
         if (name == "analyze")  return tool_analyze(args);
         if (name == "network")  return tool_network(args);

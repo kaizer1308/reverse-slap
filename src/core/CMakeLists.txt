@@ -121,6 +121,8 @@ add_library(slop_core STATIC
     runtime/driver_autoload.cpp
     runtime/kernel_service.hpp
     runtime/kernel_service.cpp
+    runtime/kernel_injector.hpp
+    runtime/kernel_injector.cpp
     script/lua_engine.hpp
     script/lua_engine.cpp
     emu/taint.hpp
