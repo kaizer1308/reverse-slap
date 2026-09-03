@@ -100,6 +100,10 @@ struct AnalysisDB {
 
     void add_xref(const Xref& x) {
         std::lock_guard lk(mtx);
+        add_xref_unlocked(x);
+    }
+
+    void add_xref_unlocked(const Xref& x) {
         xrefs.push_back(x);
         xrefs_to[x.to].push_back(x);
         xrefs_from[x.from].push_back(x);

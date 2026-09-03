@@ -146,9 +146,8 @@ void Analyzer::run() {
         phase_mark = now;
     };
 
-    // Cooperative cancel probe: flips the cancelled flag once and makes the
-    // phase sequence bail. Checked between every phase and inside the two
-    // long walks (linear_sweep / descend).
+    // phase sequence bail. Checked between every phase and inside the
+    // long walk (descend).
     const auto bail = [this] {
         if (!cancel_.load(std::memory_order_relaxed)) return false;
         cancelled_.store(true, std::memory_order_relaxed);
@@ -156,7 +155,6 @@ void Analyzer::run() {
         return true;
     };
 
-    linear_sweep();        phase("linear_sweep");  if (bail()) return; progress_ = 0.12f;
     recursive_descent();   phase("recursive_descent"); if (bail()) return; progress_ = 0.25f;
     detect_functions();    phase("detect_functions"); if (bail()) return; progress_ = 0.38f;
     rtti_.parse(img_, db_); phase("rtti_parse"); if (bail()) return;
@@ -194,12 +192,6 @@ void Analyzer::run() {
     }
     phase("rtti_descend");
 
-    // tentative_ only ever served as descend's decode cache; nothing reads it
-    // past this point and on a large image it is the single biggest live
-    // allocation in the process (one Insn per byte-swept instruction)
-    { std::unordered_map<va_t, Insn> drop; drop.swap(tentative_); }
-    phase("free_sweep_cache");
-
     detect_thunks();       phase("detect_thunks"); if (bail()) return; progress_ = 0.42f;
 
     sigmatch_.match_functions(db_, img_);
@@ -236,84 +228,15 @@ void Analyzer::run() {
                  db_.resolved_indirect.size());
 }
 
-void Analyzer::linear_sweep() {
-    constexpr size_t kMaxLinearSweepSection = 50ULL * 1024 * 1024;
-    const size_t cap = insn_budget_;
-    if (cap) tentative_.reserve(cap);
-
-    for (const auto& seg : img_.segments) {
-        if (cancel_.load(std::memory_order_relaxed)) break;
-        if (cap && tentative_.size() >= cap) break;
-        if (!seg.executable() || seg.data.empty()) continue;
-        if (seg.data.size() > kMaxLinearSweepSection) {
-            spdlog::info("skipping linear sweep of section {} ({}MB > 50MB limit)",
-                         seg.name, seg.data.size() / (1024*1024));
-            continue;
-        }
-
-        size_t off = 0;
-        size_t last_probe = 0;
-        while (off < seg.data.size() && (!cap || tentative_.size() < cap)) {
-            if (off - last_probe >= 4096) {
-                last_probe = off;
-                if (cancel_.load(std::memory_order_relaxed)) return;
-            }
-
-            Insn insn{};
-            if (!decode_insn(seg.va + off, seg.data.data() + off,
-                             seg.data.size() - off, insn)) {
-                insn.addr = seg.va + off;
-                insn.len = 1;
-                insn.type = InsnType::Unknown;
-                insn.bytes[0] = seg.data[off];
-                insn.set_mnemonic("db");
-                const std::string operand = fmt::format("0x{:02X}", seg.data[off]);
-                insn.set_op_str(operand);
-            }
-
-            off += insn.len;
-            tentative_.emplace(insn.addr, std::move(insn));
-        }
-    }
-}
-
-void Analyzer::merge_tentative() {
-    if (tentative_.empty()) return;
-
-    std::vector<std::pair<va_t, va_t>> confirmed;
-    confirmed.reserve(db_.insns.size());
-    for (auto& [addr, insn] : db_.insns)
-        confirmed.emplace_back(addr, addr + insn.len);
-    std::sort(confirmed.begin(), confirmed.end());
-
-    for (auto& [addr, insn] : tentative_) {
-        if (db_.insns.count(addr)) continue;
-        if (!is_code_addr(addr)) continue;
-
-        va_t end = addr + insn.len;
-
-        auto it = std::lower_bound(confirmed.begin(), confirmed.end(),
-            std::make_pair(addr, va_t(0)));
-
-        bool overlaps = false;
-        if (it != confirmed.begin()) {
-            auto prev = std::prev(it);
-            if (prev->second > addr) overlaps = true;
-        }
-        if (!overlaps && it != confirmed.end() && it->first < end)
-            overlaps = true;
-
-        if (!overlaps)
-            db_.insns[addr] = std::move(insn);
-    }
-    tentative_.clear();
-    spdlog::info("merge: {} confirmed insns", db_.insns.size());
-}
-
 void Analyzer::recursive_descent() {
-    // The sweep already saw most of what descent will confirm, so it is a
-    // good size hint and saves the map a long chain of rehashes
-    if (!tentative_.empty()) db_.insns.reserve(tentative_.size());
+    size_t total_exec_bytes = 0;
+    for (const auto& seg : img_.segments) {
+        if (seg.executable()) total_exec_bytes += seg.size;
+    }
+    size_t est_insns = total_exec_bytes / 4;
+    if (insn_budget_ && est_insns > insn_budget_) est_insns = insn_budget_;
+    if (est_insns > 0) db_.insns.reserve(est_insns);
+
     std::unordered_set<va_t> visited;
     descend(img_.entry, visited);
     for (auto& exp : img_.exports)
@@ -344,16 +267,12 @@ void Analyzer::descend(va_t addr, std::unordered_set<va_t>& visited) {
         while (off < max_len) {
             Insn insn{};
             const va_t insn_addr = cur + off;
-            const auto tentative = tentative_.find(insn_addr);
-            if (tentative != tentative_.end()) {
-                insn = std::move(tentative->second);
-                tentative_.erase(tentative);
-            } else if (!decode_insn(insn_addr, ptr + off, max_len - off, insn)) {
+            if (!decode_insn(insn_addr, ptr + off, max_len - off, insn)) {
                 break;
             }
             const va_t decoded_addr = insn.addr;
-            db_.insns.insert_or_assign(decoded_addr, std::move(insn));
-            const Insn& decoded = db_.insns.at(decoded_addr);
+            auto [it, inserted] = db_.insns.insert_or_assign(decoded_addr, std::move(insn));
+            const Insn& decoded = it->second;
             off += decoded.len;
             if (over_budget()) return;
 
@@ -734,24 +653,24 @@ void Analyzer::build_xrefs() {
                 auto resolved = db_.resolved_indirect.find(addr);
                 if (resolved != db_.resolved_indirect.end()) t = resolved->second;
             }
-            if (t) db_.add_xref({addr, t, XrefType::CodeCall});
+            if (t) db_.add_xref_unlocked({addr, t, XrefType::CodeCall});
         } else if (insn.is_branch()) {
             va_t t = insn.branch_target();
             if (!t) {
                 auto resolved = db_.resolved_indirect.find(addr);
                 if (resolved != db_.resolved_indirect.end()) t = resolved->second;
             }
-            if (t) db_.add_xref({addr, t, XrefType::CodeJump});
+            if (t) db_.add_xref_unlocked({addr, t, XrefType::CodeJump});
         }
         for (u8 i = 0; i < insn.op_count; ++i) {
             auto& op = insn.ops[i];
             if (op.type == OpType::Mem && op.val) {
                 const bool read = op.read || !op.write;
-                if (read) db_.add_xref({addr, op.val, XrefType::DataRead});
-                if (op.write) db_.add_xref({addr, op.val, XrefType::DataWrite});
+                if (read) db_.add_xref_unlocked({addr, op.val, XrefType::DataRead});
+                if (op.write) db_.add_xref_unlocked({addr, op.val, XrefType::DataWrite});
             } else if (op.type == OpType::Imm && op.val > img_.base &&
                      op.val < img_.base + 0x10000000)
-                db_.add_xref({addr, op.val, XrefType::DataOffset});
+                db_.add_xref_unlocked({addr, op.val, XrefType::DataOffset});
         }
     }
 }
@@ -792,7 +711,7 @@ void Analyzer::find_string_refs() {
         for (u8 i = 0; i < insn.op_count; ++i) {
             auto& op = insn.ops[i];
             if (op.type == OpType::Mem && op.val && str_addrs.count(op.val)) {
-                db_.add_xref({addr, op.val, XrefType::DataOffset});
+                db_.add_xref_unlocked({addr, op.val, XrefType::DataOffset});
                 ++refs_added;
             }
         }
@@ -1325,6 +1244,12 @@ void Analyzer::populate_data_sections() {
     size_t ptr_sz = (img_.arch == Arch::X64 || img_.arch == Arch::ARM64 || img_.arch == Arch::PPC) ? 8 : 4;
     DataSize ds = (img_.arch == Arch::X64 || img_.arch == Arch::ARM64 || img_.arch == Arch::PPC) ? DataSize::Qword : DataSize::Dword;
     u32 defined = 0;
+
+    size_t total_data_bytes = 0;
+    for (const auto& seg : img_.segments) {
+        if (!seg.executable() && !seg.data.empty()) total_data_bytes += seg.data.size();
+    }
+    if (total_data_bytes > 0) db_.data_items.reserve(std::min<size_t>(total_data_bytes / (ptr_sz * 4), 65536));
 
     for (auto& seg : img_.segments) {
         if (seg.executable() || seg.data.empty()) continue;

@@ -125,11 +125,18 @@ void traffic_store_t::index_stream(const packet_record_t& p) {
         s.server_addr  = p.remote_addr;
         s.server_port  = p.remote_port;
     }
+    constexpr size_t kMaxStreamPayloadBytes = 1024 * 1024; // 1 MiB per direction
     if (p.direction == 0) {
-        s.c2s.insert(s.c2s.end(), p.payload.begin(), p.payload.end());
+        if (s.c2s.size() < kMaxStreamPayloadBytes) {
+            const size_t take = std::min(p.payload.size(), kMaxStreamPayloadBytes - s.c2s.size());
+            s.c2s.insert(s.c2s.end(), p.payload.begin(), p.payload.begin() + take);
+        }
         ++s.c2s_packets;
     } else {
-        s.s2c.insert(s.s2c.end(), p.payload.begin(), p.payload.end());
+        if (s.s2c.size() < kMaxStreamPayloadBytes) {
+            const size_t take = std::min(p.payload.size(), kMaxStreamPayloadBytes - s.s2c.size());
+            s.s2c.insert(s.s2c.end(), p.payload.begin(), p.payload.begin() + take);
+        }
         ++s.s2c_packets;
     }
 }
@@ -140,6 +147,15 @@ void traffic_store_t::add(packet_record_t pkt) {
     index_stream(pkt);
     pkts_.push_back(std::move(pkt));
     while (pkts_.size() > max_packets_) pkts_.pop_front();
+
+    constexpr size_t kMaxStreams = 4096;
+    if (streams_.size() > kMaxStreams) {
+        auto oldest = streams_.begin();
+        for (auto it = streams_.begin(); it != streams_.end(); ++it) {
+            if (it->second.last_ms < oldest->second.last_ms) oldest = it;
+        }
+        streams_.erase(oldest);
+    }
 }
 
 traffic_store_t::page_t traffic_store_t::packets(uint64_t from_id,

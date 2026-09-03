@@ -47,8 +47,6 @@ public:
     const RTTIParser& rtti_parser() const { return rtti_; }
 
 private:
-    void linear_sweep();
-    void merge_tentative();
     void recursive_descent();
     void detect_functions();
     void detect_thunks();
@@ -117,7 +115,6 @@ private:
     std::atomic<bool>  budget_hit_{false};
     // Shared with sweep workers so decode_range can probe cancellation.
     std::shared_ptr<std::atomic<bool>> cancel_shared_{std::make_shared<std::atomic<bool>>(false)};
-    std::unordered_map<va_t, Insn> tentative_;
     std::unordered_map<va_t, std::vector<va_t>> recovered_edges_;
     // functions that gained an edge or a resolved target in the last round
     std::unordered_set<va_t> cfg_dirty_;

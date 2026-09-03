@@ -71,87 +71,89 @@ pointer_scan(reader_t& r,
     nodes.push_back({opt.target, -1, 0});
     std::vector<size_t> frontier{0};
 
-    for (uint32_t level = 0; level < depth && !frontier.empty(); ++level) {
-        if (tok.cancelled()) { st.cancelled = true; break; }
+    // One sweep over all spans: collect every aligned non-null qword
+    std::vector<edge_t> edges;
+    constexpr size_t kChunk = 1u << 20;
 
-        // One sweep over all spans: collect every aligned non-null qword
-        std::vector<edge_t> edges;
-        constexpr size_t kChunk = 1u << 20;
-
-        auto sink = [&](uintptr_t run_addr, const uint8_t* data, size_t len) {
-            uintptr_t p = run_addr; // runs may start unaligned to `align`
-            const uintptr_t run_end = run_addr + len;
-            // Align the starting pointer within the run
-            p = (p + align - 1) / align * align;
-            while (p + 8 <= run_end) {
-                uint64_t v;
-                std::memcpy(&v, data + (p - run_addr), 8);
-                if (v != 0) { // null pointers are noise
-                    edges.push_back({v, p});
-                    ++st.edges_explored;
-                    if (st.edges_explored > infra::limits::max_pointer_edges) {
-                        st.truncated = true;
-                        return;
-                    }
+    auto sink = [&](uintptr_t run_addr, const uint8_t* data, size_t len) {
+        uintptr_t p = run_addr; // runs may start unaligned to `align`
+        const uintptr_t run_end = run_addr + len;
+        // Align the starting pointer within the run
+        p = (p + align - 1) / align * align;
+        while (p + 8 <= run_end) {
+            uint64_t v;
+            std::memcpy(&v, data + (p - run_addr), 8);
+            if (v != 0) { // null pointers are noise
+                edges.push_back({v, p});
+                ++st.edges_explored;
+                if (st.edges_explored > infra::limits::max_pointer_edges) {
+                    st.truncated = true;
+                    return;
                 }
-                p += align;
             }
-        };
-
-        for (const auto& s : spans) {
-            if (st.truncated || tok.cancelled()) break;
-            uintptr_t cursor = s.begin;
-            while (cursor < s.end && !st.truncated) {
-                if (tok.cancelled()) { st.cancelled = true; break; }
-                const size_t want = static_cast<size_t>(
-                    std::min<uint64_t>(kChunk, s.end - cursor));
-                detail::resilient_read(r, cursor, want, 8, tok, sink);
-                cursor += want;
-            }
+            p += align;
         }
+    };
 
-        if (edges.empty()) break;
+    for (const auto& s : spans) {
+        if (st.truncated || tok.cancelled()) break;
+        uintptr_t cursor = s.begin;
+        while (cursor < s.end && !st.truncated) {
+            if (tok.cancelled()) { st.cancelled = true; break; }
+            const size_t want = static_cast<size_t>(
+                std::min<uint64_t>(kChunk, s.end - cursor));
+            detail::resilient_read(r, cursor, want, 8, tok, sink);
+            cursor += want;
+        }
+    }
+
+    if (tok.cancelled()) { st.cancelled = true; }
+    if (!edges.empty() && !st.cancelled) {
         std::sort(edges.begin(), edges.end(),
                   [](const edge_t& a, const edge_t& b) { return a.value < b.value; });
 
-        // Expand every frontier address against the sorted edge list
-        std::vector<size_t> next_frontier;
-        bool frontier_full = false;
-
-        for (const size_t fidx : frontier) {
+        for (uint32_t level = 0; level < depth && !frontier.empty(); ++level) {
             if (tok.cancelled()) { st.cancelled = true; break; }
-            if (frontier_full) break;
 
-            const uintptr_t dest = nodes[fidx].addr;
+            // Expand every frontier address against the sorted edge list
+            std::vector<size_t> next_frontier;
+            bool frontier_full = false;
 
-            // Accept V where diff = dest - V in [min_off, max_off]
-            // => V in [dest - max_off, dest - min_off] (unsigned window)
-            if (min_off > 0 && static_cast<uint64_t>(min_off) > dest) continue;
-            const uint64_t lo = (max_off > 0 && static_cast<uint64_t>(max_off) > dest)
-                ? 0u
-                : dest - static_cast<uint64_t>(max_off);
-            const uint64_t hi = dest - static_cast<uint64_t>(min_off); // wraps on negative
-            if (hi < lo) continue;
+            for (const size_t fidx : frontier) {
+                if (tok.cancelled()) { st.cancelled = true; break; }
+                if (frontier_full) break;
 
-            auto first = std::lower_bound(edges.begin(), edges.end(), lo,
-                [](const edge_t& e, uint64_t v) { return e.value < v; });
-            auto last = std::upper_bound(edges.begin(), edges.end(), hi,
-                [](uint64_t v, const edge_t& e) { return v < e.value; });
+                const uintptr_t dest = nodes[fidx].addr;
 
-            for (auto it = first; it != last; ++it) {
-                const int64_t off = static_cast<int64_t>(dest - it->value);
-                nodes.push_back({it->holder, static_cast<int64_t>(fidx), off});
-                next_frontier.push_back(nodes.size() - 1);
-                if (next_frontier.size() >= opt.frontier_cap) {
-                    st.truncated = true;
-                    frontier_full = true;
-                    break;
+                // Accept V where diff = dest - V in [min_off, max_off]
+                // => V in [dest - max_off, dest - min_off] (unsigned window)
+                if (min_off > 0 && static_cast<uint64_t>(min_off) > dest) continue;
+                const uint64_t lo = (max_off > 0 && static_cast<uint64_t>(max_off) > dest)
+                    ? 0u
+                    : dest - static_cast<uint64_t>(max_off);
+                const uint64_t hi = dest - static_cast<uint64_t>(min_off); // wraps on negative
+                if (hi < lo) continue;
+
+                auto first = std::lower_bound(edges.begin(), edges.end(), lo,
+                    [](const edge_t& e, uint64_t v) { return e.value < v; });
+                auto last = std::upper_bound(edges.begin(), edges.end(), hi,
+                    [](uint64_t v, const edge_t& e) { return v < e.value; });
+
+                for (auto it = first; it != last; ++it) {
+                    const int64_t off = static_cast<int64_t>(dest - it->value);
+                    nodes.push_back({it->holder, static_cast<int64_t>(fidx), off});
+                    next_frontier.push_back(nodes.size() - 1);
+                    if (next_frontier.size() >= opt.frontier_cap) {
+                        st.truncated = true;
+                        frontier_full = true;
+                        break;
+                    }
                 }
             }
-        }
 
-        frontier = std::move(next_frontier);
-        if (st.truncated && frontier.empty()) break;
+            frontier = std::move(next_frontier);
+            if (st.truncated && frontier.empty()) break;
+        }
     }
 
     // build chains from every node, the parent walk yields root first

@@ -63,10 +63,13 @@ std::unordered_map<uint64_t, std::string> build_iat_map(const image_ref_t& img) 
 
 uint64_t function_bound(const image_ref_t& img, uint64_t va) {
     if (!img.fns || va < img.base) return 0;
-    for (const auto& f : img.fns->functions()) {
-        if (f.size == 0) continue;
-        if (va >= f.va && va < f.va + f.size) return f.va + f.size;
-    }
+    const auto& fns = img.fns->functions();
+    auto it = std::upper_bound(fns.begin(), fns.end(), va,
+        [](uint64_t v, const disasm::function_t& f) { return v < f.va; });
+    if (it == fns.begin()) return 0;
+    --it;
+    if (it->size && va >= it->va && va < it->va + it->size)
+        return it->va + it->size;
     return 0;
 }
 
