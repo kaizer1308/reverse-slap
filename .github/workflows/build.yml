@@ -9,20 +9,85 @@ concurrency:
   group: build-${{ github.ref }}
   cancel-in-progress: true
 
-jobs:
-  build:
-    runs-on: windows-2022
-    timeout-minutes: 120
+env:
+  # CI-fast Rust: local Cargo.toml keeps lto=true + codegen-units=1 for max
+  # runtime perf, CI overrides for link speed (~2-4 min saved).
+  CARGO_INCREMENTAL: 1
+  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: 16
+  CARGO_PROFILE_RELEASE_LTO: false
+  CARGO_PROFILE_RELEASE_STRIP: true
+  CARGO_NET_RETRY: 10
+  CMAKE_DISABLE_FIND_PACKAGE_PkgConfig: TRUE
+  CMAKE_DISABLE_FIND_PACKAGE_Doxygen: TRUE
+  SCCACHE_GHA_ENABLED: "true"
+  CMAKE_C_COMPILER_LAUNCHER: sccache
+  CMAKE_CXX_COMPILER_LAUNCHER: sccache
 
+jobs:
+  # C++ engine + mapper only, no tests, no frontend.
+  # Critical path: ~2-4 min warm (sccache + _ext hit) vs 5-8 min cold.
+  cxx:
+    runs-on: windows-2022
+    timeout-minutes: 30
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
 
-      # the runner image has neither the wdk nor this exact sdk, the driver
-      # compiles straight against the kit headers with cl and the mapper
-      # links ntdll.lib out of it, so both installs are needed
-      # exit codes are only logged, the verify step below is the real gate
-      # since setup exes like returning 3010 for reboot required
+      - name: sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: cache _ext (cmake deps sources)
+        uses: actions/cache@v4
+        with:
+          path: _ext
+          key: ext-${{ runner.os }}-${{ hashFiles('cmake/deps.cmake') }}
+          restore-keys: |
+            ext-${{ runner.os }}-
+
+      - name: build cxx (no tests, no frontend)
+        shell: pwsh
+        run: powershell -NoProfile -File tools\build.ps1 -NoFrontend -CmakeExtra "-DSLOP_BUILD_TESTS=OFF -DSLOP_BUILD_TEST_TARGET=OFF"
+
+      - name: sccache stats
+        shell: pwsh
+        run: sccache --show-stats || true
+
+      - name: upload engine artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: cxx-artifacts
+          path: |
+            build/src/engine/reverse-slop-engine.exe
+            build/src/engine/slop_frida.dll
+            build/mapper/slop_mapper.exe
+          if-no-files-found: error
+
+  # Kernel driver only. Parallel with cxx (~1-2 min + kits).
+  driver:
+    runs-on: windows-2022
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: cache windows kits 26100
+        id: kits-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            C:/Program Files (x86)/Windows Kits/10/Include/10.0.26100.0
+            C:/Program Files (x86)/Windows Kits/10/Lib/10.0.26100.0
+            C:/Program Files (x86)/Windows Kits/10/bin/10.0.26100.0
+          key: kits-26100-${{ runner.os }}-v1
+
       - name: install windows sdk 26100
+        if: steps.kits-cache.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
           curl.exe -L -o sdksetup.exe "https://go.microsoft.com/fwlink/?linkid=2338977"
@@ -30,31 +95,125 @@ jobs:
           Write-Host "sdksetup exit code: $($p.ExitCode)"
 
       - name: install wdk 26100
+        if: steps.kits-cache.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
           curl.exe -L -o wdksetup.exe "https://go.microsoft.com/fwlink/?linkid=2335869"
           $p = Start-Process -FilePath ".\wdksetup.exe" -ArgumentList "/q","/norestart","/ceip","off" -Wait -PassThru
           Write-Host "wdksetup exit code: $($p.ExitCode)"
 
-      # fail here in seconds instead of an hour into the c++ build
-      - name: verify the kit files
+      - name: build driver
+        shell: pwsh
+        run: powershell -NoProfile -File tools\build_slopdrvr.ps1
+
+      - name: upload driver
+        uses: actions/upload-artifact@v4
+        with:
+          name: driver-artifact
+          path: build/driver/slopdrvr.sys
+          if-no-files-found: error
+
+  # Tests run parallel, never block the bundle.
+  tests:
+    runs-on: windows-2022
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: cache _ext (cmake deps sources)
+        uses: actions/cache@v4
+        with:
+          path: _ext
+          key: ext-${{ runner.os }}-${{ hashFiles('cmake/deps.cmake') }}
+          restore-keys: |
+            ext-${{ runner.os }}-
+
+      - name: build + run tests (no frontend)
         shell: pwsh
         run: |
-          $kit = 'C:\Program Files (x86)\Windows Kits\10'
-          foreach ($p in @(
-              "$kit\Include\10.0.26100.0\km\ntifs.h",
-              "$kit\Include\10.0.26100.0\shared\ntdef.h",
-              "$kit\Lib\10.0.26100.0\km\x64\ntoskrnl.lib",
-              "$kit\Lib\10.0.26100.0\km\x64\libcntpr.lib",
-              "$kit\Lib\10.0.26100.0\um\x64\ntdll.lib")) {
-            if (-not (Test-Path -LiteralPath $p)) { throw "kit file missing: $p" }
-          }
+          powershell -NoProfile -File tools\build.ps1 -NoFrontend -CmakeExtra "-DSLOP_BUILD_TESTS=ON -DSLOP_BUILD_TEST_TARGET=ON"
+          ctest --test-dir build --output-on-failure
 
-      # the one true build, full mode so a missing component fails the run
-      # instead of quietly shipping a lesser bundle
-      - name: build everything
+  # Tauri bundle. Waits for cxx+driver (~3-4 min), no C++ rebuild.
+  frontend:
+    runs-on: windows-2022
+    timeout-minutes: 30
+    needs: [cxx, driver]
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: setup node with npm cache
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - name: rust cache (target/ + registry)
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: app/src-tauri -> target
+          cache-on-failure: true
+
+      - name: cache node_modules
+        uses: actions/cache@v4
+        with:
+          path: app/node_modules
+          key: node-${{ runner.os }}-${{ hashFiles('app/package-lock.json') }}
+          restore-keys: |
+            node-${{ runner.os }}-
+
+      - name: cache magicmida (unpacker zips)
+        uses: actions/cache@v4
+        with:
+          path: ~/AppData/Local/reverse-slop/tools/magicmida
+          key: magicmida-2026-05-14-v1
+          restore-keys: |
+            magicmida-
+
+      - name: download cxx artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: cxx-artifacts
+          path: _staging/cxx
+
+      - name: download driver artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: driver-artifact
+          path: _staging/driver
+
+      - name: stage build tree for tauri resource map
         shell: pwsh
-        run: powershell -NoProfile -File tools\build.ps1 -Full
+        run: |
+          New-Item -ItemType Directory -Force -Path build/src/engine, build/mapper, build/driver | Out-Null
+          # upload-artifact preserves subdirs (build/...) on some versions and
+          # flattens on others — search recursively so both layouts work.
+          function Find-Staged($root, $name) {
+            $f = Get-ChildItem -Path $root -Recurse -Filter $name -File -ErrorAction SilentlyContinue | Select-Object -First 1
+            if (-not $f) { throw "staged file missing: $name under $root" }
+            return $f.FullName
+          }
+          Copy-Item -LiteralPath (Find-Staged _staging/cxx 'reverse-slop-engine.exe') -Destination build/src/engine/reverse-slop-engine.exe -Force
+          Copy-Item -LiteralPath (Find-Staged _staging/cxx 'slop_frida.dll') -Destination build/src/engine/slop_frida.dll -Force
+          Copy-Item -LiteralPath (Find-Staged _staging/cxx 'slop_mapper.exe') -Destination build/mapper/slop_mapper.exe -Force
+          Copy-Item -LiteralPath (Find-Staged _staging/driver 'slopdrvr.sys') -Destination build/driver/slopdrvr.sys -Force
+          Get-ChildItem build/src/engine, build/mapper, build/driver
+
+      - name: build frontend bundle (no C++ rebuild, driver pre-staged)
+        shell: pwsh
+        run: powershell -NoProfile -File tools\build.ps1 -FrontendOnly -SkipDriver -Full
 
       - name: upload the portable app
         uses: actions/upload-artifact@v4

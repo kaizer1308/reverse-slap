@@ -35,11 +35,17 @@ set(SPDLOG_INSTALL OFF CACHE BOOL "" FORCE)
 set(SPDLOG_ENABLE_PCH OFF CACHE BOOL "" FORCE)
 
 # capstone only for the architectures hyperion decodes beyond x86 and x64,
-# keep the tool set small so builds stay quick
+# keep the tool set small so builds stay quick (was all 16 arches: single
+# biggest C++ configure/compile saving, ~1-3 min on CI)
 set(CAPSTONE_BUILD_STATIC_RUNTIME ON CACHE BOOL "" FORCE)
 set(CAPSTONE_BUILD_SHARED OFF CACHE BOOL "" FORCE)
 set(CAPSTONE_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(CAPSTONE_BUILD_CSTOOL OFF CACHE BOOL "" FORCE)
+set(CAPSTONE_BUILD_CSTEST OFF CACHE BOOL "" FORCE)
+set(CAPSTONE_ARCHITECTURE_DEFAULT OFF CACHE BOOL "" FORCE)
+set(CAPSTONE_X86_SUPPORT ON CACHE BOOL "" FORCE)
+set(CAPSTONE_ARM_SUPPORT ON CACHE BOOL "" FORCE)
+set(CAPSTONE_ARM64_SUPPORT ON CACHE BOOL "" FORCE)
 
 FetchContent_Declare(fmt
     URL https://github.com/fmtlib/fmt/archive/refs/tags/11.1.4.zip

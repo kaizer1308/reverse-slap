@@ -5,6 +5,9 @@ param(
     [switch]$NoFrontend,
     [switch]$Test,
     [switch]$Full,
+    [switch]$FrontendOnly,
+    [switch]$SkipDriver,
+    [string]$CmakeExtra = '',
     [string]$Preset = 'ninja-msvc-release'
 )
 
@@ -16,6 +19,7 @@ New-Item -ItemType Directory -Path $logDir | Out-Null
 
 $vsRoot = $null
 $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+if (-not $FrontendOnly) {
 if (Test-Path -LiteralPath $vswhere) {
     $vsRoot = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
 }
@@ -34,10 +38,16 @@ $vcvars = Join-Path $vsRoot 'VC\Auxiliary\Build\vcvars64.bat'
 Write-Host "==> repo:     $repoRoot"
 Write-Host "==> vs root:  $vsRoot"
 Write-Host "==> logs:     $logDir"
+} else {
+    Write-Host "==> repo:     $repoRoot (frontend-only, skipping VS detection)"
+    Write-Host "==> logs:     $logDir"
+    $vsCMake = 'cmake'
+}
 if ($Full) {
     Write-Host '==> full installer mode: driver, magicmida and the webview2 runtime are all required' -ForegroundColor Cyan
 }
 
+if (-not $FrontendOnly) {
 cmd /c "call `"$vcvars`" > NUL 2>&1 && set" | ForEach-Object {
     if ($_ -match '^([A-Za-z_][A-Za-z0-9_]*)=(.*)$') {
         Set-Item -Path ("Env:" + $Matches[1]) -Value $Matches[2]
@@ -47,16 +57,26 @@ cmd /c "call `"$vcvars`" > NUL 2>&1 && set" | ForEach-Object {
 if (Test-Path -LiteralPath $vsNinja) {
     $env:path = "$(Split-Path -Parent $vsNinja);$env:path"
 }
+}
 
 if ($FullClean -and (Test-Path -LiteralPath (Join-Path $repoRoot 'build'))) {
     Write-Host '==> removing build directory'
     Remove-Item -LiteralPath (Join-Path $repoRoot 'build') -Recurse -Force
 }
 
+if (-not $FrontendOnly) {
 Write-Host "==> configuring preset '$Preset'"
+# sccache (CI): mozilla sccache-action sets CMAKE_CXX_COMPILER_LAUNCHER=sccache
+# in env. Forward it + any $CmakeExtra (e.g. -DSLOP_BUILD_TESTS=OFF) to the
+# configure line so CI gets cache hits without touching local defaults.
+$configureExtra = @()
+if ($env:CMAKE_C_COMPILER_LAUNCHER) { $configureExtra += "-DCMAKE_C_COMPILER_LAUNCHER=$($env:CMAKE_C_COMPILER_LAUNCHER)" }
+if ($env:CMAKE_CXX_COMPILER_LAUNCHER) { $configureExtra += "-DCMAKE_CXX_COMPILER_LAUNCHER=$($env:CMAKE_CXX_COMPILER_LAUNCHER)" }
+if ($CmakeExtra -and $CmakeExtra.Trim()) { $configureExtra += $CmakeExtra.Split(' ', [System.StringSplitOptions]::RemoveEmptyEntries) }
+if ($configureExtra.Count -gt 0) { Write-Host "==> configure extra: $($configureExtra -join ' ')" }
 $prevEap = $ErrorActionPreference
 $ErrorActionPreference = 'Continue'
-& $vsCMake --preset $Preset -S $repoRoot 2>&1 | ForEach-Object { "$_" } | Set-Content -LiteralPath (Join-Path $logDir 'configure.log')
+& $vsCMake --preset $Preset -S $repoRoot @configureExtra 2>&1 | ForEach-Object { "$_" } | Set-Content -LiteralPath (Join-Path $logDir 'configure.log')
 Get-Content -LiteralPath (Join-Path $logDir 'configure.log') | Write-Host
 $ErrorActionPreference = $prevEap
 if ($LASTEXITCODE -ne 0) { throw "configure failed (exit $LASTEXITCODE), log: $(Join-Path $logDir 'configure.log')" }
@@ -95,6 +115,9 @@ $summary | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $logDir 'summary
 Write-Host '==> build succeeded'
 Write-Host "==> binary: $($summary.binary)"
 Write-Host "==> engine: $($summary.engine)"
+} else {
+    Write-Host '==> frontend-only: skipping C++ configure/build (artifacts come from cxx job)'
+}
 
 # Tauri front end (the app)
 # The Tauri UI is the shipped app; reverse-slop.exe (ImGui) is the legacy shell
@@ -104,11 +127,17 @@ Write-Host "==> engine: $($summary.engine)"
 # resource from build\src\engine
 if (-not $NoFrontend) {
     # The driver needs the WDK, which is not installed on every dev box. Build
-    # it when possible; the tauri resource filter below skips it when absent
+    # it when possible; the tauri resource filter below skips it when absent.
+    # -SkipDriver is for CI frontend job where slopdrvr.sys already comes from
+    # the parallel driver job artifact (saves WDK install + rebuild there).
+    if (-not $SkipDriver) {
     & powershell -NoProfile -File (Join-Path $PSScriptRoot 'build_slopdrvr.ps1')
     if ($LASTEXITCODE -ne 0) {
         if ($Full) { throw 'driver build failed, the full installer bundles slopdrvr.sys (install the WDK)' }
         Write-Host '==> driver build failed (WDK missing?), bundling app without driver' -ForegroundColor Yellow
+    }
+    } else {
+        Write-Host '==> skipping driver build (sys staged from driver job artifact)'
     }
 
     # Magicmida (Themida/WinLicense unpacker). The engine resolves it next to
@@ -142,12 +171,19 @@ if (-not $NoFrontend) {
         Write-Host '==> installing frontend dependencies'
         # npm chats on stderr; under ErrorActionPreference=Stop PowerShell 5.1
         # turns the first stderr line into a terminating error, flatten the
-        # streams like the cmake calls below
+        # streams like the cmake calls below.
+        # `npm ci` is ~20-30% faster than `npm install` when package-lock.json
+        # exists (clean, parallel, offline-cache friendly) — critical on CI
+        # where node_modules cache may have missed.
         $prevEap = $ErrorActionPreference
         $ErrorActionPreference = 'Continue'
         Push-Location $appDir
         try {
-            & npm install --no-audit --no-fund 2>&1 | ForEach-Object { "$_" } | Tee-Object -FilePath (Join-Path $logDir 'npm-install.log')
+            if (Test-Path -LiteralPath (Join-Path $appDir 'package-lock.json')) {
+                & npm ci --prefer-offline --no-audit --no-fund 2>&1 | ForEach-Object { "$_" } | Tee-Object -FilePath (Join-Path $logDir 'npm-install.log')
+            } else {
+                & npm install --no-audit --no-fund 2>&1 | ForEach-Object { "$_" } | Tee-Object -FilePath (Join-Path $logDir 'npm-install.log')
+            }
             $npmExit = $LASTEXITCODE
         } finally { Pop-Location }
         $ErrorActionPreference = $prevEap
