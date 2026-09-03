@@ -12,6 +12,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <chrono>
 #include <cstdio>
 #include <cctype>
 #include <fstream>
@@ -65,7 +66,7 @@ struct session_meta_t {
 void load_meta(binary_t& b, session_meta_t& out) {
     out.comments.clear();
     out.bookmarks.clear();
-    const std::string path = symbols_path_for(fnv1a(b.file.data(), b.file.size()));
+    const std::string path = symbols_path_for(b.file_hash);
     if (path.empty()) return;
 
     std::ifstream f(path);
@@ -124,7 +125,7 @@ void load_meta(binary_t& b, session_meta_t& out) {
 }
 
 void save_meta(const binary_t& b) {
-    const std::string path = symbols_path_for(fnv1a(b.file.data(), b.file.size()));
+    const std::string path = symbols_path_for(b.file_hash);
     if (path.empty()) return;
 
     json hex_j = json::object();
@@ -158,6 +159,7 @@ void unload_locked() {
     g_bin.hype.reset();
     g_bin.file.clear();
     g_bin.file.shrink_to_fit();
+    g_bin.file_hash = 0;
     g_bin.pe = {};
     g_bin.base = 0;
     g_bin.name.clear();
@@ -207,9 +209,18 @@ bool load_file(const std::string& path, uint64_t base_override) {
 
     std::ifstream f(path, std::ios::binary);
     if (!f) return false;
-    g_bin.file = std::vector<uint8_t>(std::istreambuf_iterator<char>(f),
-                                      std::istreambuf_iterator<char>{});
+    // one sized read, not a byte-at-a-time streambuf iterator pair: on a few
+    // hundred megabytes the iterator form costs seconds on its own
+    f.seekg(0, std::ios::end);
+    const std::streamoff size = f.tellg();
+    if (size < 1024) { unload_locked(); return false; }
+    f.seekg(0, std::ios::beg);
+    g_bin.file.resize(static_cast<size_t>(size));
+    f.read(reinterpret_cast<char*>(g_bin.file.data()), size);
+    if (!f) { unload_locked(); return false; }
+    g_bin.file.resize(static_cast<size_t>(f.gcount()));
     if (g_bin.file.size() < 1024) { unload_locked(); return false; }
+    g_bin.file_hash = fnv1a(g_bin.file.data(), g_bin.file.size());
 
     g_bin.pe = disasm::pe_parse(g_bin.file.data(), g_bin.file.size());
     if (!g_bin.pe.ok || !g_bin.eng.init(g_bin.pe.pe32plus)) { unload_locked(); return false; }
@@ -221,8 +232,20 @@ bool load_file(const std::string& path, uint64_t base_override) {
     const size_t slash = path.find_last_of("\\/");
     g_bin.name = (slash == std::string::npos) ? path : path.substr(slash + 1);
 
+    // stage timings: a slow open should name the index that is slow
+    using clock_t_ = std::chrono::steady_clock;
+    auto stage = clock_t_::now();
+    const auto stage_ms = [&stage] {
+        const auto now = clock_t_::now();
+        const double ms = std::chrono::duration<double, std::milli>(now - stage).count();
+        stage = now;
+        return ms;
+    };
+
     if (!g_bin.fns.build(g_bin.pe, g_bin.file, g_bin.eng, g_bin.base))   { unload_locked(); return false; }
+    const double fns_ms = stage_ms();
     if (!g_bin.xrefs.build(g_bin.pe, g_bin.file, g_bin.eng, g_bin.base)) { unload_locked(); return false; }
+    const double xrefs_ms = stage_ms();
 
     // strings from the data sections, exec sections are skipped
     for (const auto& s : g_bin.pe.sections) {
@@ -245,10 +268,16 @@ bool load_file(const std::string& path, uint64_t base_override) {
     // the type catalog rides the same per hash store, rebind on load
     slop::core::re::type_catalog::bind_binary(g_bin.file.data(), g_bin.file.size());
 
+    const double strings_ms = stage_ms();
+
+    char timing[160];
+    std::snprintf(timing, sizeof(timing),
+                  " (functions %.0f ms, xrefs %.0f ms, strings %.0f ms)",
+                  fns_ms, xrefs_ms, strings_ms);
     slop::core::infra::diag::info("disasm", "loaded " + g_bin.name + ", " +
         std::to_string(g_bin.fns.functions().size()) + " functions, " +
         std::to_string(g_bin.xrefs.total()) + " xrefs, " +
-        std::to_string(g_bin.strings.size()) + " strings");
+        std::to_string(g_bin.strings.size()) + " strings" + timing);
 
     // hyperion analysis in the background, small binaries finish in under a second and big ones stay responsive through the ready flag
     g_bin.hype = std::make_unique<hyperion_session::session_t>();
@@ -390,6 +419,7 @@ hype_status_t hype_status() {
     st.engine_present = g_bin.hype != nullptr;
     if (!g_bin.hype) return st;
     st.ready        = g_bin.hype->ready();
+    st.truncated    = st.ready && g_bin.hype->truncated();
     st.running      = !st.ready && g_bin.hype->running();
     st.progress     = st.ready ? 1.f : g_bin.hype->progress();
     if (!st.ready) st.engine_error = g_bin.hype->error();

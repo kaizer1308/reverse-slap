@@ -75,8 +75,12 @@ public:
 
     // Decode one instruction at `va` reading from buf (>= len bytes avail)
     // Const: the underlying Zydis decoder/formatter carry no cross-call state
+    //
+    // want_text off skips formatting and leaves insn_t::text empty. The index
+    // builds sweep every executable byte and never look at the text, and
+    // filling it costs a heap allocation per instruction
     std::optional<insn_t> decode(uint64_t va, const uint8_t* buf,
-                                 size_t len) const;
+                                 size_t len, bool want_text = true) const;
 
 private:
     ZydisDecoder           decoder_{};

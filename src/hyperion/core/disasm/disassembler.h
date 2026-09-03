@@ -20,26 +20,31 @@ enum class InsnType : u8 {
 
 enum class OpType : u8 { None, Reg, Imm, Mem };
 
+// Field order is chosen for size, not readability: the natural ordering pads
+// this out to 40 bytes, and an Insn carries four of them for every decoded
+// instruction in the image. Keeping the 8-byte members first packs it to 32
 struct Operand {
-    OpType type = OpType::None;
     u64    val  = 0;
+    struct { i64 disp; u16 base; u16 index; u8 scale; } mem{};
     u16    reg  = 0;
     u16    size = 0;
+    OpType type = OpType::None;
     bool   read = false;
     bool   write = false;
-    struct { u16 base; u16 index; u8 scale; i64 disp; } mem{};
 };
 
+// Also ordered for size — an image with tens of millions of instructions
+// keeps one of these per instruction in the DB and another per basic block
 struct Insn {
     va_t        addr;
+    Operand     ops[4];
+    char        op_str[64];
+    char        mnemonic[12];
+    u8          bytes[15];
     u8          len;
     InsnType    type;
-    u16         mnemonic_id;
-    char        mnemonic[12];
-    char        op_str[64];
-    u8          bytes[15];
-    Operand     ops[4];
     u8          op_count;
+    u16         mnemonic_id;
 
     void set_mnemonic(const char* s) {
         std::strncpy(mnemonic, s, sizeof(mnemonic) - 1);

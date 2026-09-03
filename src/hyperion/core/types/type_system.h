@@ -44,6 +44,7 @@ public:
         u32 id = next_id_++;
         TypeDef td{id, TypeKind::Struct, name, size, {}, {}, 0, 0, 0};
         types_[id] = std::move(td);
+        by_name_.emplace(name, id);
         return id;
     }
 
@@ -51,6 +52,7 @@ public:
         u32 id = next_id_++;
         TypeDef td{id, TypeKind::Enum, name, 4, {}, {}, 0, 0, 0};
         types_[id] = std::move(td);
+        by_name_.emplace(name, id);
         return id;
     }
 
@@ -60,6 +62,7 @@ public:
         u32 sz = target ? target->size : 0;
         TypeDef td{id, TypeKind::Typedef, name, sz, {}, {}, target_id, 0, 0};
         types_[id] = std::move(td);
+        by_name_.emplace(name, id);
         return id;
     }
 
@@ -87,16 +90,17 @@ public:
         return it != types_.end() ? &it->second : nullptr;
     }
 
+    // O(1) through by_name_. The old linear walk turned struct recovery on
+    // large images quadratic: every recovered struct rescanned every type
+    // already recovered, four more times per field for the builtin sizes
     TypeDef* find_by_name(const std::string& name) {
-        for (auto& [_, td] : types_)
-            if (td.name == name) return &td;
-        return nullptr;
+        const auto it = by_name_.find(name);
+        return it != by_name_.end() ? get(it->second) : nullptr;
     }
 
     const TypeDef* find_by_name(const std::string& name) const {
-        for (auto& [_, td] : types_)
-            if (td.name == name) return &td;
-        return nullptr;
+        const auto it = by_name_.find(name);
+        return it != by_name_.end() ? get(it->second) : nullptr;
     }
 
     std::string format_at(va_t addr, u32 type_id, const u8* data, size_t len) const {
@@ -110,13 +114,20 @@ public:
     const std::unordered_map<u32, TypeDef>& all() const { return types_; }
     u32 next_id() const { return next_id_; }
 
-    void remove(u32 id) { types_.erase(id); }
+    void remove(u32 id) {
+        const auto it = types_.find(id);
+        if (it == types_.end()) return;
+        const auto named = by_name_.find(it->second.name);
+        if (named != by_name_.end() && named->second == id) by_name_.erase(named);
+        types_.erase(it);
+    }
 
 private:
     void init_builtins() {
         auto add = [&](TypeKind k, const char* n, u32 sz) {
             u32 id = next_id_++;
             types_[id] = {id, k, n, sz, {}, {}, 0, 0, 0};
+            by_name_.emplace(n, id);
         };
         add(TypeKind::Void,  "void",    0);
         add(TypeKind::UInt,  "u8",      1);
@@ -184,7 +195,10 @@ private:
         return fmt::format("0x{:X}", *reinterpret_cast<const u32*>(data));
     }
 
-    std::unordered_map<u32, TypeDef> types_;
+    std::unordered_map<u32, TypeDef>    types_;
+    // first id registered under a name wins, matching the old linear search's
+    // "first match" contract closely enough for the callers that dedupe on it
+    std::unordered_map<std::string, u32> by_name_;
     u32 next_id_ = 1;
 };
 

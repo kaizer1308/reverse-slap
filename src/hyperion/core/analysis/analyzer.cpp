@@ -3,6 +3,7 @@
 #include <spdlog/spdlog.h>
 #include <fmt/format.h>
 #include <algorithm>
+#include <chrono>
 #include <queue>
 #include <unordered_set>
 #include <cstring>
@@ -69,18 +70,44 @@ Analyzer::Analyzer(PEImage& img, WorkerPool& pool)
     cap_disasm_.set_arch(img.arch);
     db_.image_base = img.base;
     db_.arch = img.arch;
+    build_segment_index();
+}
+
+void Analyzer::build_segment_index() {
+    segment_index_.clear();
+    segment_index_.reserve(img_.segments.size());
+    for (const auto& seg : img_.segments) {
+        if (seg.size == 0) continue;
+        segment_index_.push_back({seg.va, seg.va + seg.size, &seg, seg.executable()});
+    }
+    std::sort(segment_index_.begin(), segment_index_.end(),
+              [](const SegmentSpan& a, const SegmentSpan& b) { return a.va < b.va; });
+}
+
+const Analyzer::SegmentSpan* Analyzer::span_for(va_t addr) const {
+    // greatest span with va <= addr, then one containment test
+    auto it = std::upper_bound(segment_index_.begin(), segment_index_.end(), addr,
+                               [](va_t value, const SegmentSpan& span) { return value < span.va; });
+    if (it == segment_index_.begin()) return nullptr;
+    --it;
+    return addr < it->end ? &*it : nullptr;
 }
 
 const u8* Analyzer::va_to_ptr(va_t addr, size_t* max_len) {
-    for (auto& seg : img_.segments) {
-        if (seg.contains(addr)) {
-            size_t off = static_cast<size_t>(addr - seg.va);
-            if (off >= seg.data.size()) return nullptr;
-            if (max_len) *max_len = seg.data.size() - off;
-            return seg.data.data() + off;
-        }
-    }
-    return nullptr;
+    const SegmentSpan* span = span_for(addr);
+    if (!span) return nullptr;
+    const size_t off = static_cast<size_t>(addr - span->va);
+    if (off >= span->seg->data.size()) return nullptr;
+    if (max_len) *max_len = span->seg->data.size() - off;
+    return span->seg->data.data() + off;
+}
+
+bool Analyzer::over_budget() {
+    if (insn_budget_ == 0 || db_.insns.size() < insn_budget_) return false;
+    if (!budget_hit_.exchange(true, std::memory_order_relaxed))
+        spdlog::warn("analysis: instruction budget of {} reached, "
+                     "the database covers part of the image", insn_budget_);
+    return true;
 }
 
 bool Analyzer::is_iat_addr(va_t addr) const {
@@ -90,26 +117,34 @@ bool Analyzer::is_iat_addr(va_t addr) const {
 }
 
 bool Analyzer::is_code_addr(va_t addr) const {
-    for (auto& seg : img_.segments)
-        if (seg.executable() && seg.contains(addr)) return true;
-    return false;
+    const SegmentSpan* span = span_for(addr);
+    return span && span->executable;
 }
 
 bool Analyzer::in_section(va_t addr, const char* name) const {
-    for (auto& seg : img_.segments)
-        if (seg.name == name && seg.contains(addr)) return true;
-    return false;
+    const SegmentSpan* span = span_for(addr);
+    return span && span->seg->name == name;
 }
 
 const Segment* Analyzer::section_for(va_t addr) const {
-    for (auto& seg : img_.segments)
-        if (seg.contains(addr)) return &seg;
-    return nullptr;
+    const SegmentSpan* span = span_for(addr);
+    return span ? span->seg : nullptr;
 }
 
 void Analyzer::run() {
     spdlog::info("analysis: starting");
     progress_ = 0.0f;
+
+    // Per-phase wall clock, so a slow image says which phase is slow instead
+    // of just taking a long time. Logged at debug, the totals at info.
+    const auto run_start = std::chrono::steady_clock::now();
+    auto phase_mark = run_start;
+    const auto phase = [&phase_mark](const char* name) {
+        const auto now = std::chrono::steady_clock::now();
+        spdlog::debug("analysis phase {}: {:.1f} ms", name,
+                      std::chrono::duration<double, std::milli>(now - phase_mark).count());
+        phase_mark = now;
+    };
 
     // Cooperative cancel probe: flips the cancelled flag once and makes the
     // phase sequence bail. Checked between every phase and inside the two
@@ -121,10 +156,10 @@ void Analyzer::run() {
         return true;
     };
 
-    linear_sweep();        if (bail()) return; progress_ = 0.12f;
-    recursive_descent();   if (bail()) return; progress_ = 0.25f;
-    detect_functions();    if (bail()) return; progress_ = 0.38f;
-    rtti_.parse(img_, db_); if (bail()) return;
+    linear_sweep();        phase("linear_sweep");  if (bail()) return; progress_ = 0.12f;
+    recursive_descent();   phase("recursive_descent"); if (bail()) return; progress_ = 0.25f;
+    detect_functions();    phase("detect_functions"); if (bail()) return; progress_ = 0.38f;
+    rtti_.parse(img_, db_); phase("rtti_parse"); if (bail()) return;
     // Share the visited set across every RTTI descend call. The old code
     // reset it per-method, so on huge binaries (300MB UE builds) we would
     // re-decode the entire reachable graph tens of thousands of times.
@@ -157,31 +192,44 @@ void Analyzer::run() {
             }
         }
     }
-    detect_thunks();       if (bail()) return; progress_ = 0.42f;
+    phase("rtti_descend");
+
+    // tentative_ only ever served as descend's decode cache; nothing reads it
+    // past this point and on a large image it is the single biggest live
+    // allocation in the process (one Insn per byte-swept instruction)
+    { std::unordered_map<va_t, Insn> drop; drop.swap(tentative_); }
+    phase("free_sweep_cache");
+
+    detect_thunks();       phase("detect_thunks"); if (bail()) return; progress_ = 0.42f;
 
     sigmatch_.match_functions(db_, img_);
+    phase("signatures");
     if (bail()) return;    progress_ = 0.45f;
 
-    discover_cfg_fixed_point(); if (bail()) return; progress_ = 0.62f;
-    build_xrefs();         if (bail()) return; progress_ = 0.72f;
-    find_strings();        if (bail()) return; progress_ = 0.78f;
-    find_string_refs();    if (bail()) return; progress_ = 0.82f;
-    detect_vtables();      if (bail()) return; progress_ = 0.85f;
-    detect_globals();      if (bail()) return; progress_ = 0.88f;
-    detect_noreturn();     if (bail()) return; progress_ = 0.87f;
-    detect_tail_calls();   if (bail()) return; progress_ = 0.89f;
-    detect_calling_conventions(); if (bail()) return; progress_ = 0.91f;
-    detect_loops();        if (bail()) return; progress_ = 0.95f;
-    recover_structs();     if (bail()) return; progress_ = 0.97f;
-    propagate_interproc_types(); if (bail()) return; progress_ = 0.98f;
-    populate_data_sections();    if (bail()) return; progress_ = 0.99f;
-    apply_names();         if (bail()) return; progress_ = 0.99f;
-    detect_main();         if (bail()) return; progress_ = 0.995f;
+    discover_cfg_fixed_point(); phase("cfg_fixed_point"); if (bail()) return; progress_ = 0.62f;
+    build_xrefs();         phase("build_xrefs"); if (bail()) return; progress_ = 0.72f;
+    find_strings();        phase("find_strings"); if (bail()) return; progress_ = 0.78f;
+    find_string_refs();    phase("find_string_refs"); if (bail()) return; progress_ = 0.82f;
+    detect_vtables();      phase("detect_vtables"); if (bail()) return; progress_ = 0.85f;
+    detect_globals();      phase("detect_globals"); if (bail()) return; progress_ = 0.88f;
+    detect_noreturn();     phase("detect_noreturn"); if (bail()) return; progress_ = 0.87f;
+    detect_tail_calls();   phase("detect_tail_calls"); if (bail()) return; progress_ = 0.89f;
+    detect_calling_conventions(); phase("callconv"); if (bail()) return; progress_ = 0.91f;
+    detect_loops();        phase("detect_loops"); if (bail()) return; progress_ = 0.95f;
+    recover_structs();     phase("recover_structs"); if (bail()) return; progress_ = 0.97f;
+    propagate_interproc_types(); phase("interproc_types"); if (bail()) return; progress_ = 0.98f;
+    populate_data_sections();    phase("populate_data"); if (bail()) return; progress_ = 0.99f;
+    apply_names();         phase("apply_names"); if (bail()) return; progress_ = 0.99f;
+    detect_main();         phase("detect_main"); if (bail()) return; progress_ = 0.995f;
 
     rtti_.parse(img_, db_);
+    phase("rtti_parse2");
     if (bail()) return;
     progress_ = 1.0f;
 
+    spdlog::info("analysis: total {:.1f} ms",
+                 std::chrono::duration<double, std::milli>(
+                     std::chrono::steady_clock::now() - run_start).count());
     spdlog::info("analysis: done - {} insns, {} funcs, {} xrefs, {} strings, {} vtables, {} globals, {} resolved_indirect",
                  db_.insns.size(), db_.funcs.size(), db_.xrefs.size(),
                  db_.strings.size(), db_.vtables.size(), db_.globals.size(),
@@ -190,39 +238,42 @@ void Analyzer::run() {
 
 void Analyzer::linear_sweep() {
     constexpr size_t kMaxLinearSweepSection = 50ULL * 1024 * 1024;
-    std::vector<std::future<std::vector<Insn>>> futures;
-    for (auto& seg : img_.segments) {
-        if (cancel_.load(std::memory_order_relaxed)) break;   // skip the rest
+    const size_t cap = insn_budget_;
+    if (cap) tentative_.reserve(cap);
+
+    for (const auto& seg : img_.segments) {
+        if (cancel_.load(std::memory_order_relaxed)) break;
+        if (cap && tentative_.size() >= cap) break;
         if (!seg.executable() || seg.data.empty()) continue;
         if (seg.data.size() > kMaxLinearSweepSection) {
             spdlog::info("skipping linear sweep of section {} ({}MB > 50MB limit)",
                          seg.name, seg.data.size() / (1024*1024));
             continue;
         }
-        const va_t start = seg.va;
-        const u8* data = seg.data.data();
-        const size_t size = seg.data.size();
-        const Arch arch = img_.arch;
-        const std::shared_ptr<std::atomic<bool>> cancel_flag = cancel_shared_;
-        futures.push_back(pool_.submit([start, data, size, arch, cancel_flag]() {
-            const auto cancelled = [cancel_flag] {
-                return cancel_flag->load(std::memory_order_relaxed);
-            };
-            if (arch == Arch::X86 || arch == Arch::X64) {
-                Disassembler decoder;
-                decoder.set_arch(arch);
-                return decoder.decode_range(start, data, size, cancelled);
+
+        size_t off = 0;
+        size_t last_probe = 0;
+        while (off < seg.data.size() && (!cap || tentative_.size() < cap)) {
+            if (off - last_probe >= 4096) {
+                last_probe = off;
+                if (cancel_.load(std::memory_order_relaxed)) return;
             }
-            CapstoneDisasm decoder;
-            decoder.set_arch(arch);
-            return decoder.decode_range(start, data, size, cancelled);
-        }));
-    }
-    for (auto& f : futures) {
-        auto decoded = f.get();
-        if (!cancel_.load(std::memory_order_relaxed))
-            for (auto& insn : decoded)
-                tentative_[insn.addr] = std::move(insn);
+
+            Insn insn{};
+            if (!decode_insn(seg.va + off, seg.data.data() + off,
+                             seg.data.size() - off, insn)) {
+                insn.addr = seg.va + off;
+                insn.len = 1;
+                insn.type = InsnType::Unknown;
+                insn.bytes[0] = seg.data[off];
+                insn.set_mnemonic("db");
+                const std::string operand = fmt::format("0x{:02X}", seg.data[off]);
+                insn.set_op_str(operand);
+            }
+
+            off += insn.len;
+            tentative_.emplace(insn.addr, std::move(insn));
+        }
     }
 }
 
@@ -260,6 +311,9 @@ void Analyzer::merge_tentative() {
 }
 
 void Analyzer::recursive_descent() {
+    // The sweep already saw most of what descent will confirm, so it is a
+    // good size hint and saves the map a long chain of rehashes
+    if (!tentative_.empty()) db_.insns.reserve(tentative_.size());
     std::unordered_set<va_t> visited;
     descend(img_.entry, visited);
     for (auto& exp : img_.exports)
@@ -269,11 +323,14 @@ void Analyzer::recursive_descent() {
 }
 
 void Analyzer::descend(va_t addr, std::unordered_set<va_t>& visited) {
+    if (over_budget()) return;
+
     std::queue<va_t> wl;
     wl.push(addr);
 
     while (!wl.empty()) {
         if (cancel_.load(std::memory_order_relaxed)) return;
+        if (over_budget()) return;
         va_t cur = wl.front(); wl.pop();
         if (visited.count(cur)) continue;
         if (!is_code_addr(cur)) continue;
@@ -289,22 +346,26 @@ void Analyzer::descend(va_t addr, std::unordered_set<va_t>& visited) {
             const va_t insn_addr = cur + off;
             const auto tentative = tentative_.find(insn_addr);
             if (tentative != tentative_.end()) {
-                insn = tentative->second;
+                insn = std::move(tentative->second);
+                tentative_.erase(tentative);
             } else if (!decode_insn(insn_addr, ptr + off, max_len - off, insn)) {
                 break;
             }
-            db_.insns[insn.addr] = insn;
-            off += insn.len;
+            const va_t decoded_addr = insn.addr;
+            db_.insns.insert_or_assign(decoded_addr, std::move(insn));
+            const Insn& decoded = db_.insns.at(decoded_addr);
+            off += decoded.len;
+            if (over_budget()) return;
 
-            if (insn.is_ret()) break;
-            if (insn.is_call()) {
-                va_t t = insn.branch_target();
+            if (decoded.is_ret()) break;
+            if (decoded.is_call()) {
+                va_t t = decoded.branch_target();
                 if (t && !visited.count(t)) wl.push(t);
             }
-            if (insn.is_branch()) {
-                va_t t = insn.branch_target();
+            if (decoded.is_branch()) {
+                va_t t = decoded.branch_target();
                 if (t && !visited.count(t)) wl.push(t);
-                if (insn.type == InsnType::Jmp) break;
+                if (decoded.type == InsnType::Jmp) break;
             }
         }
     }
@@ -316,8 +377,13 @@ void Analyzer::detect_functions() {
     for (auto& exp : img_.exports)
         if (!exp.forwarded && is_code_addr(exp.addr)) entries.insert(exp.addr);
 
-    // .pdata runtime functions — most reliable source for x64
+    // .pdata runtime functions — most reliable source for x64. Once the budget
+    // has bitten, most of them have no decoded body behind them, and a few
+    // hundred thousand empty Function records is a lot of memory spent on
+    // nothing, so take only the ones descent actually reached
+    const bool truncated = budget_reached();
     for (auto& rf : img_.runtime_funcs) {
+        if (truncated && !db_.insns.count(rf.start)) continue;
         entries.insert(rf.start);
     }
 
@@ -426,8 +492,9 @@ void Analyzer::remove_junk_code() {
     spdlog::info("removed {} junk instructions", to_remove.size());
 }
 
-void Analyzer::build_cfgs() {
+void Analyzer::build_cfgs(const std::unordered_set<va_t>* only) {
     for (auto& [entry, func] : db_.funcs) {
+        if (only && !only->count(entry)) continue;
         func.blocks.clear();
         func.block_addrs.clear();
         func.analyzed = false;
@@ -444,14 +511,16 @@ void Analyzer::build_cfgs() {
             bb.start = bb_start;
             va_t cur = bb_start;
 
-            while (db_.insns.count(cur)) {
+            for (;;) {
+                const auto found = db_.insns.find(cur);
+                if (found == db_.insns.end()) break;
                 if (!func.ranges.empty()) {
                     bool in_range = false;
                     for (const auto& [start, end] : func.ranges)
                         if (cur >= start && cur < end) { in_range = true; break; }
                     if (!in_range) break;
                 }
-                auto& insn = db_.insns[cur];
+                auto& insn = found->second;
                 bb.insns.push_back(insn);
                 cur += insn.len;
 
@@ -477,6 +546,9 @@ void Analyzer::build_cfgs() {
             }
 
             bb.end = cur;
+            // push_back doubles, so a block can carry up to its own size again
+            // in slack; across millions of instructions that is gigabytes
+            bb.insns.shrink_to_fit();
             func.block_addrs.push_back(bb.start);
             func.blocks[bb.start] = std::move(bb);
         }
@@ -500,11 +572,21 @@ void Analyzer::discover_cfg_fixed_point() {
     size_t previous_edges = static_cast<size_t>(-1);
     size_t previous_functions = static_cast<size_t>(-1);
 
+    // Round 0 has to look at everything. After that only functions that gained
+    // an edge or a resolved call site can produce a different CFG, so later
+    // rounds work off that set instead of re-walking the whole image
+    std::unordered_set<va_t> pending;
+    bool first_round = true;
+
     for (int iteration = 0; iteration < kMaxIterations; ++iteration) {
         if (cancel_.load(std::memory_order_relaxed)) return;
-        build_cfgs();
-        detect_switches();
-        propagate_dataflow();
+        if (!first_round && pending.empty()) return;
+
+        const std::unordered_set<va_t>* scope = first_round ? nullptr : &pending;
+        cfg_dirty_.clear();
+        build_cfgs(scope);
+        detect_switches(scope);
+        propagate_dataflow(scope);
 
         std::vector<va_t> new_functions;
         for (const auto& [site, target] : db_.resolved_indirect) {
@@ -529,19 +611,30 @@ void Analyzer::discover_cfg_fixed_point() {
             edges.erase(std::unique(edges.begin(), edges.end()), edges.end());
             edge_count += edges.size();
         }
-        if (edge_count == previous_edges && db_.funcs.size() == previous_functions)
-            break;
+        if (edge_count == previous_edges && db_.funcs.size() == previous_functions) {
+            // nothing new this round, so the CFGs built at the top of it
+            // already reflect every edge and function we know about
+            return;
+        }
         previous_edges = edge_count;
         previous_functions = db_.funcs.size();
+
+        // next round: functions whose edges moved, plus the ones just
+        // discovered, which have no CFG at all yet
+        pending = std::move(cfg_dirty_);
+        cfg_dirty_.clear();
+        for (va_t entry : new_functions) pending.insert(entry);
+        first_round = false;
     }
-    build_cfgs();
+    if (!pending.empty()) build_cfgs(&pending);
 }
 
-void Analyzer::detect_switches() {
+void Analyzer::detect_switches(const std::unordered_set<va_t>* only) {
     u32 tables_found = 0;
 
     for (auto& [entry, func] : db_.funcs) {
         if (!func.analyzed) continue;
+        if (only && !only->count(entry)) continue;
 
         for (auto& [ba, block] : func.blocks) {
             if (block.insns.size() < 2) continue;
@@ -570,6 +663,7 @@ void Analyzer::detect_switches() {
                     if (!is_code_addr(target)) break;
                     block.succs.push_back(target);
                     recovered_edges_[last.addr].push_back(target);
+                    cfg_dirty_.insert(entry);
                 }
                 ++tables_found;
                 continue;
@@ -617,6 +711,7 @@ void Analyzer::detect_switches() {
                 if (!is_code_addr(target)) break;
                 block.succs.push_back(target);
                 recovered_edges_[last.addr].push_back(target);
+                cfg_dirty_.insert(entry);
             }
             ++tables_found;
         }
@@ -625,6 +720,13 @@ void Analyzer::detect_switches() {
 }
 
 void Analyzer::build_xrefs() {
+    // Most instructions contribute at least one xref, so size the flat list
+    // and both direction maps from the instruction count rather than letting
+    // them grow (and rehash, and relink) their way there
+    db_.xrefs.reserve(db_.insns.size());
+    db_.xrefs_to.reserve(db_.insns.size() / 2);
+    db_.xrefs_from.reserve(db_.insns.size() / 2);
+
     for (auto& [addr, insn] : db_.insns) {
         if (insn.is_call()) {
             va_t t = insn.branch_target();
@@ -859,6 +961,15 @@ void Analyzer::detect_noreturn() {
 
 void Analyzer::detect_tail_calls() {
     u32 count = 0;
+
+    // Retyping a jump xref used to std::find_if over the whole flat xref
+    // vector per candidate, which is quadratic once an image has millions of
+    // them. Index the flat vector by source address once instead.
+    std::unordered_map<va_t, std::vector<size_t>> flat_by_from;
+    flat_by_from.reserve(db_.xrefs.size());
+    for (size_t i = 0; i < db_.xrefs.size(); ++i)
+        flat_by_from[db_.xrefs[i].from].push_back(i);
+
     for (auto& [entry, func] : db_.funcs) {
         if (!func.analyzed) continue;
         va_t func_end = 0;
@@ -881,11 +992,18 @@ void Analyzer::detect_tail_calls() {
                     is_tail = true;
 
             if (is_tail) {
-                auto it = std::find_if(db_.xrefs.begin(), db_.xrefs.end(), [&](const Xref& x) {
-                    return x.from == last.addr && x.to == target && x.type == XrefType::CodeJump;
-                });
-                if (it != db_.xrefs.end()) {
-                    it->type = XrefType::CodeCall;
+                bool retyped = false;
+                const auto candidates = flat_by_from.find(last.addr);
+                if (candidates != flat_by_from.end()) {
+                    for (size_t i : candidates->second) {
+                        Xref& x = db_.xrefs[i];
+                        if (x.to != target || x.type != XrefType::CodeJump) continue;
+                        x.type = XrefType::CodeCall;
+                        retyped = true;
+                        break;
+                    }
+                }
+                if (retyped) {
                     for (auto& xr : db_.xrefs_to[target])
                         if (xr.from == last.addr && xr.type == XrefType::CodeJump)
                             xr.type = XrefType::CodeCall;
@@ -933,11 +1051,12 @@ void Analyzer::detect_calling_conventions() {
     spdlog::info("calling conventions assigned (x64={})", is_x64 ? "yes" : "no");
 }
 
-void Analyzer::propagate_dataflow() {
+void Analyzer::propagate_dataflow(const std::unordered_set<va_t>* only) {
     u32 resolved = 0;
 
     for (auto& [entry, func] : db_.funcs) {
         if (!func.analyzed || func.blocks.empty()) continue;
+        if (only && !only->count(entry)) continue;
 
         std::unordered_map<u16, va_t> reg_vals;
 
@@ -965,7 +1084,10 @@ void Analyzer::propagate_dataflow() {
                     insn.op_count > 0 && insn.ops[0].type == OpType::Reg) {
                     auto it = reg_vals.find(insn.ops[0].reg);
                     if (it != reg_vals.end() && it->second != 0 && is_code_addr(it->second)) {
-                        if (!db_.resolved_indirect.count(insn.addr)) ++resolved;
+                        if (!db_.resolved_indirect.count(insn.addr)) {
+                            ++resolved;
+                            cfg_dirty_.insert(entry);
+                        }
                         db_.resolved_indirect[insn.addr] = it->second;
                     }
                 }
@@ -981,7 +1103,10 @@ void Analyzer::propagate_dataflow() {
                             va_t target = 0;
                             std::memcpy(&target, ptr, (img_.arch == Arch::X64 || img_.arch == Arch::ARM64 || img_.arch == Arch::PPC) ? 8 : 4);
                             if (is_code_addr(target)) {
-                                if (!db_.resolved_indirect.count(insn.addr)) ++resolved;
+                                if (!db_.resolved_indirect.count(insn.addr)) {
+                                    ++resolved;
+                                    cfg_dirty_.insert(entry);
+                                }
                                 db_.resolved_indirect[insn.addr] = target;
                             }
                         }
@@ -1118,6 +1243,13 @@ void Analyzer::detect_loops() {
 void Analyzer::recover_structs() {
     u32 count = 0;
 
+    // The builtin ids never move, so resolve them once instead of four
+    // name lookups per recovered field
+    const TypeDef* builtin_u8  = db_.types.find_by_name("u8");
+    const TypeDef* builtin_u16 = db_.types.find_by_name("u16");
+    const TypeDef* builtin_u32 = db_.types.find_by_name("u32");
+    const TypeDef* builtin_u64 = db_.types.find_by_name("u64");
+
     for (auto& [entry, func] : db_.funcs) {
         if (!func.analyzed) continue;
 
@@ -1162,21 +1294,15 @@ void Analyzer::recover_structs() {
                     total_size = static_cast<u32>(off) + sz;
 
             u32 sid = db_.types.add_struct(name, total_size);
-            [[maybe_unused]] u32 field_idx = 0;
             for (auto& [off, sz] : fields_set) {
-                std::string fname = fmt::format("field_{:X}", off);
                 u32 type_id = 0;
-                auto* t8  = db_.types.find_by_name("u8");
-                auto* t16 = db_.types.find_by_name("u16");
-                auto* t32 = db_.types.find_by_name("u32");
-                auto* t64 = db_.types.find_by_name("u64");
-                if (sz == 1 && t8) type_id = t8->id;
-                else if (sz == 2 && t16) type_id = t16->id;
-                else if (sz == 4 && t32) type_id = t32->id;
-                else if (sz == 8 && t64) type_id = t64->id;
-                else if (t32) type_id = t32->id;
-                db_.types.add_field(sid, fname, type_id, static_cast<u32>(off));
-                ++field_idx;
+                if (sz == 1 && builtin_u8) type_id = builtin_u8->id;
+                else if (sz == 2 && builtin_u16) type_id = builtin_u16->id;
+                else if (sz == 4 && builtin_u32) type_id = builtin_u32->id;
+                else if (sz == 8 && builtin_u64) type_id = builtin_u64->id;
+                else if (builtin_u32) type_id = builtin_u32->id;
+                db_.types.add_field(sid, fmt::format("field_{:X}", off), type_id,
+                                    static_cast<u32>(off));
             }
             ++count;
         }

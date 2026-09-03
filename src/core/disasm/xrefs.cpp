@@ -10,8 +10,15 @@ const std::vector<xref_t> xref_index_t::kEmpty{};
 
 namespace {
 
-// skip high entropy sections, compressed blobs only produce garbage refs
-// and can eat the cap before real code is indexed
+// Skip high entropy sections: compressed blobs only produce garbage refs and
+// can eat the cap before real code is indexed.
+//
+// The cutoff has to clear real compiled code, which is noisier than it looks —
+// a large optimised x64 .text measures around 6.6, and the old 6.5 cutoff
+// silently produced zero xrefs for exactly the big binaries this index matters
+// most for. Packed and encrypted payloads sit at 7.5 and up
+constexpr double kPackedEntropy = 7.2;
+
 double section_entropy(const uint8_t* data, size_t len) {
     if (!data || len == 0) return 0.0;
     // Sample up to 64 KiB from the section for speed
@@ -45,14 +52,14 @@ bool xref_index_t::build(const pe_image_t& pe, const std::vector<uint8_t>& file,
 
         // Skip high-entropy sections (compressed/encrypted blobs produce
         // only noise refs and burn through the max_refs budget)
-        if (s.raw_size > 4096 && section_entropy(data, s.raw_size) > 6.5)
+        if (s.raw_size > 4096 && section_entropy(data, s.raw_size) > kPackedEntropy)
             continue;
 
         size_t off = 0;
         while (off < s.raw_size) {
             if (total_ >= max_refs) return true;   // index full, still usable
 
-            auto insn = eng.decode(sec_va + off, data + off, s.raw_size - off);
+            auto insn = eng.decode(sec_va + off, data + off, s.raw_size - off, false);
             if (!insn) { ++off; continue; }        // resync by one byte
 
             const uint64_t from = insn->va;

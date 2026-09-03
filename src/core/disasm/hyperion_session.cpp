@@ -1,11 +1,15 @@
 // src/core/disasm/hyperion_session.cpp
 
+// GlobalMemoryStatusEx, for sizing the analysis budget against available RAM
+#include <windows.h>
+
 #include "core/disasm/hyperion_session.hpp"
 
 #include "core/infra/diag.hpp"
 
 #include <algorithm>
 #include <cctype>
+#include <cstdlib>
 
 namespace slop::core::disasm::hyperion_session {
 
@@ -17,6 +21,27 @@ hype::Disassembler& shared_decoder() {
     // is serialized by g_decoder_mu at the call sites below
     static hype::Disassembler dec;
     return dec;
+}
+
+size_t analysis_insn_budget() {
+    static const size_t budget = [] {
+        if (const char* env = std::getenv("SLOP_HYPERION_INSN_BUDGET")) {
+            char* end = nullptr;
+            const unsigned long long v = std::strtoull(env, &end, 10);
+            if (end != env) return static_cast<size_t>(v);
+        }
+        MEMORYSTATUSEX mem{};
+        mem.dwLength = sizeof(mem);
+        if (!GlobalMemoryStatusEx(&mem)) return static_cast<size_t>(1'000'000);
+
+        // The instruction map, sweep cache, CFG copy, xrefs and allocator
+        // overhead coexist during analysis. Leave most currently available
+        // memory to the loaded image, the UI and the operating system.
+        constexpr uint64_t kBytesPerInsn = 1024;
+        const uint64_t affordable = (mem.ullAvailPhys / 4) / kBytesPerInsn;
+        return static_cast<size_t>(std::clamp<uint64_t>(affordable, 250'000, 2'000'000));
+    }();
+    return budget;
 }
 
 namespace {
@@ -192,6 +217,7 @@ bool session_t::begin(const uint8_t* bytes, size_t len, uint64_t base_override) 
     }
 
     analyzer_ = std::make_unique<hype::Analyzer>(img_, pool_);
+    analyzer_->set_insn_budget(analysis_insn_budget());
     return true;
 }
 
@@ -221,7 +247,11 @@ void session_t::run_pipeline() {
         slop::core::infra::diag::info(
             "hyperion", "analysis done — " +
                 std::to_string(db().funcs.size()) + " functions, " +
-                std::to_string(db().insns.size()) + " insns");
+                std::to_string(db().insns.size()) + " insns" +
+                (analyzer_->budget_reached()
+                     ? " (partial: instruction budget of " +
+                           std::to_string(analyzer_->insn_budget()) + " reached)"
+                     : std::string{}));
     } catch (const std::exception& e) {
         set_error(std::string("hyperion analysis failed: ") + e.what());
     } catch (...) {
@@ -286,6 +316,12 @@ void session_t::stop() {
     join_worker();
     // A completed run between the flag and the join is fine, stop() is a
     // no-op then. A cancelled one left ready_ false with the error set
+}
+
+bool session_t::truncated() const {
+    if (!ready_.load(std::memory_order_acquire)) return false;
+    std::lock_guard lk(start_mu_);
+    return analyzer_ && analyzer_->budget_reached();
 }
 
 bool session_t::running() const {

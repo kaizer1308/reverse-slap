@@ -34,6 +34,10 @@ struct binary_t {
     std::string              name;            // display name
     std::string              path;            // source file path
     std::vector<uint8_t>     file;
+    // fnv1a over `file`, computed once at load. It keys the annotation store
+    // and every rename/comment/bookmark writes that store back, so rehashing
+    // a few hundred megabytes per keystroke is not an option
+    uint64_t                 file_hash = 0;
     disasm::pe_image_t       pe;
     uint64_t                 base   = 0;      // VA base used everywhere
     disasm::engine_t         eng;
@@ -94,6 +98,7 @@ struct hype_status_t {
     bool        engine_present = false;
     bool        ready          = false;
     bool        running        = false;   // analysis in flight
+    bool        truncated      = false;   // ready, but the image outgrew the budget
     float       progress       = 0.f;     // 0..1 while running
 };
 hype_status_t hype_status();

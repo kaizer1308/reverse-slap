@@ -5,7 +5,6 @@
 #include "core/infra/diag.hpp"
 
 #include <algorithm>
-#include <set>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -76,7 +75,7 @@ bool function_index_t::build(const pe_image_t& pe, const std::vector<uint8_t>& f
     if (ranges.empty()) return false;
 
     std::unordered_map<uint64_t, size_t> extent;   // fn start -> last decoded end off
-    std::set<uint64_t> claimed;
+    std::unordered_set<uint64_t> claimed;
 
     // Recursive descent
     std::vector<uint64_t> worklist;
@@ -96,7 +95,7 @@ bool function_index_t::build(const pe_image_t& pe, const std::vector<uint8_t>& f
 
         const uint64_t start = worklist.back();
         worklist.pop_back();
-        if (claimed.count(start)) continue;
+        if (!claimed.insert(start).second) continue;
 
         const exec_range_t* rng = range_for_va(ranges, start);
         if (!rng) continue;
@@ -109,13 +108,11 @@ bool function_index_t::build(const pe_image_t& pe, const std::vector<uint8_t>& f
             if (off_in_range >= rng->len) break;
 
             auto insn = eng.decode(va, file.data() + rng->file_off + off_in_range,
-                                   rng->len - static_cast<size_t>(off_in_range));
+                                   rng->len - static_cast<size_t>(off_in_range), false);
             if (!insn) break;
 
             if (insn->flow == flow_t::call && insn->has_rel_target)
                 push_target(insn->rel_target);
-
-            claimed.insert(start);
 
             if (insn->flow == flow_t::ret) { terminated_cleanly = true; break; }
             if (insn->flow == flow_t::jmp) {
@@ -140,6 +137,20 @@ bool function_index_t::build(const pe_image_t& pe, const std::vector<uint8_t>& f
         }
     }
 
+    // Recursive descent already decoded these spans. Without this the sweep
+    // below re-validates candidates in the middle of known functions, decoding
+    // up to 2048 instructions each time, which on a large image is most of
+    // the index build
+    std::vector<std::pair<uint64_t, uint64_t>> covered;   // sorted [start, end)
+    covered.reserve(extent.size());
+    for (const auto& [start, sz] : extent) covered.emplace_back(start, start + sz);
+    std::sort(covered.begin(), covered.end());
+    const auto is_covered = [&covered](uint64_t va) {
+        auto it = std::upper_bound(covered.begin(), covered.end(), va,
+            [](uint64_t v, const std::pair<uint64_t, uint64_t>& r) { return v < r.first; });
+        return it != covered.begin() && va < std::prev(it)->second;
+    };
+
     // Prologue heuristic sweep over unclaimed bytes
     for (const auto& rng : ranges) {
         if (fns_.size() >= max_functions) { stats_.truncated = true; break; }
@@ -157,7 +168,7 @@ bool function_index_t::build(const pe_image_t& pe, const std::vector<uint8_t>& f
             if (!looks_like_prologue(p, rng.len - off)) continue;
 
             const uint64_t cand = rng.va + off;
-            if (claimed.count(cand)) continue;
+            if (claimed.count(cand) || is_covered(cand)) continue;
 
             // Validate by decoding toward an eventual ret within 16 KiB
             uint64_t va = cand;
@@ -166,7 +177,7 @@ bool function_index_t::build(const pe_image_t& pe, const std::vector<uint8_t>& f
                 const uint64_t o = va - rng.va;
                 if (o >= rng.len) break;
                 auto insn = eng.decode(va, file.data() + rng.file_off + o,
-                                       rng.len - static_cast<size_t>(o));
+                                       rng.len - static_cast<size_t>(o), false);
                 if (!insn) break;
                 if (insn->flow == flow_t::ret) { ok = true; break; }
                 va += insn->length;

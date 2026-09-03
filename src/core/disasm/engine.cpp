@@ -25,7 +25,7 @@ bool engine_t::init(bool x64) {
 }
 
 std::optional<insn_t> engine_t::decode(uint64_t va, const uint8_t* buf,
-                                       size_t len) const {
+                                       size_t len, bool want_text) const {
     if (!initialized_ || buf == nullptr || len == 0) return std::nullopt;
 
     ZydisDecodedInstruction instr{};
@@ -41,11 +41,13 @@ std::optional<insn_t> engine_t::decode(uint64_t va, const uint8_t* buf,
     std::memcpy(out.bytes, buf, instr.length);
     out.mnemonic = instr.mnemonic;
 
-    char text[256]{};
-    if (ZYAN_SUCCESS(ZydisFormatterFormatInstruction(&formatter_, &instr, ops,
-                                                     instr.operand_count_visible,
-                                                     text, sizeof(text), va, ZYAN_NULL)))
-        out.text = text;
+    if (want_text) {
+        char text[256]{};
+        if (ZYAN_SUCCESS(ZydisFormatterFormatInstruction(&formatter_, &instr, ops,
+                                                         instr.operand_count_visible,
+                                                         text, sizeof(text), va, ZYAN_NULL)))
+            out.text = text;
+    }
 
     // Compact operand summary for analysis passes
     const uint8_t vis =

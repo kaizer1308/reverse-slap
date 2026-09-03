@@ -42,6 +42,10 @@ struct session_t {
     // cooperative cancel, flags the analyzer and waits for the worker to land
     void stop();
 
+    // analysis landed but had to stop short of the whole image, see
+    // analysis_insn_budget()
+    bool        truncated() const;
+
     bool        ready() const { return ready_.load(std::memory_order_acquire); }
     // True while the background worker is running a pipeline (between
     // start()/reanalyze() and ready()/stop()/failure)
@@ -118,5 +122,14 @@ private:
 // Shared decode engine (thread-guarded; hyperion's Zydis decoder carries no
 // cross-call state, but the C++ wrapper is cheap to lock)
 hype::Disassembler& shared_decoder();
+
+// How many instructions a single analysis may put in the database. The DB
+// holds one record per instruction plus another per basic block, so a few
+// hundred megabytes of code would need tens of gigabytes; past the budget the
+// run stops descending and reports truncated() instead of thrashing.
+//
+// Derived from available RAM, floor 250K, ceiling 2M. SLOP_HYPERION_INSN_BUDGET
+// overrides it (0 disables the cap entirely)
+size_t analysis_insn_budget();
 
 } // namespace slop::core::disasm::hyperion_session
