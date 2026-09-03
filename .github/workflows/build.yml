@@ -155,12 +155,18 @@ jobs:
     permissions:
       contents: read
     env:
-      # incremental only here: no sccache in this job, so no conflict.
+      # incremental + sccache-composed: rust-cache handles target/, sccache
+      # wraps rustc for cold hits. DEBUG=0 keeps link fast (strip stays on).
       CARGO_INCREMENTAL: 1
+      RUSTC_WRAPPER: sccache
+      CARGO_PROFILE_RELEASE_DEBUG: 0
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 1
+
+      - name: sccache (rustc wrapper)
+        uses: mozilla-actions/sccache-action@v0.0.9
 
       - name: setup node with npm cache
         uses: actions/setup-node@v4
@@ -222,12 +228,13 @@ jobs:
 
       - name: build frontend bundle (no C++ rebuild, driver pre-staged)
         shell: pwsh
-        run: powershell -NoProfile -File tools\build.ps1 -FrontendOnly -SkipDriver -Full
+        run: powershell -NoProfile -File tools\build.ps1 -FrontendOnly -SkipDriver -Full -OnlineWebview
 
       - name: upload the portable app
         uses: actions/upload-artifact@v4
         with:
           name: reverse-slop-portable
+          compression-level: 0
           path: |
             dist/reverse-slop/reverse-slop.exe
             dist/reverse-slop/engine
@@ -237,5 +244,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: reverse-slop-setup
+          compression-level: 0
           path: app/src-tauri/target/release/bundle/nsis/*-setup.exe
           if-no-files-found: error

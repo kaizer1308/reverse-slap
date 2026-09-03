@@ -7,6 +7,7 @@ param(
     [switch]$Full,
     [switch]$FrontendOnly,
     [switch]$SkipDriver,
+    [switch]$OnlineWebview,
     [string]$CmakeExtra = '',
     [string]$Preset = 'ninja-msvc-release'
 )
@@ -227,9 +228,11 @@ if (-not $NoFrontend) {
             Write-Host '==> magicmida absent, bundling without the Themida unpacker'
         }
         $bundleOverride = @{ resources = $resources }
-        if ($Full) {
+        if ($Full -and -not $OnlineWebview) {
             # embed the whole webview2 runtime so a machine with neither
-            # webview2 nor internet still installs, adds ~130 MB to the setup exe
+            # webview2 nor internet still installs, adds ~130 MB to the setup exe.
+            # CI passes -OnlineWebview to skip the 150MB runtime download +
+            # NSIS recompression (~1-2 min saved); local full builds keep offline.
             $bundleOverride['windows'] = @{ webviewInstallMode = @{ type = 'offlineInstaller' } }
         }
         $override = @{ bundle = $bundleOverride }
