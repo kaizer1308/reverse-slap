@@ -12,7 +12,9 @@ concurrency:
 env:
   # CI-fast Rust: local Cargo.toml keeps lto=true + codegen-units=1 for max
   # runtime perf, CI overrides for link speed (~2-4 min saved).
-  CARGO_INCREMENTAL: 1
+  # NOTE: CARGO_INCREMENTAL lives only on the frontend job — sccache rejects
+  # it even when wrapping MSVC cl.exe (cxx/tests configure fails with
+  # "Incremental compilation is prohibited").
   CARGO_PROFILE_RELEASE_CODEGEN_UNITS: 16
   CARGO_PROFILE_RELEASE_LTO: false
   CARGO_PROFILE_RELEASE_STRIP: true
@@ -20,8 +22,6 @@ env:
   CMAKE_DISABLE_FIND_PACKAGE_PkgConfig: TRUE
   CMAKE_DISABLE_FIND_PACKAGE_Doxygen: TRUE
   SCCACHE_GHA_ENABLED: "true"
-  CMAKE_C_COMPILER_LAUNCHER: sccache
-  CMAKE_CXX_COMPILER_LAUNCHER: sccache
 
 jobs:
   # C++ engine + mapper only, no tests, no frontend.
@@ -31,6 +31,9 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: read
+    env:
+      CMAKE_C_COMPILER_LAUNCHER: sccache
+      CMAKE_CXX_COMPILER_LAUNCHER: sccache
     steps:
       - uses: actions/checkout@v4
         with:
@@ -119,6 +122,9 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: read
+    env:
+      CMAKE_C_COMPILER_LAUNCHER: sccache
+      CMAKE_CXX_COMPILER_LAUNCHER: sccache
     steps:
       - uses: actions/checkout@v4
         with:
@@ -148,6 +154,9 @@ jobs:
     needs: [cxx, driver]
     permissions:
       contents: read
+    env:
+      # incremental only here: no sccache in this job, so no conflict.
+      CARGO_INCREMENTAL: 1
     steps:
       - uses: actions/checkout@v4
         with:
