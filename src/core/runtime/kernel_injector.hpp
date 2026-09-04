@@ -40,6 +40,13 @@ struct inject_options_t {
     // returns, so hidden-module walks and CreateToolhelp module snapshots
     // don't see it
     bool unlink_peb = false;
+    // unload of a manual-mapped image: call DllMain(DLL_PROCESS_DETACH)
+    // before freeing. OFF by default -- the static CRT's detach path runs
+    // per-thread teardown (_freeptd, FLS callbacks) on whichever host
+    // thread the hijack landed on, and for an image with no LDR entry that
+    // corrupts the host's CRT state nondeterministically. The memory free
+    // alone is always safe.
+    bool call_dllmain_detach = false;
     // total budget for the thread-hijack call primitive (per call)
     uint32_t call_timeout_ms = 8000;
 };
@@ -99,9 +106,14 @@ inject_result_t inject_manual_map_file(uint32_t pid,
 
 // Best-effort unload of a mapped DLL. For loadlibrary mode this resolves
 // FreeLibrary in kernel32 and calls it. For manual-map bases we just call
-// DllMain(base, DLL_PROCESS_DETACH, 1) then kernel-free.
+// DllMain(base, DLL_PROCESS_DETACH, 1) then kernel-free. size_hint, when
+// nonzero, is the mapped SizeOfImage from the inject result -- it lets the
+// VAD re-merge (needed for the one-shot MEM_RELEASE after per-section
+// protection split the allocation) work even when the target's header page
+// has been trimmed out of the working set and the physical read fails.
 inject_result_t unload(uint32_t pid, uint64_t module_base,
                        bool manual_mapped,
-                       const inject_options_t& opts = {});
+                       const inject_options_t& opts = {},
+                       uint64_t size_hint = 0);
 
 } // namespace slop::core::runtime::injector

@@ -1785,16 +1785,15 @@ namespace thread_hijack {
 
 
     __forceinline void force_wake_thread(HANDLE thread_handle) {
-
-
-        if (pCancelSynchronousIo) {
-            pCancelSynchronousIo(thread_handle);
-        }
-
-
-        if (pNtAlertThread) {
-            pNtAlertThread(thread_handle);
-        }
+        // Intentionally a no-op. Waking a hijacked thread by force is the
+        // wrong move in every direction: CancelSynchronousIo cancels
+        // whatever synchronous I/O the thread is blocked in (a console
+        // app's stdin read dies and the process exits cleanly), and
+        // NtAlertThread aborts alertable ALPC waits the same way. A thread
+        // worth hijacking either is running (resumes straight into the
+        // shellcode) or wakes on its own (sleep loops, message pumps,
+        // game render/net threads) -- the poll budget spans that wake.
+        (void)thread_handle;
     }
 
 
@@ -2537,6 +2536,12 @@ std::uint64_t voyager::device_t::call_function_attempt(
         static_cast<unsigned long long>(remote_call_request_fingerprint(req)),
         static_cast<unsigned long long>(GetTickCount64() - attempt_start));
 
+    // RC ioctl contract: we send req.shellcode_address = allocation base,
+    // and handle7781 writes back the actual code entry (base + 0x200) into
+    // the same field before returning -- read AFTER send_request it is
+    // already the entry point. Do NOT add CODE_OFFSET here; that lands RIP
+    // in the zero-filled tail of the allocation and the hijacked thread
+    // dies on `add [rax], al` with a garbage RAX.
     std::uint64_t code_entry = req.shellcode_address;
 
 
@@ -2609,10 +2614,22 @@ std::uint64_t voyager::device_t::call_function_attempt(
     }
 
 
-    constexpr int MAX_WAIT_ITERATIONS = 2000;
+    // Early attempts get a short budget: a thread parked in a wait that
+    // never completes (console read, ALPC receive) is quickly given up on
+    // and restored so the next attempt can pick a self-waking thread. The
+    // later attempts carry the full budget so sleep-loop threads (1s
+    // tickers, message pumps) get their wake covered.
+    const bool early_attempt = (attempt_index <= 2);
+    constexpr int MAX_WAIT_ITERATIONS_FULL  = 30000;
+    constexpr int MAX_WAIT_ITERATIONS_EARLY = 6000;
+    const int MAX_WAIT_ITERATIONS =
+        early_attempt ? MAX_WAIT_ITERATIONS_EARLY : MAX_WAIT_ITERATIONS_FULL;
+    constexpr ULONGLONG MAX_POLL_DURATION_MS_FULL  = 15000;
+    constexpr ULONGLONG MAX_POLL_DURATION_MS_EARLY = 2500;
+    const ULONGLONG MAX_POLL_DURATION_MS =
+        early_attempt ? MAX_POLL_DURATION_MS_EARLY : MAX_POLL_DURATION_MS_FULL;
     constexpr int FAST_POLL_THRESHOLD = 500;
     constexpr int MEDIUM_POLL_THRESHOLD = 2000;
-    constexpr ULONGLONG MAX_POLL_DURATION_MS = 15000;
 
     std::uint64_t result = 0;
     bool completed = false;

@@ -31,8 +31,9 @@ voyager::device_t* active_dev(std::string* error) {
 }
 
 // Bind the device to a target pid: switch the device's process context,
-// resolve DTB if missing. Everything downstream (read_raw, write_raw,
-// allocate_memory, call_function) rides on this.
+// resolve DTB if missing, and populate the main-image base (call_function's
+// spoof-gadget search refuses to run without it). Everything downstream
+// (read_raw, write_raw, allocate_memory, call_function) rides on this.
 bool bind_pid(voyager::device_t& dev, uint32_t pid, std::string* error) {
     if (pid == 0 || pid <= 4) {
         if (error) *error = "invalid pid";
@@ -48,6 +49,12 @@ bool bind_pid(voyager::device_t& dev, uint32_t pid, std::string* error) {
             return false;
         }
         dev.set_dtb(dtb);
+    }
+    if (dev.get_base_address() == 0) {
+        // find_image() asks the driver for the target's main image base and
+        // caches it in the device; without it call_function bails out at the
+        // spoof-gadget stage and every remote call silently returns 0
+        dev.find_image();
     }
     return true;
 }
@@ -603,8 +610,12 @@ inject_result_t inject_loadlibrary(uint32_t pid, const std::wstring& dll_path,
 
     // 6. optional header erase
     if (opts.erase_pe_header) {
-        // zero the first page (contains MZ, DOS stub, PE, optional header,
-        // and the section headers)
+        // the loader maps image headers read-only, and the driver's write
+        // path ProbeForWrites through the target's address space -- flip
+        // the first page writable before zeroing or the erase silently
+        // fails on LoadLibrary'd modules
+        uint32_t old_prot = 0;
+        dev->protect_memory(rc, 0x1000, PAGE_READWRITE, &old_prot);
         if (zero_target(*dev, rc, 0x1000)) {
             r.header_erased = true;
             log(r, "erase", "zeroed first 0x1000 of module");
@@ -950,8 +961,7 @@ inject_result_t inject_manual_map_file(uint32_t pid,
 // =========================================================================
 
 inject_result_t unload(uint32_t pid, uint64_t module_base, bool manual_mapped,
-                       const inject_options_t& opts) {
-    (void)opts;
+                       const inject_options_t& opts, uint64_t size_hint) {
     inject_result_t r;
     r.mode = manual_mapped ? "manual_map" : "loadlibrary";
     r.pid = pid;
@@ -974,22 +984,53 @@ inject_result_t unload(uint32_t pid, uint64_t module_base, bool manual_mapped,
         return r;
     }
 
-    // manual-mapped: call DllMain(DLL_PROCESS_DETACH) then free
-    // caller must know the entry point; probe the target headers if erased
-    // we can only best-effort here. Skip DllMain if we can't find it.
+    // manual-mapped: optionally call DllMain(DLL_PROCESS_DETACH), then
+    // free the region. DllMain(DETACH) is opt-in (see inject_options_t):
+    // the static CRT's detach runs per-thread teardown on the hijacked
+    // host thread, which corrupts host CRT state for LDR-less images.
     const uint64_t maybe_mz = dev->read<uint16_t>(module_base);
-    if (maybe_mz == IMAGE_DOS_SIGNATURE) {
-        const uint32_t e_lfanew = dev->read<uint32_t>(module_base + 0x3C);
-        const uint32_t entry_rva =
-            dev->read<uint32_t>(module_base + e_lfanew + 0x28);
-        if (entry_rva) {
-            const uint64_t entry = module_base + entry_rva;
-            dev->call_function(entry, module_base, DLL_PROCESS_DETACH, 0);
-            log(r, "detach",
-                "DllMain(DETACH) at 0x" + std::to_string(entry));
+    const uint32_t e_lfanew =
+        (maybe_mz == IMAGE_DOS_SIGNATURE)
+            ? dev->read<uint32_t>(module_base + 0x3C) : 0;
+    const bool headers_ok = e_lfanew > 0 && e_lfanew < 0x400;
+
+    if (opts.call_dllmain_detach) {
+        if (headers_ok) {
+            const uint32_t entry_rva =
+                dev->read<uint32_t>(module_base + e_lfanew + 0x28);
+            if (entry_rva) {
+                const uint64_t entry = module_base + entry_rva;
+                const uint64_t dret =
+                    dev->call_function(entry, module_base, DLL_PROCESS_DETACH, 0);
+                log(r, "detach",
+                    "DllMain(DETACH) at 0x" + std::to_string(entry) +
+                        " -> 0x" + std::to_string(dret));
+            }
+        } else {
+            log(r, "detach", "headers unreadable or erased, DllMain(DETACH) skipped");
         }
-    } else {
-        log(r, "detach", "header already erased, skipping DllMain(DETACH)");
+    }
+
+    // per-section protection during the map split the allocation's VAD; a
+    // single uniform re-protect coalesces the splits so the one-shot
+    // MEM_RELEASE below can free the whole region. Prefer the caller's
+    // size hint -- the target's header page can get trimmed out of the
+    // working set mid-call and the physical read then returns 0.
+    uint32_t size_of_image = static_cast<uint32_t>(size_hint & 0xFFFFFFFFull);
+    if (size_of_image == 0 && headers_ok) {
+        size_of_image = dev->read<uint32_t>(module_base + e_lfanew + 0x50);
+    }
+    if (size_of_image > 0x1000 && size_of_image < 0x10000000) {
+        uint32_t old_prot = 0;
+        if (dev->protect_memory(module_base, size_of_image,
+                                PAGE_READWRITE, &old_prot)) {
+            log(r, "merge", "re-protected 0x" +
+                                std::to_string(size_of_image) +
+                                " to coalesce split VADs");
+        } else {
+            log(r, "merge", "re-protect failed gle=" +
+                                std::to_string(GetLastError()));
+        }
     }
 
     if (dev->free_memory(module_base)) {

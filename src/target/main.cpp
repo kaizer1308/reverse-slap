@@ -28,6 +28,52 @@ std::atomic<bool> g_running{true};
 std::atomic<bool> g_auto_tick{false};
 std::atomic<int>  g_tick_hz{1};
 
+// Crash diagnostics: the injector test suite hijacks threads in this
+// process, and when something goes wrong the access violation kills the
+// fixture with no trace. This filter writes the exception record and
+// register state to %TEMP% so the failing instruction is identifiable.
+LONG WINAPI crash_dump_filter(EXCEPTION_POINTERS* ep) {
+    char path[MAX_PATH] = {};
+    if (GetTempPathA(MAX_PATH, path) == 0) return EXCEPTION_CONTINUE_SEARCH;
+    char tail[64] = {};
+    std::snprintf(tail, sizeof(tail), "sloptarget_crash_%u.txt",
+                  GetCurrentProcessId());
+    std::strcat(path, tail);
+    FILE* f = nullptr;
+    if (fopen_s(&f, path, "w") == 0 && f) {
+        const EXCEPTION_RECORD& xr = *ep->ExceptionRecord;
+        std::fprintf(f, "code=0x%08lX addr=0x%llX flags=0x%lX\n",
+                     xr.ExceptionCode,
+                     (unsigned long long)(uintptr_t)xr.ExceptionAddress,
+                     xr.ExceptionFlags);
+        for (unsigned i = 0; i < xr.NumberParameters && i < 15; ++i)
+            std::fprintf(f, "info[%u]=0x%llX\n", i,
+                         (unsigned long long)xr.ExceptionInformation[i]);
+        if (ep->ContextRecord) {
+            const CONTEXT& c = *ep->ContextRecord;
+            std::fprintf(f,
+                "rip=0x%llX rsp=0x%llX rbp=0x%llX\n"
+                "rax=0x%llX rbx=0x%llX rcx=0x%llX rdx=0x%llX\n"
+                "rsi=0x%llX rdi=0x%llX r8=0x%llX r9=0x%llX\n"
+                "r10=0x%llX r11=0x%llX r12=0x%llX r13=0x%llX\n"
+                "r14=0x%llX r15=0x%llX\n"
+                "tid=%lu\n",
+                (unsigned long long)c.Rip, (unsigned long long)c.Rsp,
+                (unsigned long long)c.Rbp,
+                (unsigned long long)c.Rax, (unsigned long long)c.Rbx,
+                (unsigned long long)c.Rcx, (unsigned long long)c.Rdx,
+                (unsigned long long)c.Rsi, (unsigned long long)c.Rdi,
+                (unsigned long long)c.R8, (unsigned long long)c.R9,
+                (unsigned long long)c.R10, (unsigned long long)c.R11,
+                (unsigned long long)c.R12, (unsigned long long)c.R13,
+                (unsigned long long)c.R14, (unsigned long long)c.R15,
+                GetCurrentThreadId());
+        }
+        std::fclose(f);
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
 void ticker_thread() {
     while (g_running.load(std::memory_order_relaxed)) {
         if (g_auto_tick.load(std::memory_order_relaxed)) {
@@ -100,6 +146,7 @@ void process_command(const char* line) {
 } // namespace
 
 int main(int argc, char* argv[]) {
+    SetUnhandledExceptionFilter(crash_dump_filter);
     setvbuf(stdout, nullptr, _IONBF, 0);
     std::printf("SlopTarget v0.1 - reverse-slop test target\n");
     std::printf("PID: %u\n\n", GetCurrentProcessId());

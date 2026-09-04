@@ -27,6 +27,7 @@ add_executable(slop_tests
     test_magicmida.cpp
     test_driver.cpp
     test_driver_abi.cpp
+    test_injector.cpp
 )
 
 # Real-world PE fixture: the built SlopTarget.exe itself
@@ -37,6 +38,25 @@ if(TARGET slop_target)
     )
     add_dependencies(slop_tests slop_target)
 endif()
+
+# Payload DLL for the live kernel-injector suite: static CRT + a dynamic
+# thread_local so the mapped image carries a TLS directory, CRT callbacks
+# and kernel32->kernelbase forwarder imports worth resolving
+add_library(slop_inject_fixture SHARED inject_fixture_dll.cpp)
+set_target_properties(slop_inject_fixture PROPERTIES
+    OUTPUT_NAME "slop_inject_fixture"
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+)
+target_compile_definitions(slop_inject_fixture PRIVATE
+    NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS
+)
+if(MSVC)
+    target_compile_options(slop_inject_fixture PRIVATE /W4 /EHsc)
+endif()
+target_compile_definitions(slop_tests PRIVATE
+    SLOP_INJECT_DLL_PATH="$<TARGET_FILE:slop_inject_fixture>"
+)
+add_dependencies(slop_tests slop_inject_fixture)
 
 target_include_directories(slop_tests PRIVATE "${CMAKE_SOURCE_DIR}/src/tests")
 target_include_directories(slop_tests PRIVATE "${CMAKE_SOURCE_DIR}/src")
@@ -52,7 +72,7 @@ set_target_properties(slop_tests PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
 )
 
-foreach(filter IN ITEMS decomp hyperion mcp driver abi)
+foreach(filter IN ITEMS decomp hyperion mcp driver abi inject)
     add_test(NAME "slop_tests_${filter}" COMMAND slop_tests)
     set_tests_properties("slop_tests_${filter}" PROPERTIES
         ENVIRONMENT "SLOP_TEST_FILTER=${filter}"

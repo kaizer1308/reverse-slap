@@ -1,0 +1,40 @@
+# Normalize all text files to LF in the repo.
+# Windows checkouts stay LF too (this repo is C++ built cross-editor;
+# keeping LF everywhere kills the phantom-modified churn).
+* text=auto eol=lf
+
+# Force LF for source files regardless of how they were committed
+*.cpp   text eol=lf
+*.h     text eol=lf
+*.hpp   text eol=lf
+*.inc   text eol=lf
+*.c     text eol=lf
+*.rs    text eol=lf
+*.py    text eol=lf
+*.json  text eol=lf
+*.toml  text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.md    text eol=lf
+*.txt   text eol=lf
+*.ps1   text eol=lf
+*.lock  text eol=lf
+
+# Windows-only scripts keep CRLF
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+
+# Binaries — never touch
+*.png   binary
+*.jpg   binary
+*.ico   binary
+*.dll   binary
+*.exe   binary
+*.sys   binary
+*.lib   binary
+*.a     binary
+*.so    binary
+*.pdb   binary
+*.ttf   binary
+*.woff  binary
+*.woff2 binary
