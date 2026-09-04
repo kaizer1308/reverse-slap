@@ -53,11 +53,24 @@ void SSABuilder::compute_reverse_postorder() {
 }
 
 int SSABuilder::intersect(int first, int second) const {
-    while (first != second) {
-        while (rpo_index_[first] > rpo_index_[second]) first = idom_[first];
-        while (rpo_index_[second] > rpo_index_[first]) second = idom_[second];
+    // Defensive: callers only pass idom-valid (reachable) blocks, but a -1
+    // here used to mean an out-of-bounds rpo_index_ read or a non-terminating
+    // walk through the entry self-loop. Bail out instead of hanging.
+    int guard = num_blocks_ * 2 + 8;
+    while (first != second && guard-- > 0) {
+        if (first < 0 || second < 0) return -1;
+        if (first >= num_blocks_ || second >= num_blocks_) return -1;
+        if (rpo_index_[first] < 0 || rpo_index_[second] < 0) return -1;
+        while (rpo_index_[first] > rpo_index_[second]) {
+            first = idom_[first];
+            if (first < 0) return -1;
+        }
+        while (rpo_index_[second] > rpo_index_[first]) {
+            second = idom_[second];
+            if (second < 0) return -1;
+        }
     }
-    return first;
+    return (guard > 0 && first == second) ? first : -1;
 }
 
 void SSABuilder::compute_dominators() {
@@ -91,13 +104,22 @@ void SSABuilder::compute_dominators() {
 void SSABuilder::compute_dom_frontiers() {
     dom_frontier_.assign(num_blocks_, {});
     for (int b = 0; b < num_blocks_; ++b) {
+        // Unreachable blocks have no idom and no frontier; without this skip
+        // the runner below walks into the entry block's idom self-loop
+        // (idom[entry] == entry) and spins forever pushing duplicates.
+        if (idom_[b] < 0) continue;
         auto& preds = func_->blocks[b].preds;
         if (preds.size() < 2) continue;
         for (int p : preds) {
             int runner = p;
-            while (runner >= 0 && runner != idom_[b]) {
+            int guard = num_blocks_ + 1;
+            while (runner >= 0 && runner != idom_[b] && guard-- > 0) {
                 dom_frontier_[runner].push_back(b);
-                runner = idom_[runner];
+                const int next = (runner >= 0 && runner < num_blocks_)
+                                     ? idom_[runner]
+                                     : -1;
+                if (next == runner) break; // entry self-loop: stop
+                runner = next;
             }
         }
     }

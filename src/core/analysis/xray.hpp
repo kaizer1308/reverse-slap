@@ -84,6 +84,7 @@ struct obfuscation_result_t {
     std::vector<pattern_hit_t> patterns;
     size_t opaque_predicates = 0, dead_heads = 0, junk_sequences = 0;
     size_t indirect_jumps = 0, push_ret = 0;
+    size_t privileged = 0;     // IN/OUT/IRET/INT n/HLT/... in user-mode code
     int    score_pct      = 0;
 };
 
@@ -147,6 +148,13 @@ struct hook_hit_t {
 
 std::vector<hook_hit_t> detect_hooks(const image_ref_t& img,
                                      size_t max_functions = 500);
+
+// Same prologue check over an explicit VA list. Used when the legacy
+// function index is empty (stripped/packed headers) but Hyperion recovered
+// functions: callers pass sorted hype DB entry VAs.
+std::vector<hook_hit_t> detect_hooks_at(const image_ref_t& img,
+                                        const std::vector<uint64_t>& vas,
+                                        size_t max_functions = 500);
 
 // direct syscalls
 

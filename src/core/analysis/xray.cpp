@@ -334,6 +334,60 @@ obfuscation_result_t detect_obfuscation(const image_ref_t& img, uint64_t fn_va) 
             res.patterns.push_back(std::move(h));
             ++res.push_ret;
         }
+
+        // Privileged / user-mode-nonsensical ISA: the classic VM-junk
+        // alphabet (OUTSD/STOSD/IRETD/INT n sleds). STOSx alone is legit
+        // (counted as string ops), but IN/OUT/IRET/HLT/CLI/arbitrary INT
+        // never appear in real user-mode code.
+        bool privileged = false;
+        const char* priv_kind = nullptr;
+        switch (in.mnemonic) {
+        case ZYDIS_MNEMONIC_IN:
+        case ZYDIS_MNEMONIC_INSB:
+        case ZYDIS_MNEMONIC_INSW:
+        case ZYDIS_MNEMONIC_INSD:
+        case ZYDIS_MNEMONIC_OUT:
+        case ZYDIS_MNEMONIC_OUTSB:
+        case ZYDIS_MNEMONIC_OUTSW:
+        case ZYDIS_MNEMONIC_OUTSD:
+            privileged = true; priv_kind = "port_io"; break;
+        case ZYDIS_MNEMONIC_HLT:
+        case ZYDIS_MNEMONIC_CLI:
+        case ZYDIS_MNEMONIC_STI:
+            privileged = true; priv_kind = "privileged_flag"; break;
+        case ZYDIS_MNEMONIC_IRET:
+        case ZYDIS_MNEMONIC_IRETD:
+        case ZYDIS_MNEMONIC_IRETQ:
+            privileged = true; priv_kind = "iret"; break;
+        case ZYDIS_MNEMONIC_SYSCALL:
+        case ZYDIS_MNEMONIC_SYSRET:
+        case ZYDIS_MNEMONIC_SYSENTER:
+        case ZYDIS_MNEMONIC_SYSEXIT:
+        case ZYDIS_MNEMONIC_RDMSR:
+        case ZYDIS_MNEMONIC_WRMSR:
+        case ZYDIS_MNEMONIC_INVD:
+        case ZYDIS_MNEMONIC_WBINVD:
+            privileged = true; priv_kind = "privileged_sys"; break;
+        case ZYDIS_MNEMONIC_INT:
+            // INT3 is padding/breakpoint noise; any other vector in
+            // user-mode codegen is junk or a trap.
+            if (in.op_count > 0 && in.ops[0].cls == op_class_t::imm &&
+                in.ops[0].imm != 3) {
+                privileged = true; priv_kind = "int_vector";
+            }
+            break;
+        default: break;
+        }
+        if (privileged) {
+            ++res.privileged;
+            if (res.patterns.size() < 256) {
+                pattern_hit_t h;
+                h.type    = "privileged_junk";
+                h.address = in.va;
+                h.detail  = std::string(priv_kind) + ": " + in.text;
+                res.patterns.push_back(std::move(h));
+            }
+        }
     }
     if (nop_run >= 4) {
         pattern_hit_t h;
@@ -384,6 +438,7 @@ obfuscation_result_t detect_obfuscation(const image_ref_t& img, uint64_t fn_va) 
     score += static_cast<int>(std::min(res.junk_sequences * 8, size_t{20}));
     score += static_cast<int>(std::min(res.indirect_jumps * 15, size_t{25}));
     if (res.push_ret > 0)       score += 15;
+    score += static_cast<int>(std::min(res.privileged * 15, size_t{40}));
     res.score_pct = std::min(score, 100);
     return res;
 }
@@ -608,19 +663,14 @@ anti_analysis_result_t detect_anti_analysis(const image_ref_t& img,
 
 // inline hooks
 
-std::vector<hook_hit_t> detect_hooks(const image_ref_t& img,
-                                     size_t max_functions) {
-    std::vector<hook_hit_t> out;
-    if (!img.fns) return out;
-    const auto& fns = img.fns->functions();
-    const size_t cap = std::min(fns.size(), max_functions);
+namespace {
 
-    for (size_t i = 0; i < cap; ++i) {
+// Shared single-VA prologue check. Returns true and fills h on a hook hit.
+bool check_prologue(const image_ref_t& img, uint64_t va, hook_hit_t& h) {
         uint8_t pro[16]{};
-        if (!read_img(img, fns[i].va, pro, sizeof(pro))) continue;
+        if (!read_img(img, va, pro, sizeof(pro))) return false;
 
-        hook_hit_t h;
-        h.address = fns[i].va;
+        h.address = va;
         h.prologue_hex.reserve(32);
         char tmp[8];
         for (int b = 0; b < 8; ++b) {
@@ -635,39 +685,62 @@ std::vector<hook_hit_t> detect_hooks(const image_ref_t& img,
                 (static_cast<int32_t>(pro[3]) << 16) |
                 (static_cast<int32_t>(pro[4]) << 24);
             h.hook_type = "jmp_rel32";
-            h.target    = fns[i].va + 5 + static_cast<int64_t>(rel);
-            out.push_back(std::move(h));
-            continue;
+            h.target    = va + 5 + static_cast<int64_t>(rel);
+            return true;
         }
         if (pro[0] == 0xFF && pro[1] == 0x25) {
             const int32_t disp = static_cast<int32_t>(
                 pro[2] | (pro[3] << 8) | (pro[4] << 16) | (pro[5] << 24));
             h.hook_type = "jmp_indirect_rip";
-            const uint64_t slot = fns[i].va + 6 + static_cast<int64_t>(disp);
+            const uint64_t slot = va + 6 + static_cast<int64_t>(disp);
             uint64_t tgt = 0;
             if (read_img(img, slot, &tgt, sizeof(tgt))) h.target = tgt;
-            out.push_back(std::move(h));
-            continue;
+            return true;
         }
         if (pro[0] == 0x48 && pro[1] == 0xB8 && pro[10] == 0xFF && pro[11] == 0xE0) {
             uint64_t tgt = 0;
             std::memcpy(&tgt, pro + 2, 8);
             h.hook_type = "mov_rax_jmp_rax";
             h.target    = tgt;
-            out.push_back(std::move(h));
-            continue;
+            return true;
         }
         if (pro[0] == 0x68 && pro[5] == 0xC3) {
             h.hook_type = "push_ret";
             h.target = pro[1] | (pro[2] << 8) | (pro[3] << 16) |
                        (static_cast<uint64_t>(pro[4]) << 24);
-            out.push_back(std::move(h));
-            continue;
+            return true;
         }
         if (pro[0] == 0xCC) {
             h.hook_type = "int3_prologue";
-            out.push_back(std::move(h));
+            return true;
         }
+        return false;
+}
+
+} // namespace
+
+std::vector<hook_hit_t> detect_hooks(const image_ref_t& img,
+                                     size_t max_functions) {
+    std::vector<hook_hit_t> out;
+    if (!img.fns) return out;
+    const auto& fns = img.fns->functions();
+    const size_t cap = std::min(fns.size(), max_functions);
+
+    for (size_t i = 0; i < cap; ++i) {
+        hook_hit_t h;
+        if (check_prologue(img, fns[i].va, h)) out.push_back(std::move(h));
+    }
+    return out;
+}
+
+std::vector<hook_hit_t> detect_hooks_at(const image_ref_t& img,
+                                        const std::vector<uint64_t>& vas,
+                                        size_t max_functions) {
+    std::vector<hook_hit_t> out;
+    const size_t cap = std::min(vas.size(), max_functions);
+    for (size_t i = 0; i < cap; ++i) {
+        hook_hit_t h;
+        if (check_prologue(img, vas[i], h)) out.push_back(std::move(h));
     }
     return out;
 }
@@ -1164,6 +1237,37 @@ std::vector<crypto_hit_t> crypto_range_bytes(uint64_t base_va,
             h.value    = c->value;
             h.source   = "data";
             out.push_back(std::move(h));
+        }
+    }
+
+    // Phase 3: raw byte-table scan. S-box bytes never match the dword table
+    // above (63 7C 77 7B in memory is 0x7B777C63 little-endian, while the
+    // table holds the big-endian reading 0x637C777B), so match the 16-byte
+    // prefixes directly.
+    struct byte_table_t {
+        const char* algorithm;
+        const char* name;
+        uint8_t     prefix[16];
+    };
+    static constexpr byte_table_t kByteTables[] = {
+        {"AES", "sbox_forward[0..15]",
+         {0x63, 0x7C, 0x77, 0x7B, 0xF2, 0x6B, 0x6F, 0xC5,
+          0x30, 0x01, 0x67, 0x2B, 0xFE, 0xD7, 0xAB, 0x76}},
+        {"AES", "sbox_inverse[0..15]",
+         {0x52, 0x09, 0x6A, 0xD5, 0x30, 0x36, 0xA5, 0x38,
+          0xBF, 0x40, 0xA3, 0x9E, 0x81, 0xF3, 0xD7, 0xFB}},
+    };
+    for (const auto& t : kByteTables) {
+        for (size_t off = 0; off + 16 <= len && out.size() < limit; ++off) {
+            if (std::memcmp(data + off, t.prefix, 16) != 0) continue;
+            crypto_hit_t h;
+            h.va       = base_va + off;
+            h.algorithm = t.algorithm;
+            h.constant_name = t.name;
+            h.value    = 0;
+            h.source   = "data";
+            out.push_back(std::move(h));
+            off += 255; // one hit per 256-byte table copy
         }
     }
     return out;

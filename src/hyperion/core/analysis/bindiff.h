@@ -28,6 +28,9 @@ public:
         // Optional cooperative cancel + wall-clock deadline.
         const std::function<bool()>* cancel = nullptr;
         uint64_t deadline_ms = 0; // steady_clock ms, 0 = none
+        // Optional progress sink (0..1 fraction of max_pairs), invoked
+        // periodically from the quadratic fallback loop. May be null.
+        const std::function<void(float)>* progress = nullptr;
     };
     struct outcome_t {
         std::vector<DiffResult> results;

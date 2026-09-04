@@ -856,3 +856,68 @@ TEST_CASE(devirt_identify_classify_lift_mini_vm) {
     REQUIRE(pc.find("push()") != std::string::npos);
     REQUIRE(pc.find("pop()") != std::string::npos);
 }
+
+TEST_CASE(xray_obfuscation_flags_privileged_junk) {
+    disasm::engine_t eng;
+    REQUIRE(eng.init());
+    synth_pe s;
+    s.code_va = s.base + 0x1000;
+
+    // VM-junk alphabet: OUTSD / IRETD / INT 0xD3 are never real user-mode
+    // codegen, so the scorer must go non-zero (was: 0% on this exact shape).
+    const uint64_t junk = s.emit({0x6F});              // outsd
+    s.emit({0xCF});                                    // iretd
+    s.emit({0xCD, 0xD3});                              // int 0xD3
+    s.emit({0xC3});                                    // ret
+    s.finish();
+
+    auto r = s.ref(eng);
+    auto obf = xray::detect_obfuscation(r, junk);
+    REQUIRE_GE(obf.privileged, 3u);
+    REQUIRE_GT(obf.score_pct, 0);
+    bool saw_priv = false;
+    for (const auto& p : obf.patterns)
+        if (p.type == "privileged_junk") saw_priv = true;
+    REQUIRE(saw_priv);
+}
+
+TEST_CASE(xray_crypto_range_finds_aes_sbox_bytes) {
+    // The 16-byte AES forward S-box prefix never hits the dword table
+    // (LE/BE mismatch), so crypto_range_bytes has a raw byte-table phase.
+    std::vector<uint8_t> buf(64, 0);
+    const uint8_t sbox[16] = {0x63, 0x7C, 0x77, 0x7B, 0xF2, 0x6B, 0x6F, 0xC5,
+                              0x30, 0x01, 0x67, 0x2B, 0xFE, 0xD7, 0xAB, 0x76};
+    std::memcpy(buf.data() + 8, sbox, sizeof(sbox));
+
+    auto hits = xray::crypto_range_bytes(0x140000000, buf.data(), buf.size(),
+                                         nullptr, 64);
+    bool saw_sbox = false;
+    for (const auto& h : hits) {
+        if (std::string(h.algorithm) == "AES" &&
+            std::string(h.constant_name).find("sbox_forward") !=
+                std::string::npos &&
+            h.va == 0x140000000 + 8)
+            saw_sbox = true;
+    }
+    REQUIRE(saw_sbox);
+}
+
+TEST_CASE(xray_detect_hooks_at_explicit_vas) {
+    disasm::engine_t eng;
+    REQUIRE(eng.init());
+    synth_pe s;
+    s.code_va = s.base + 0x1000;
+
+    // Hook-shaped prologue: jmp rel32 at function start
+    const uint64_t hooked = s.emit({0xE9, 0x00, 0x00, 0x00, 0x00});
+    s.emit({0xC3});
+    const uint64_t clean = s.emit({0x55});             // push rbp
+    s.emit({0xC3});
+    s.finish();
+
+    auto r = s.ref(eng);
+    auto hits = xray::detect_hooks_at(r, {hooked, clean}, 16);
+    REQUIRE_EQ(hits.size(), 1u);
+    REQUIRE_EQ(hits[0].address, hooked);
+    REQUIRE_STR_EQ(hits[0].hook_type.c_str(), "jmp_rel32");
+}

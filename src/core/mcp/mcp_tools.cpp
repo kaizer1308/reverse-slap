@@ -10,6 +10,7 @@
 #include "core/infra/app_control.hpp"
 #include "core/infra/cancel.hpp"
 #include "core/infra/clock.hpp"
+#include "core/infra/jobs.hpp"
 #include "core/infra/deferred.hpp"
 #include "core/infra/diag.hpp"
 #include "core/infra/event_bus.hpp"
@@ -72,6 +73,7 @@
 #include "core/runtime/session.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
@@ -83,6 +85,7 @@
 #include <sstream>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace slop::core::mcp {
@@ -103,6 +106,19 @@ using json = nlohmann::json;
 
 std::mutex g_tool_mu;
 std::mutex g_image_mu; // guards g_image so analyze.diff can run off g_tool_mu
+
+// async bindiff jobs (analyze.diff_start/diff_job/diff_cancel)
+struct diff_job_rec_t {
+    std::string path_a, path_b;
+    std::string stage = "queued";   // loading|analyzing_a|analyzing_b|comparing|done
+    float       progress = -1.0f;   // -1 = indeterminate
+    bool        done = false;
+    json        result;              // full diff payload on success/partial
+    std::string error;               // set when the job failed outright
+};
+std::mutex g_diff_mu;
+std::map<uint64_t, diff_job_rec_t> g_diff_jobs;
+constexpr size_t kMaxDiffJobs = 32;
 
 // mcp side state
 
@@ -2433,8 +2449,11 @@ json tool_disasm(const json& args) {
             if (bin.hype && bin.hype->ready()) hdb = &bin.hype->db();
         }
 
+        std::unordered_set<uint64_t> seen;
         for (size_t i = 0; i < fns.size() && i < limit; ++i) {
-            json o = {{"va", fns[i].va}, {"size", fns[i].size}};
+            json o = {{"va", fns[i].va}, {"size", fns[i].size},
+                      {"source", "index"}};
+            seen.insert(fns[i].va);
             if (syms) {
                 const auto it = syms->find(fns[i].va);
                 if (it != syms->end()) o["symbol"] = it->second;
@@ -2455,8 +2474,41 @@ json tool_disasm(const json& args) {
             }
             arr.push_back(std::move(o));
         }
+        // The recursive-descent index can come up empty (stripped exports,
+        // TLS-only entry, packed headers) while Hyperion still recovers
+        // functions via RTTI/vtables/jump tables. Append those so callers
+        // always see the analyzer's function set, not an empty list.
+        size_t hype_extra = 0;
+        if (hdb && arr.size() < limit) {
+            std::vector<uint64_t> missing;
+            missing.reserve(hdb->funcs.size());
+            for (const auto& [va, hf] : hdb->funcs) {
+                (void)hf;
+                if (!seen.count(va)) missing.push_back(va);
+            }
+            std::sort(missing.begin(), missing.end());
+            for (uint64_t va : missing) {
+                if (arr.size() >= limit) break;
+                const auto& hf = hdb->funcs.find(va)->second;
+                json o = {{"va", va}, {"source", "hyperion"},
+                          {"blocks", hf.blocks.size()},
+                          {"callconv", callconv_name(hf.callconv)}};
+                if (syms) {
+                    const auto it = syms->find(va);
+                    if (it != syms->end()) o["symbol"] = it->second;
+                }
+                const auto nit = hdb->names.find(va);
+                if (nit != hdb->names.end() && !o.contains("symbol"))
+                    o["name"] = nit->second;
+                if (!hf.loops.empty()) o["loops"] = hf.loops.size();
+                if (hf.noreturn) o["noreturn"] = true;
+                arr.push_back(std::move(o));
+                ++hype_extra;
+            }
+        }
         json out = {{"image", img_name}, {"functions", arr},
-                    {"total", fns.size()},
+                    {"total", fns.size() + hype_extra},
+                    {"index_total", fns.size()},
                     {"stats", {{"seeds", fidx->stats().seeds},
                                {"recursive_descent", fidx->stats().rd_functions},
                                {"heuristic", fidx->stats().heuristic_fns}}}};
@@ -2467,7 +2519,14 @@ json tool_disasm(const json& args) {
                                auto& bin = ds::get();
                                return bin.hype ? bin.hype->rtti().classes().size() : 0;
                            }()}};
+            if (fns.size() == 0 && !hdb->funcs.empty())
+                out["note"] = "recursive-descent index found no functions "
+                              "(stripped/packed headers); rows below with "
+                              "source=hyperion come from the analyzer DB";
         }
+        if (arr.size() >= limit &&
+            fns.size() + (hdb ? hdb->funcs.size() : 0) > arr.size())
+            out["truncated"] = true;
         return out;
     }
 
@@ -2475,26 +2534,36 @@ json tool_disasm(const json& args) {
         const uint64_t addr = parse_addr_alias(args, {"addr", "base", "va", "address"});
         const size_t limit = std::min<size_t>(args.value("limit", 500u), 10000u);
 
-        // hyperion xrefs are richer so use them when we can
+        // Union of every source: hyperion DB (code + modeled-data refs),
+        // legacy linear index, and a targeted RIP-relative LEA sweep.
+        // Hyperion only records DataOffset for recognized strings, so plain
+        // LEA-to-data refs can be missing there; the legacy index skips
+        // high-entropy sections, so packed code can be missing there.
+        std::map<uint64_t, std::pair<int, std::string>> best; // from -> rank, kind
+        std::string engines;
+        auto note_engine = [&](const char* e) {
+            if (engines.find(e) == std::string::npos) {
+                if (!engines.empty()) engines += "+";
+                engines += e;
+            }
+        };
+
         if (!have_path) {
             auto& bin = ds::get();
             if (bin.hype && bin.hype->ready()) {
                 const auto& db = bin.hype->db();
                 const auto  it = db.xrefs_to.find(addr);
-                json arr = json::array();
-                size_t total = 0;
+                // a call emits two records for one instruction, keep the strongest kind
+                auto kind_rank = [](hype::XrefType t) {
+                    switch (t) {
+                    case hype::XrefType::CodeCall:  return 5;
+                    case hype::XrefType::CodeJump:  return 4;
+                    case hype::XrefType::DataWrite: return 3;
+                    case hype::XrefType::DataRead:  return 2;
+                    default:                        return 1;
+                    }
+                };
                 if (it != db.xrefs_to.end()) {
-                    // a call emits two records for one instruction, keep the strongest kind
-                    auto kind_rank = [](hype::XrefType t) {
-                        switch (t) {
-                        case hype::XrefType::CodeCall:  return 5;
-                        case hype::XrefType::CodeJump:  return 4;
-                        case hype::XrefType::DataWrite: return 3;
-                        case hype::XrefType::DataRead:  return 2;
-                        default:                        return 1;
-                        }
-                    };
-                    std::map<uint64_t, std::pair<int, const char*>> best;
                     for (const auto& x : it->second) {
                         const char* k = xref_kind_name_hype(x.type);
                         const int   r = kind_rank(x.type);
@@ -2502,17 +2571,8 @@ json tool_disasm(const json& args) {
                         if (b == best.end() || b->second.first < r)
                             best[x.from] = {r, k};
                     }
-                    total = best.size();
-                    for (const auto& [from, p] : best) {
-                        if (arr.size() >= limit) break;
-                        arr.push_back({{"from", from}, {"kind", p.second}});
-                    }
+                    note_engine("hyperion");
                 }
-                json out = {{"image", img_name}, {"engine", "hyperion"},
-                        {"refs_to", arr}, {"count", arr.size()},
-                        {"total", total}};
-                if (total > arr.size()) out["truncated"] = true;
-                return out;
             }
         }
 
@@ -2520,16 +2580,69 @@ json tool_disasm(const json& args) {
             if (!xidx->build(*pe, *file, eng, base)) fail("xref index build failed");
             *xidx_ok = true;
         }
-        json arr = json::array();
-        size_t total = 0;
-        for (const auto& r : xidx->refs_to(addr)) {
-            ++total;
-            if (arr.size() >= limit) continue;
-            arr.push_back({{"from", r.from}, {"kind", xref_kind_name(r.kind)}});
+        {
+            bool any = false;
+            for (const auto& r : xidx->refs_to(addr)) {
+                any = true;
+                int rank = 2;
+                const char* k = xref_kind_name(r.kind);
+                if (r.kind == disasm::xref_kind_t::call) rank = 5;
+                else if (r.kind == disasm::xref_kind_t::jmp) rank = 4;
+                const auto b = best.find(r.from);
+                if (b == best.end() || b->second.first < rank)
+                    best[r.from] = {rank, k};
+            }
+            if (any) note_engine("index");
         }
-        json out = {{"image", img_name}, {"refs_to", arr}, {"count", arr.size()},
-                    {"total", total}};
-        if (total > arr.size()) out["truncated"] = true;
+
+        // Fallback/augment: decode-sweep executable sections for
+        // RIP-relative operands resolving exactly to addr. Catches LEA
+        // string/data refs both indexes can miss (unrecognized strings,
+        // entropy-skipped packed code). Bounded: 32MB scan, stops at limit.
+        size_t scan_hits = 0;
+        if (best.size() < limit) {
+            size_t scanned = 0;
+            constexpr size_t kMaxScan = 32u << 20;
+            for (const auto& sec : pe->sections) {
+                if (best.size() >= limit || scanned >= kMaxScan) break;
+                if (!sec.is_executable() || sec.raw_size == 0) continue;
+                auto soff = pe->rva_to_offset(sec.rva);
+                if (!soff || *soff + sec.raw_size > file->size()) continue;
+                const size_t n = std::min<size_t>(
+                    sec.raw_size, kMaxScan - scanned);
+                size_t off = 0;
+                while (off < n && best.size() < limit) {
+                    const uint64_t va = base + sec.rva + off;
+                    uint8_t buf[16];
+                    const size_t avail = std::min<size_t>(sizeof(buf), n - off);
+                    std::memcpy(buf, file->data() + *soff + off, avail);
+                    auto in = eng.decode(va, buf, avail, false);
+                    if (!in || in->length == 0) { ++off; continue; }
+                    if (in->has_rip_rel && in->rip_rel_target == addr &&
+                        !best.count(va)) {
+                        best[va] = {2, "data"};
+                        ++scan_hits;
+                    }
+                    off += in->length ? in->length : 1;
+                }
+                scanned += n;
+            }
+            if (scan_hits) note_engine("lea_scan");
+        }
+
+        json arr = json::array();
+        for (const auto& [from, rk] : best) {
+            if (arr.size() >= limit) break;
+            arr.push_back({{"from", from}, {"kind", rk.second}});
+        }
+        json out = {{"image", img_name}, {"engine", engines.empty() ? "none" : engines},
+                    {"refs_to", arr}, {"count", arr.size()},
+                    {"total", best.size()}};
+        if (best.size() > arr.size()) out["truncated"] = true;
+        if (best.empty())
+            out["note"] = "no refs from hyperion, linear index, or LEA sweep; "
+                          "the address may be unreferenced, in an unscanned "
+                          "region, or reached only indirectly (register)";
         return out;
     }
 
@@ -4040,15 +4153,246 @@ json tool_emulate(const json& args) {
 
 // tool: analyze
 
+// Shared bindiff core for sync `diff` and the async diff_start jobs.
+// Returns the FULL result (all non-identical diffs); callers slice `diffs`
+// to their limit. Throws (fail) on load/analyze failure or when cancelled
+// between phases. `cancelled()` is polled between phases and inside the
+// compare; `report(stage, progress)` feeds job polling (-1 = indeterminate).
+json run_diff_core(const std::string& pa, const std::string& pb,
+                   uint32_t timeout_ms, size_t max_pairs,
+                   const std::function<bool()>& cancelled,
+                   const std::function<void(const std::string&, float)>& report) {
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(timeout_ms);
+    auto ms_left = [&]() -> uint64_t {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) return 0;
+        return static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                deadline - now).count());
+    };
+    auto check_cancel = [&](const char* what) {
+        if (cancelled && cancelled()) fail(std::string(what) + " cancelled");
+        if (ms_left() == 0)
+            fail(std::string(what) + " timed out (timeout_ms exceeded)");
+    };
+
+    auto load_bytes = [](const std::string& path) {
+        std::ifstream f(path, std::ios::binary);
+        if (!f) fail("cannot open " + path);
+        f.seekg(0, std::ios::end);
+        const auto sz = f.tellg();
+        if (sz <= 0) fail("empty file: " + path);
+        if (sz > (256ll << 20)) fail("file too large for diff (>256MB): " + path);
+        f.seekg(0, std::ios::beg);
+        std::vector<uint8_t> bytes(static_cast<size_t>(sz));
+        f.read(reinterpret_cast<char*>(bytes.data()), sz);
+        if (!f) fail("short read on " + path);
+        return bytes;
+    };
+
+    report("loading", -1.0f);
+    std::vector<uint8_t> bytes_a = load_bytes(pa);
+    check_cancel("diff");
+    std::vector<uint8_t> bytes_b = load_bytes(pb);
+    check_cancel("diff");
+
+    // NOTE: start_sync has no cancel hook, so each side can still take a
+    // while on huge binaries; the deadline applies to the compare phase
+    // and to the boundary between the two analyses.
+    report("analyzing_a", -1.0f);
+    auto sa = std::make_unique<hs::session_t>();
+    if (cancelled && cancelled()) fail("diff cancelled");
+    if (!sa->start_sync(bytes_a.data(), bytes_a.size(), 0)) {
+        if (cancelled && cancelled()) fail("diff cancelled");
+        fail("hyperion analysis failed for " + pa + ": " + sa->error());
+    }
+    check_cancel("diff");
+    report("analyzing_b", -1.0f);
+    auto sb = std::make_unique<hs::session_t>();
+    if (cancelled && cancelled()) fail("diff cancelled");
+    if (!sb->start_sync(bytes_b.data(), bytes_b.size(), 0)) {
+        if (cancelled && cancelled()) fail("diff cancelled");
+        fail("hyperion analysis failed for " + pb + ": " + sb->error());
+    }
+    if (cancelled && cancelled()) fail("diff cancelled");
+
+    report("comparing", 0.0f);
+    hype::BinDiff differ;
+    hype::BinDiff::options_t opt;
+    opt.max_pairs = max_pairs;
+    opt.cancel = cancelled ? &cancelled : nullptr;
+    // absolute steady-clock deadline in BinDiff::now_ms() terms
+    opt.deadline_ms = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count()) +
+        timeout_ms;
+    std::function<void(float)> progress_fn = [&](float p) {
+        report("comparing", p * 0.95f + 0.05f);
+    };
+    opt.progress = &progress_fn;
+    auto outcome = differ.compare_budgeted(sa->db(), sb->db(), opt);
+
+    json arr = json::array();
+    const char* status_name[] = {"added", "removed", "modified", "identical"};
+    for (const auto& r : outcome.results) {
+        if (r.status == hype::DiffResult::Identical) continue;  // noise
+        arr.push_back({{"addr_a", r.addr_a}, {"addr_b", r.addr_b},
+                       {"name", r.name},
+                       {"similarity", r.similarity},
+                       {"status", status_name[r.status]}});
+    }
+    size_t counts[4] = {0, 0, 0, 0};
+    for (const auto& r : outcome.results) ++counts[r.status];
+    json out = {{"ok", true}, {"diffs", arr}, {"count", arr.size()},
+                {"totals", {{"added", counts[0]}, {"removed", counts[1]},
+                            {"modified", counts[2]},
+                            {"identical", counts[3]}}},
+                {"funcs_a", sa->db().funcs.size()},
+                {"funcs_b", sb->db().funcs.size()},
+                {"pairs_evaluated", outcome.pairs_evaluated},
+                {"pairs_skipped_size", outcome.pairs_skipped_size},
+                {"timed_out", outcome.timed_out},
+                {"cancelled", outcome.cancelled}};
+    if (outcome.timed_out)
+        out["note"] = "pair budget/deadline hit: results are partial "
+                      "(raise max_pairs/timeout_ms for a fuller diff)";
+    if (outcome.cancelled) out["note"] = "diff cancelled: results are partial";
+    report("done", 1.0f);
+    return out;
+}
+
 json tool_analyze(const json& args,
                   const infra::cancel_token_t& cancel = {}) {
     const std::string action = require_action(args);
-    if (action != "packer" && action != "signatures" && action != "diff")
-        fail("analyze: unknown action (packer|signatures|diff)");
+    if (action != "packer" && action != "signatures" && action != "diff" &&
+        action != "diff_start" && action != "diff_job" &&
+        action != "diff_cancel")
+        fail("analyze: unknown action "
+             "(packer|signatures|diff|diff_start|diff_job|diff_cancel)");
 
     // diff is heavy (two full Hyperion analyses + quadratic compare), so it
     // runs WITHOUT the global tool mutex (see call_tool), honors cancel +
     // timeout_ms, and caps the pair budget instead of hanging the engine.
+    // diff_start/diff_job/diff_cancel are the async job flavor with progress.
+    if (action == "diff_start") {
+        if (!args.contains("path_a") || !args.contains("path_b"))
+            fail("missing path_a/path_b");
+        const std::string pa = args.at("path_a").get<std::string>();
+        const std::string pb = args.at("path_b").get<std::string>();
+        const uint32_t timeout_ms = static_cast<uint32_t>(
+            std::clamp(args.value("timeout_ms", 600000), 5000, 1800000));
+        const size_t max_pairs = std::min<size_t>(
+            args.value("max_pairs", 500000u), 10000000u);
+
+        infra::job_desc_t desc;
+        desc.label = "bindiff";
+        desc.owner = "analyze.diff_start";
+        desc.cancellable = true;
+        // Placeholder id: replaced with the real job id after submit; the
+        // body looks its record up by id captured below.
+        std::shared_ptr<std::atomic<uint64_t>> job_id =
+            std::make_shared<std::atomic<uint64_t>>(0);
+        desc.body = [pa, pb, timeout_ms, max_pairs, job_id](
+                        infra::job_context_t& ctx) {
+            // submit() assigns the id after spawning us; wait for it.
+            uint64_t id = 0;
+            for (int i = 0; i < 5000 && id == 0 && !ctx.cancelled(); ++i) {
+                id = job_id->load(std::memory_order_acquire);
+                if (!id)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            if (!id) { ctx.fail("diff job id never assigned"); return; }
+            auto report = [&](const std::string& stage, float p) {
+                std::lock_guard lk(g_diff_mu);
+                auto it = g_diff_jobs.find(id);
+                if (it == g_diff_jobs.end()) return;
+                it->second.stage = stage;
+                it->second.progress = p;
+            };
+            try {
+                json res = run_diff_core(
+                    pa, pb, timeout_ms, max_pairs,
+                    [&]() { return ctx.cancelled(); }, report);
+                std::lock_guard lk(g_diff_mu);
+                auto it = g_diff_jobs.find(id);
+                if (it != g_diff_jobs.end()) {
+                    it->second.result = std::move(res);
+                    it->second.stage = "done";
+                    it->second.progress = 1.0f;
+                    it->second.done = true;
+                }
+            } catch (const std::exception& e) {
+                std::lock_guard lk(g_diff_mu);
+                auto it = g_diff_jobs.find(id);
+                if (it != g_diff_jobs.end()) {
+                    it->second.error = e.what();
+                    it->second.stage = "done";
+                    it->second.done = true;
+                }
+                ctx.fail(e.what());
+            }
+        };
+        const uint64_t id = infra::jobs::submit(std::move(desc));
+        if (!id) fail("diff job queue full, retry shortly");
+        job_id->store(id, std::memory_order_release);
+        {
+            std::lock_guard lk(g_diff_mu);
+            auto& rec = g_diff_jobs[id];
+            rec.path_a = pa;
+            rec.path_b = pb;
+            rec.stage = "queued";
+            while (g_diff_jobs.size() > kMaxDiffJobs)
+                g_diff_jobs.erase(g_diff_jobs.begin());
+        }
+        return {{"ok", true}, {"job_id", id},
+                {"hint", "poll analyze.diff_job(id) for stage/progress, "
+                         "cancel with analyze.diff_cancel(id)"}};
+    }
+
+    if (action == "diff_job") {
+        const uint64_t id = parse_addr(args, "id");
+        const size_t limit = std::min<size_t>(args.value("limit", 500u), 5000u);
+        std::lock_guard lk(g_diff_mu);
+        const auto it = g_diff_jobs.find(id);
+        if (it == g_diff_jobs.end())
+            fail("unknown diff job (expired or never submitted)");
+        const auto& rec = it->second;
+        if (!rec.done) {
+            json out = {{"ok", true}, {"job_id", id},
+                        {"state", infra::jobs::alive(id) ? "running" : "queued"},
+                        {"stage", rec.stage}, {"progress", rec.progress}};
+            return out;
+        }
+        if (!rec.error.empty()) fail(rec.error);
+        json res = rec.result;
+        if (res.contains("diffs") && res.at("diffs").is_array() &&
+            res.at("diffs").size() > limit) {
+            json sliced = json::array();
+            for (size_t i = 0; i < limit; ++i)
+                sliced.push_back(res.at("diffs").at(i));
+            res["diffs"] = std::move(sliced);
+            res["count"] = res["diffs"].size();
+            res["truncated"] = true;
+        }
+        res["job_id"] = id;
+        res["state"] = "succeeded";
+        return res;
+    }
+
+    if (action == "diff_cancel") {
+        const uint64_t id = parse_addr(args, "id");
+        if (!infra::jobs::cancel(id)) {
+            std::lock_guard lk(g_diff_mu);
+            if (g_diff_jobs.find(id) == g_diff_jobs.end())
+                fail("unknown diff job");
+            // Known but already finished: cancel is a no-op success.
+            return {{"job_id", id}, {"cancelled", false},
+                    {"note", "job already finished"}};
+        }
+        return {{"job_id", id}, {"cancelled", true}};
+    }
+
     if (action == "diff") {
         if (!args.contains("path_a") || !args.contains("path_b"))
             fail("missing path_a/path_b");
@@ -4058,97 +4402,23 @@ json tool_analyze(const json& args,
             std::clamp(args.value("timeout_ms", 120000), 5000, 1800000));
         const size_t max_pairs = std::min<size_t>(
             args.value("max_pairs", 500000u), 10000000u);
-        const auto deadline = std::chrono::steady_clock::now() +
-                              std::chrono::milliseconds(timeout_ms);
-        auto ms_left = [&]() -> uint64_t {
-            const auto now = std::chrono::steady_clock::now();
-            if (now >= deadline) return 0;
-            return static_cast<uint64_t>(
-                std::chrono::duration_cast<std::chrono::milliseconds>(
-                    deadline - now).count());
-        };
-        auto check_cancel = [&]() {
-            if (cancel.cancelled()) fail("diff cancelled");
-            if (ms_left() == 0) fail("diff timed out (timeout_ms exceeded)");
-        };
-
-        auto load_bytes = [](const std::string& path) {
-            std::ifstream f(path, std::ios::binary);
-            if (!f) fail("cannot open " + path);
-            f.seekg(0, std::ios::end);
-            const auto sz = f.tellg();
-            if (sz <= 0) fail("empty file: " + path);
-            if (sz > (256ll << 20)) fail("file too large for diff (>256MB): " + path);
-            f.seekg(0, std::ios::beg);
-            std::vector<uint8_t> bytes(static_cast<size_t>(sz));
-            f.read(reinterpret_cast<char*>(bytes.data()), sz);
-            if (!f) fail("short read on " + path);
-            return bytes;
-        };
-
-        std::vector<uint8_t> bytes_a = load_bytes(pa);
-        check_cancel();
-        std::vector<uint8_t> bytes_b = load_bytes(pb);
-        check_cancel();
-
-        // NOTE: start_sync has no cancel hook, so each side can still take a
-        // while on huge binaries; the deadline applies to the compare phase
-        // and to the boundary between the two analyses.
-        auto sa = std::make_unique<hs::session_t>();
-        if (cancel.cancelled()) fail("diff cancelled");
-        if (!sa->start_sync(bytes_a.data(), bytes_a.size(), 0)) {
-            if (cancel.cancelled()) fail("diff cancelled");
-            fail("hyperion analysis failed for " + pa + ": " + sa->error());
-        }
-        check_cancel();
-        auto sb = std::make_unique<hs::session_t>();
-        if (cancel.cancelled()) fail("diff cancelled");
-        if (!sb->start_sync(bytes_b.data(), bytes_b.size(), 0)) {
-            if (cancel.cancelled()) fail("diff cancelled");
-            fail("hyperion analysis failed for " + pb + ": " + sb->error());
-        }
-        if (cancel.cancelled()) fail("diff cancelled");
-
-        hype::BinDiff differ;
-        hype::BinDiff::options_t opt;
-        opt.max_pairs = max_pairs;
-        std::function<bool()> cancelled_fn = [&]() { return cancel.cancelled(); };
-        opt.cancel = cancel ? &cancelled_fn : nullptr;
-        // absolute steady-clock deadline in BinDiff::now_ms() terms
-        opt.deadline_ms = static_cast<uint64_t>(
-            std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now().time_since_epoch()).count()) +
-            timeout_ms;
-        auto outcome = differ.compare_budgeted(sa->db(), sb->db(), opt);
-
-        json arr = json::array();
         const size_t limit = std::min<size_t>(args.value("limit", 500u), 5000u);
-        const char* status_name[] = {"added", "removed", "modified", "identical"};
-        for (size_t i = 0; i < outcome.results.size() && arr.size() < limit; ++i) {
-            const auto& r = outcome.results[i];
-            if (r.status == hype::DiffResult::Identical) continue;  // noise
-            arr.push_back({{"addr_a", r.addr_a}, {"addr_b", r.addr_b},
-                           {"name", r.name},
-                           {"similarity", r.similarity},
-                           {"status", status_name[r.status]}});
+        auto noop = [](const std::string&, float) {};
+        json full = run_diff_core(
+            pa, pb, timeout_ms, max_pairs,
+            [&]() { return cancel.cancelled(); }, noop);
+        if (full.contains("diffs") && full.at("diffs").is_array() &&
+            full.at("diffs").size() > limit) {
+            json sliced = json::array();
+            for (size_t i = 0; i < limit; ++i)
+                sliced.push_back(full.at("diffs").at(i));
+            full["diffs"] = std::move(sliced);
+            full["count"] = full["diffs"].size();
+            full["truncated"] = true;
         }
-        size_t counts[4] = {0, 0, 0, 0};
-        for (const auto& r : outcome.results) ++counts[r.status];
-        json out = {{"ok", true}, {"diffs", arr}, {"count", arr.size()},
-                    {"totals", {{"added", counts[0]}, {"removed", counts[1]},
-                                {"modified", counts[2]},
-                                {"identical", counts[3]}}},
-                    {"funcs_a", sa->db().funcs.size()},
-                    {"funcs_b", sb->db().funcs.size()},
-                    {"pairs_evaluated", outcome.pairs_evaluated},
-                    {"pairs_skipped_size", outcome.pairs_skipped_size},
-                    {"timed_out", outcome.timed_out},
-                    {"cancelled", outcome.cancelled}};
-        if (outcome.timed_out)
-            out["note"] = "pair budget/deadline hit: results are partial "
-                          "(raise max_pairs/timeout_ms for a fuller diff)";
-        if (outcome.cancelled) out["note"] = "diff cancelled: results are partial";
-        return out;
+        full["hint"] = "for huge binaries prefer async "
+                       "analyze.diff_start + diff_job (progress + cancel)";
+        return full;
     }
 
     // explicit path into the private cache, else the app loaded binary
@@ -5410,6 +5680,15 @@ json tool_decomp(const json& args) {
     if (!bin.ready) fail("no image loaded in reverse-slop (see disasm.loaded)");
     if (!bin.hype) fail("hyperion engine unavailable for this image");
 
+    // Fast reject: an unmapped VA can never decompile. Without this the
+    // request falls into function lookup + full p-code/SSA lifting on
+    // whatever the interval index returns, which wedged the engine.
+    if (!bin.pe.va_to_offset(va))
+        fail("addr 0x" + hex64(va) +
+             " is not mapped in the loaded image (base 0x" + hex64(bin.base) +
+             ", size_of_image 0x" + hex64(bin.pe.size_of_image) +
+             "); pass a VA inside the image (see disasm.pe sections)");
+
     const bool annotate_bytes = args.value("annotate_bytes", false);
 
     const hype::Function* f = bin.hype->function_at(va);
@@ -5696,6 +5975,30 @@ json tool_re(const json& args) {
     (void)base;
 
     if (action == "rtti_scan") {
+        // Case-insensitive substring filter over mangled + demangled names,
+        // plus limit/total so 600-class dumps stop truncating the session.
+        const std::string filter = args.value("filter", std::string{});
+        auto match_filter = [&](const std::string& a, const std::string& b) {
+            if (filter.empty()) return true;
+            auto contains_ci = [&](const std::string& hay) {
+                if (hay.size() < filter.size()) return false;
+                for (size_t i = 0; i + filter.size() <= hay.size(); ++i) {
+                    bool m = true;
+                    for (size_t k = 0; k < filter.size(); ++k) {
+                        if (std::tolower(static_cast<unsigned char>(hay[i + k])) !=
+                            std::tolower(static_cast<unsigned char>(filter[k]))) {
+                            m = false;
+                            break;
+                        }
+                    }
+                    if (m) return true;
+                }
+                return false;
+            };
+            return contains_ci(a) || contains_ci(b);
+        };
+        const size_t rtti_limit =
+            std::min<size_t>(args.value("limit", 500u), 10000u);
         // hyperion rtti beats the quick scanner when its ready
         // the lock above already pins the session
         if (!args.contains("path")) {
@@ -5703,32 +6006,48 @@ json tool_re(const json& args) {
             if (bin.ready && bin.hype && bin.hype->ready()) {
                 const auto& classes = bin.hype->rtti().classes();
                 json arr = json::array();
+                size_t matched = 0;
                 for (const auto& c : classes) {
+                    const std::string shown = c.demangled_name.empty()
+                                                  ? c.mangled_name
+                                                  : c.demangled_name;
+                    if (!match_filter(shown, c.mangled_name)) continue;
+                    ++matched;
+                    if (arr.size() >= rtti_limit) continue;
                     json methods = json::array();
                     for (auto m : c.methods) methods.push_back(m);
-                    arr.push_back({{"name", c.demangled_name.empty()
-                                                ? c.mangled_name
-                                                : c.demangled_name},
+                    arr.push_back({{"name", shown},
                                    {"mangled", c.mangled_name},
                                    {"td_va", c.type_descriptor},
                                    {"vtable_va", c.vtable},
                                    {"methods", methods},
                                    {"method_count", c.methods.size()}});
                 }
-                return {{"engine", "hyperion"}, {"classes", arr},
-                        {"count", arr.size()}};
+                json out = {{"engine", "hyperion"}, {"classes", arr},
+                            {"count", arr.size()}, {"total", matched}};
+                if (!filter.empty()) out["filter"] = filter;
+                if (matched > arr.size()) out["truncated"] = true;
+                return out;
             }
         }
         auto r = re::rtti_scan(*pe, *file);
         json arr = json::array();
+        size_t matched = 0;
         for (const auto& c : r.classes) {
+            if (!match_filter(c.name, c.name)) continue;
+            ++matched;
+            if (arr.size() >= rtti_limit) continue;
             json vfs = json::array();
             for (auto v : c.vftables) vfs.push_back(v);
             arr.push_back({{"name", c.name}, {"td_va", c.td_va},
                            {"vftables", vfs}});
         }
-        return {{"classes", arr}, {"count", arr.size()},
-                {"scanned_bytes", r.scanned_bytes}};
+        json rout = {{"classes", arr}, {"count", arr.size()},
+                     {"total", matched},
+                     {"scanned_bytes", r.scanned_bytes}};
+        if (!filter.empty()) rout["filter"] = filter;
+        if (matched > arr.size()) rout["truncated"] = true;
+        return rout;
     }
     if (action == "vftable") {
         if (!args.contains("path")) {
@@ -5935,6 +6254,7 @@ json tool_xray(const json& args) {
             out["junk_sequences"] = r.junk_sequences;
             out["indirect_jumps"] = r.indirect_jumps;
             out["push_ret"] = r.push_ret;
+            out["privileged"] = r.privileged;
             out["obfuscation_score_pct"] = r.score_pct;
             // check it actually decoded
             auto probe = xray::decode_range(img, fn_va, 4);
@@ -5996,14 +6316,41 @@ json tool_xray(const json& args) {
 
     if (action == "hooks") {
         const size_t maxf = std::min<size_t>(args.value("max_functions", 500u), 10000u);
-        auto hits = xray::detect_hooks(img, maxf);
+        const size_t indexed = img.fns ? img.fns->functions().size() : 0;
+        std::vector<xray::hook_hit_t> hits;
+        size_t checked = 0;
+        std::string source = "index";
+        if (indexed > 0) {
+            hits = xray::detect_hooks(img, maxf);
+            checked = std::min(indexed, maxf);
+        } else if (shared_lock) {
+            // Legacy index empty (stripped/packed headers): fall back to
+            // Hyperion's recovered functions so hooks still get checked.
+            auto& bin = ds::get();
+            if (bin.ready && bin.hype && bin.hype->ready()) {
+                std::vector<uint64_t> vas;
+                vas.reserve(bin.hype->db().funcs.size());
+                for (const auto& [va, hf] : bin.hype->db().funcs) {
+                    (void)hf;
+                    vas.push_back(va);
+                }
+                std::sort(vas.begin(), vas.end());
+                hits = xray::detect_hooks_at(img, vas, maxf);
+                checked = std::min(vas.size(), maxf);
+                source = "hyperion";
+            }
+        }
         json arr = json::array();
         for (const auto& h : hits)
             arr.push_back({{"address", h.address}, {"hook_type", h.hook_type},
                            {"target", h.target}, {"prologue_bytes", h.prologue_hex}});
-        out["functions_checked"] = std::min<size_t>(img.fns ? img.fns->functions().size() : 0, maxf);
+        out["functions_checked"] = checked;
         out["hooks_found"] = hits.size();
         out["hooks"] = arr;
+        out["source"] = source;
+        if (checked == 0)
+            out["note"] = "no functions available: legacy index empty and "
+                          "hyperion not ready (wait for hype.ready or pass path)";
         return out;
     }
 
@@ -6077,10 +6424,16 @@ json tool_xray(const json& args) {
     }
 
     if (action == "entropy" || action == "pages" || action == "crypto_range") {
-        // accept base/va/address aliases: agents naturally say base=
-        const uint64_t va = parse_addr_alias(args, {"addr", "base", "va", "address"});
+        // accept base/va/address aliases: agents naturally say base=.
+        // No address at all scans from the image base (a limit-only call
+        // like pages limit=10 then works instead of erroring).
+        const uint64_t va = has_any(args, {"addr", "base", "va", "address"})
+            ? parse_addr_alias(args, {"addr", "base", "va", "address"})
+            : default_base;
         const size_t size = has_any(args, {"size", "len", "length"})
             ? static_cast<size_t>(parse_addr_alias(args, {"size", "len", "length"})) : 4096;
+        out["scan_base"] = va;
+        out["scan_size"] = size;
 
         if (action == "entropy") {
             const size_t window = has_any(args, {"window_size", "window"})
@@ -6203,8 +6556,14 @@ json tool_patch(const json& args) {
         opts.patch_api_calls = args.value("patch_api_calls", true);
         opts.patch_int_traps = args.value("patch_int_traps", true);
         opts.patch_timing    = args.value("patch_timing", true);
-        r = imgpatch::patch_anti_debug(bin, parse_addr(args, "addr"), opts,
+        // Per-function operation: no addr scans the entry-point function.
+        const bool defaulted_addr = !args.contains("addr");
+        const uint64_t ad_va = defaulted_addr
+            ? bin.base + bin.pe.entry_rva
+            : parse_addr(args, "addr");
+        r = imgpatch::patch_anti_debug(bin, ad_va, opts,
                                        args.value("dry_run", false));
+        if (defaulted_addr) r.note = "no addr given: scanned entry-point function";
     } else if (action == "unpack_xor") {
         const uint64_t va = parse_addr(args, "addr");
         size_t size = args.contains("size")
@@ -6280,6 +6639,7 @@ json tool_patch(const json& args) {
         out["key_confidence"] = r.key_confidence;
     }
     if (r.strings_found) out["strings_found"] = r.strings_found;
+    if (!r.note.empty()) out["note"] = r.note;
     return out;
 }
 
@@ -7324,8 +7684,14 @@ json tool_frida(const json& args, const infra::cancel_token_t& cancel) {
     }
 
     if (action == "compile") {
+        // Standalone project compile (no session needed): entrypoint is the
+        // agent project file, project_root the project dir. For compiling a
+        // JS snippet against a live session, use compile_script instead.
         const std::string entrypoint = args.value("entrypoint", std::string{});
-        if (entrypoint.empty()) fail("missing 'entrypoint'");
+        if (entrypoint.empty())
+            fail("missing 'entrypoint' (agent project file to compile; "
+                 "standalone, no session needed -- for a live session use "
+                 "compile_script with session+source)");
         std::string output;
         if (!svc.compile_project(entrypoint, args.value("project_root", std::string{}),
                                  &output, &err,
@@ -7339,9 +7705,14 @@ json tool_frida(const json& args, const infra::cancel_token_t& cancel) {
     }
 
     if (action == "compile_script" || action == "snapshot_script") {
+        // Session-bound: attach(pid) first, then pass its session handle.
+        // (The standalone project compiler is the 'compile' action.)
         const std::string session = args.value("session", std::string{});
         const std::string source = args.value("source", std::string{});
-        if (session.empty()) fail("missing 'session' handle");
+        if (session.empty())
+            fail("missing 'session' handle (attach(pid) first, then pass its "
+                 "session; for standalone project builds use 'compile' with "
+                 "entrypoint)");
         if (source.empty()) fail("missing 'source' JS code");
         std::string b64;
         const bool ok = action == "compile_script"
@@ -7498,7 +7869,7 @@ void list_tools(json& out) {
     const char* emulate_schema =
         R"({"type":"object","properties":{"action":{"type":"string","enum":["run"]},"hex":{"type":"string"},"file_addr":{"type":"integer"},"target_addr":{"type":"integer"},"code_len":{"type":"integer"},"base":{"type":"integer"},"entry":{"type":"integer"},"stack_base":{"type":"integer"},"stack_size":{"type":"integer"},"sp":{"type":"integer"},"regs":{"type":"object"},"maps":{"type":"array"},"until":{"type":"integer"},"count":{"type":"integer"},"timeout_ms":{"type":"integer"},"trace":{"type":"boolean"},"trace_max":{"type":"integer"},"taint":{"type":"array"},"watch_addr":{"type":"integer"},"watch_len":{"type":"integer"}},"required":["action"]})";
     const char* analyze_schema =
-        R"({"type":"object","properties":{"action":{"type":"string","enum":["packer","signatures","diff"]},"path":{"type":"string"},"path_a":{"type":"string"},"path_b":{"type":"string"},"limit":{"type":"integer"},"timeout_ms":{"type":"integer"},"max_pairs":{"type":"integer"}},"required":["action"]})";
+        R"({"type":"object","properties":{"action":{"type":"string","enum":["packer","signatures","diff","diff_start","diff_job","diff_cancel"]},"path":{"type":"string"},"path_a":{"type":"string"},"path_b":{"type":"string"},"limit":{"type":"integer"},"timeout_ms":{"type":"integer"},"max_pairs":{"type":"integer"},"id":{"type":"integer"}},"required":["action"]})";
     const char* network_schema =
         R"({"type":"object","properties":{"action":{"type":"string","enum":["status","capture_start","capture_stop","packets","dns","rules_add","rules_remove","rules_clear","stats","export_pcap","streams","stream_data","inject","mod_rule_add","mod_rule_remove","mod_rules_list","redirect_add","redirect_remove","redirect_rules_list","dns_spoof_add","dns_spoof_remove","dns_spoof_list","kill_conn","intercept_start","intercept_stop","intercept_list","intercept_release","bw_start","bw_stop","bw_stats","bw_processes","fingerprint_run","fingerprint_results","reassemble_stream","connections","deep_inspect","wfp_callouts","socket_handles","tcpip_dump","interfaces","block_ip","block_port","block_process"]},"pid":{"type":"integer"},"port":{"type":"integer"},"protocol":{"type":"integer"},"from":{"type":"integer"},"filter":{"type":"string"},"limit":{"type":"integer"},"rule_id":{"type":"integer"},"direction":{"type":["integer","string"]},"path":{"type":"string"},"max_packets":{"type":"integer"},"id":{"type":"integer"},"offset":{"type":"integer"},"len":{"type":"integer"},"payload_hex":{"type":"string"},"pattern_hex":{"type":"string"},"replacement_hex":{"type":"string"},"src_ip":{"type":"string"},"dst_ip":{"type":"string"},"match_ip":{"type":"string"},"redirect_ip":{"type":"string"},"ip":{"type":"string"},"domain":{"type":"string"},"ttl":{"type":"integer"},"hold_id":{"type":"integer"},"exclude_pid":{"type":"integer"},"window_ms":{"type":"integer"},"src_port":{"type":"integer"},"dst_port":{"type":"integer"},"module":{"type":"string"}},"required":["action"]})";
     const char* proxy_schema =
@@ -7506,7 +7877,7 @@ void list_tools(json& out) {
     const char* persist_schema =
         R"({"type":"object","properties":{"action":{"type":"string","enum":["save","list","load","delete","kv_set","kv_get","hype_save","hype_load"]},"name":{"type":"string"},"data":{},"id":{"type":"integer"},"key":{"type":"string"},"value":{},"dir":{"type":"string"}},"required":["action"]})";
     const char* re_schema =
-        R"({"type":"object","properties":{"action":{"type":"string","enum":["rtti_scan","vftable","danger","libsig"]},"path":{"type":"string"},"base":{"type":"integer"},"addr":{"type":"integer"},"slots":{"type":"integer"},"sigset":{"type":"string"}},"required":["action"]})";
+        R"({"type":"object","properties":{"action":{"type":"string","enum":["rtti_scan","vftable","danger","libsig"]},"path":{"type":"string"},"base":{"type":"integer"},"addr":{"type":"integer"},"slots":{"type":"integer"},"sigset":{"type":"string"},"filter":{"type":"string"},"limit":{"type":"integer"}},"required":["action"]})";
     const char* script_schema =
         R"({"type":"object","properties":{"action":{"type":"string","enum":["run"]},"code":{"type":"string"},"timeout_ms":{"type":"integer"}},"required":["action"]})";
     const char* frida_schema =
@@ -7544,10 +7915,10 @@ void list_tools(json& out) {
                    {"description", "Run focused read-only static-analysis queries on the shared image or an explicit path. For cfg, complexity, cff, obfuscation, strings_recon, indirect_calls, and anti_analysis, pass addr as a function-start VA; known functions use indexed bounds and unknown addresses fall back to linear decode. Whole-image actions detect hooks, direct syscalls and SSNs, imported-API hashes, entropy windows, page classes, crypto constants, and ROP gadgets. apihash only searches imports of this image, including bare API and 'DLL!API' forms; it is not a global hash dictionary. Use disasm.loaded/functions first to establish image state and valid function VAs."},
                    {"inputSchema", json::parse(xray_schema)}, {"read_only", true}});
     out.push_back({{"name", "patch"},
-                   {"description", "Mutate the currently loaded file-image analysis session; this does not patch live target memory. Use journal to inspect recorded edits and revert_all to undo them. write_bytes performs an explicit VA/hex edit. nop_junk, resolve_opaque, patch_antidebug, unpack_xor, and decode_strings apply focused deobfuscation; dry_run previews opaque-predicate changes. full_pass orchestrates multiple passes and reports before/after scores. rebuild(addr) re-decodes a patched function and invalidates affected indexes so later disasm/decomp results reflect changes. Requires disasm.loaded image.ready=true; use memory.write for live-process bytes."},
+                    {"description", "Mutate the currently loaded file-image analysis session; this does not patch live target memory. Use journal to inspect recorded edits and revert_all to undo them. write_bytes performs an explicit VA/hex edit. nop_junk, resolve_opaque, patch_antidebug, unpack_xor, and decode_strings are per-function operations taking a function-start addr (patch_antidebug without addr scans the entry-point function); dry_run previews opaque-predicate changes. full_pass orchestrates multiple passes and reports before/after scores. rebuild(addr) re-decodes a patched function and invalidates affected indexes so later disasm/decomp results reflect changes. Requires disasm.loaded image.ready=true; use memory.write for live-process bytes."},
                    {"inputSchema", json::parse(patch_schema)}, {"read_only", false}});
     out.push_back({{"name", "devirt"},
-                    {"description", "Deobfuscation, VM recovery, and Themida unpacking. Themida actions supervise the separate Magicmida debugger engine: call themida_status to discover x86/x64 sidecars, themida_start(path,output_path,timeout_ms,overwrite,load) to launch a cancellable job, then poll themida_job(id) or stop it with themida_cancel(id). Successful output is architecture-validated and can load into the shared analysis session. Static actions identify/handlers/trace/lift/pseudocode recover VM structure; recover_cfg, prove_predicates, invariants, and iat_audit inspect the shared image without mutation."},
+                    {"description", "Deobfuscation, VM recovery, and Themida unpacking. Themida actions supervise the separate Magicmida debugger engine: call themida_status to discover x86/x64 sidecars, themida_start(path,output_path,timeout_ms,overwrite,load) to launch a cancellable job, then poll themida_job(id) or stop it with themida_cancel(id). Successful output is architecture-validated and can load into the shared analysis session. Static VM chain (each step needs the previous): identify(addr) reports likely_vm plus handler_table when found; handlers(table|addr) classifies the table; trace/lift/pseudocode(addr + handler_table|handlers) follow the bytecode -- trace/lift/pseudocode on a non-VM function fail with guidance, they never synthesize handlers. handlers also accepts addr= as a table alias. recover_cfg, prove_predicates, invariants, and iat_audit inspect the shared image without mutation."},
                     {"inputSchema", json::parse(devirt_schema)}, {"read_only", false}});
     out.push_back({{"name", "types"},
                    {"description", "Define and apply structs/enums for the current binary; the catalog persists by binary hash. declare parses C-like struct or enum declarations, while create/get/list/remove and add_member provide structured CRUD with computed natural or packed layouts. read_field reads one named field; format_at renders a complete struct or enum at addr. Reads use the mapped file image by default and attached-process memory when live=true. Accepted packed struct forms include 'struct Name { ... } packed;' and 'packed struct Name { ... };'. Load the intended binary before changing the catalog."},
@@ -7559,7 +7930,7 @@ void list_tools(json& out) {
                    {"description", "Emulate x86-64 code in an isolated Unicorn VM. action='run' accepts exactly one practical code source: hex bytes, file_addr from the shared image, or target_addr from attached-process memory; code_len bounds file/live reads. Set base/entry, registers, stack, and extra maps as needed. Stop with until, count, or timeout_ms. trace enables bounded instruction history; taint entries mark source byte ranges, and watch_addr/watch_len selects the output window for byte-granular propagation results. Emulation does not modify the loaded image or live target."},
                    {"inputSchema", json::parse(emulate_schema)}, {"read_only", true}});
     out.push_back({{"name", "analyze"},
-                   {"description", "Run whole-binary read-only analysis. packer uses the shared image or path and reports protector names, entry signatures, entropy, import anomalies, W+X sections, TLS, overlay, crypto constants, and the shared Hyperion verdict when available. signatures requires the analyzed shared session and returns analyzer-derived names in named_functions; names may come from RTTI, vtables, thunks, or signature candidates and are not provenance-verified as FLIRT. diff(path_a,path_b) performs two full Hyperion analyses and reports added, removed, and modified functions with similarity scores, so expect a longer call. Check disasm.loaded before shared-session actions."},
+                   {"description", "Run whole-binary read-only analysis. packer uses the shared image or path and reports protector names, entry signatures, entropy, import anomalies, W+X sections, TLS, overlay, crypto constants, and the shared Hyperion verdict when available. signatures requires the analyzed shared session and returns analyzer-derived names in named_functions; names may come from RTTI, vtables, thunks, or signature candidates and are not provenance-verified as FLIRT. diff(path_a,path_b) performs two full Hyperion analyses and reports added, removed, and modified functions with similarity scores, so expect a longer call; for huge binaries use async diff_start(path_a,path_b) then poll diff_job(id) for stage/progress and stop with diff_cancel(id). Check disasm.loaded before shared-session actions."},
                    {"inputSchema", json::parse(analyze_schema)}, {"read_only", true}});
     out.push_back({{"name", "network"},
                    {"description", "Capture, query, and manipulate Windows network traffic through slopdrvr/WFP. Call status first. A common read flow is capture_start -> packets/dns/streams/stats -> capture_stop; packets filter syntax includes port=80;host:1.2.3.4;text:foo;pid:1234;proto:tcp, and stream_data reads payload by id/offset/len. Mutation actions cover WFP rules, injection, pattern replacement, redirects, DNS spoofing, connection kill, hold/modify/release interception, bandwidth controls, and block_ip/block_port/block_process (direction in|out|both, default both). System inspection includes connections, DPI, callouts, socket handles, TCB dump, interfaces, fingerprints, and reassembly. Driver-dependent actions return structured errors when slopdrvr is unavailable."},
@@ -7571,7 +7942,7 @@ void list_tools(json& out) {
                    {"description", "Persist agent or analysis state in the app database. save(name,data) stores an arbitrary JSON session snapshot and returns an id; list discovers snapshots, load(id) retrieves one, and delete(id) removes it. kv_set/kv_get store small named values such as layouts. hype_save(dir) writes the current Hyperion project as a .hdb directory; hype_load(dir) merges names and comments into the live shared image, but does not merge xrefs or types. Persistence does not automatically restore a process attachment or debugger session."},
                    {"inputSchema", json::parse(persist_schema)}, {"read_only", false}});
     out.push_back({{"name", "re"},
-                   {"description", "Run read-only reverse-engineering reconnaissance on the shared image or an explicit path. rtti_scan prefers completed Hyperion analysis and returns demangled MSVC classes, vtables, and methods; otherwise it falls back to a quick TypeDescriptor scan. vftable(addr,slots) reads virtual-function entries and uses Hyperion metadata when addr is an indexed vtable. danger finds callsites to security-sensitive imports using Hyperion xrefs for the shared session or the legacy index for explicit paths. libsig(path,sigset) identifies libraries from a JSON byte-signature set. Check disasm.loaded and wait for hype.ready for richest results."},
+                    {"description", "Run read-only reverse-engineering reconnaissance on the shared image or an explicit path. rtti_scan prefers completed Hyperion analysis and returns demangled MSVC classes, vtables, and methods; otherwise it falls back to a quick TypeDescriptor scan. rtti_scan accepts filter (case-insensitive substring over class names) and limit (default 500) with total/truncated. vftable(addr,slots) reads virtual-function entries and uses Hyperion metadata when addr is an indexed vtable. danger finds callsites to security-sensitive imports using Hyperion xrefs for the shared session or the legacy index for explicit paths. libsig(path,sigset) identifies libraries from a JSON byte-signature set. Check disasm.loaded and wait for hype.ready for richest results."},
                    {"inputSchema", json::parse(re_schema)}, {"read_only", true}});
     out.push_back({{"name", "decomp"},
                    {"description", "Decompile one function from the shared image. Prerequisite: call disasm.loaded and wait for image.hype.ready=true, then obtain a function-start addr from disasm.functions. action='function' returns structured C, per-line VA mappings, reconstructed stack variables, and a recovered signature after p-code lifting, SSA, optimization, type inference, and control-flow structuring. Naming priority is user symbol, Hyperion name, then sub_<rva>; RTTI and recognized STL types may appear in output. Set annotate_bytes=true to prefix emitted lines with source VAs. This tool does not accept an explicit path; load the binary first."},
@@ -7586,10 +7957,10 @@ void list_tools(json& out) {
                    {"description", "Make outbound HTTP(S) requests from the host through WinHTTP. fetch(url,timeout_ms) performs GET; post(url,body,content_type,timeout_ms) performs POST. Results include response status/body or a structured transport error. Use this for symbol downloads, API queries, and target-related lookups; it is unrelated to captured traffic in network or proxy and does not inherit browser cookies."},
                    {"inputSchema", json::parse(web_schema)}, {"read_only", false}});
     out.push_back({{"name", "script"},
-                   {"description", "Run a Lua 5.4 automation script inside reverse-slop, the scripting layer over static analysis, like IDAPython for IDA. action='run' requires code; timeout_ms defaults to 5000 and is capped at 60000 (pass a higher timeout_ms when waiting for analysis). print() output is captured and returned values are serialized as 'return: <value>'. Scripts operate on the SAME shared binary session as the UI and every other MCP tool, so loads, renames, and comments are visible everywhere. Static-analysis API: slop.image.{load(path[,base]),load_from_target,unload,status,wait_ready([ms])}; slop.disasm.{decode(addr[,n]),functions([limit]),function_at(va),xrefs_to(va),strings([min[,limit]]),pe(),bytes(addr[,len]),name(va),set_name(va,name),comment(va),set_comment(va,text),bookmark_toggle(va),bookmarks()}; slop.decomp.{decompile(va),blocks(va),vtables(),globals(),rtti()} (decomp.* needs slop.image.wait_ready first). Live analysis: slop.target.{list,attach,status}, slop.mem.{read_hex,write_hex,scan}, slop.disasm.disassemble(addr,count), slop.analyze.packer. Typical flow: image.load(path) -> image.wait_ready() -> disasm.functions() -> decomp.decompile(va). Use direct MCP tools when one operation is sufficient."},
+                   {"description", "Run a Lua 5.4 automation script inside reverse-slop, the scripting layer over static analysis, like IDAPython for IDA. action='run' requires code; timeout_ms defaults to 5000 and is capped at 60000 (pass a higher timeout_ms when waiting for analysis). print() output is captured and returned values are serialized as 'return: <value>'. Scripts operate on the SAME shared binary session as the UI and every other MCP tool, so loads, renames, and comments are visible everywhere. Static-analysis API: slop.image.{load(path[,base]),load_from_target,unload,status,wait_ready([ms])}; slop.disasm.{decode(addr[,n]),functions([limit]),function_at(va),xrefs_to(va),strings([min_len[,limit]]) -- note min-length FIRST, so strings(4,3000) not strings(2000),pe(),bytes(addr[,len]),name(va),set_name(va,name),comment(va),set_comment(va,text),bookmark_toggle(va),bookmarks()}; slop.decomp.{decompile(va),blocks(va),vtables(),globals(),rtti()} (decomp.* needs slop.image.wait_ready first). Live analysis: slop.target.{list,attach,status}, slop.mem.{read_hex,write_hex,scan}, slop.disasm.disassemble(addr,count), slop.analyze.packer. Typical flow: image.load(path) -> image.wait_ready() -> disasm.functions() -> decomp.decompile(va). Use direct MCP tools when one operation is sufficient."},
                    {"inputSchema", json::parse(script_schema)}, {"read_only", false}});
     out.push_back({{"name", "frida"},
-                   {"description", "Instrument live processes with embedded frida-core 17.x. Start with status/devices; choose device, enumerate with ps/applications/find_process, then attach(pid) to obtain a session handle. Create and optionally auto-load JavaScript with script_create(session,source,runtime,load), or compile source with compile_script and pass its b64 back as script_create bytecode_b64. drain send()/console output with messages(script,limit), call rpc.exports with rpc(script,method,args,timeout_ms), and destroy scripts/detach sessions when finished. script_unload is terminal and removes its handle. spawn returns a suspended pid unless resumed; spawn/resume/kill/input and spawn/child gating support launch workflows. remote_add connects frida-server devices. Handles are returned by prior calls; do not substitute OS pids for session or script handles."},
+                   {"description", "Instrument live processes with embedded frida-core 17.x. Start with status/devices; choose device, enumerate with ps/applications/find_process, then attach(pid) to obtain a session handle. Create and optionally auto-load JavaScript with script_create(session,source,runtime,load), or compile source with compile_script(session,source) and pass its b64 back as script_create bytecode_b64 (compile_script needs a live session from attach; the standalone project compiler is the separate compile action needing entrypoint, no session). drain send()/console output with messages(script,limit), call rpc.exports with rpc(script,method,args,timeout_ms), and destroy scripts/detach sessions when finished. script_unload is terminal and removes its handle. spawn returns a suspended pid unless resumed; spawn/resume/kill/input and spawn/child gating support launch workflows. remote_add connects frida-server devices. Handles are returned by prior calls; do not substitute OS pids for session or script handles."},
                    {"inputSchema", json::parse(frida_schema)}, {"read_only", false}});
 }
 
@@ -7620,13 +7991,24 @@ nlohmann::json call_tool(const std::string& name, const nlohmann::json& args,
         // it must NOT hold g_tool_mu or every lightweight tool (target.status,
         // disasm.loaded, analyze_stop, ...) queues behind it until the MCP
         // timeout fires. It carries its own cancel token + deadline instead.
-        if (name == "analyze" && args.value("action", std::string{}) == "diff") {
-            json out = tool_analyze(args, cancel);
-            try {
-                enrich_payload(name, args, out);
-            } catch (...) {}
-            return out;
+        // The diff_start/diff_job/diff_cancel job flavor is lock-free too
+        // (own mutex + jobs coordinator), so progress polling never blocks.
+        if (name == "analyze") {
+            const std::string act = args.value("action", std::string{});
+            if (act == "diff" || act == "diff_start" || act == "diff_job" ||
+                act == "diff_cancel") {
+                json out = tool_analyze(args, cancel);
+                try {
+                    enrich_payload(name, args, out);
+                } catch (...) {}
+                return out;
+            }
         }
+        // NOTE: decomp.function stays under g_tool_mu on purpose: the patch
+        // tool can reanalyze() the session (replacing the analyzer mid-lift),
+        // so decompile must stay serialized with it. Wedges are fixed at the
+        // root instead (unmapped-VA fast reject in tool_decomp + SSA
+        // termination guards), keeping slow-but-legit decompiles safe.
         std::lock_guard lk(g_tool_mu);
         json out;
         bool found = true;

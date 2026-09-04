@@ -60,6 +60,11 @@ BinDiff::outcome_t BinDiff::compare_budgeted(const AnalysisDB& a,
         }
         return false;
     };
+    auto report_progress = [&]() {
+        if (!opt.progress || !*opt.progress || !opt.max_pairs) return;
+        (*opt.progress)(std::min(1.0f, static_cast<float>(out.pairs_evaluated) /
+                                           static_cast<float>(opt.max_pairs)));
+    };
 
     for (const auto& [ea, fa] : a.funcs) {
         if (check_stop()) break;
@@ -105,7 +110,10 @@ BinDiff::outcome_t BinDiff::compare_budgeted(const AnalysisDB& a,
             const float sim = compute_similarity_cached(ba, bb);
             ++out.pairs_evaluated;
             if (sim > best_sim) { best_sim = sim; best_eb = eb; }
-            if ((out.pairs_evaluated & 0xFFF) == 0 && check_stop()) break;
+            if ((out.pairs_evaluated & 0xFFF) == 0) {
+                report_progress();
+                if (check_stop()) break;
+            }
         }
         if (out.cancelled || out.timed_out) {
             // Budget exhausted: this and all remaining a-funcs report as

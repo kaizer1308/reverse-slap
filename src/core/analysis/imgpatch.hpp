@@ -27,6 +27,7 @@ struct op_result_t {
     uint64_t detected_key  = 0;
     double   key_confidence = 0.0;
     size_t   strings_found = 0;
+    std::string note;                    // handler-supplied context (echoed)
 };
 
 // NOP out junk: nop sleds longer than threshold plus (aggressive) dead-code

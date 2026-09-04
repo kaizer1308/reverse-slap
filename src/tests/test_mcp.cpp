@@ -1550,6 +1550,12 @@ TEST_CASE(mcp_decomp_function_hyperion_engine) {
                        {{"action", "functions"}, {"limit", 64}}, is_error);
     REQUIRE(!is_error);
     REQUIRE(fns.at("functions").size() > 0);
+    // Every row carries its provenance (index vs hyperion analyzer DB)
+    for (const auto& f : fns.at("functions")) {
+        REQUIRE(f.contains("source"));
+        const std::string src = f.value("source", "");
+        REQUIRE(src == "index" || src == "hyperion");
+    }
     const uint64_t some_fn =
         fns.at("functions").at(0).at("va").get<uint64_t>();
 
@@ -1562,11 +1568,14 @@ TEST_CASE(mcp_decomp_function_hyperion_engine) {
     REQUIRE(payload.contains("function_va"));
     REQUIRE(payload.contains("vars"));
 
-    // Unknown address -> structured error
+    // Unknown address -> structured error, fast unmapped-VA reject
+    // (must never wedge the engine on addresses outside the image)
     payload = fx.call("decomp", {{"action", "function"},
                                  {"addr", 0x1BADBEEFull}}, is_error);
     REQUIRE(is_error);
     REQUIRE(payload.contains("error"));
+    REQUIRE(payload.at("error").get<std::string>().find("not mapped") !=
+            std::string::npos);
 
     ds::unload();
 }
