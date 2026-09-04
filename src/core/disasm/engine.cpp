@@ -56,8 +56,8 @@ std::optional<insn_t> engine_t::decode(uint64_t va, const uint8_t* buf,
     for (uint8_t i = 0; i < vis; ++i) {
         const auto& op = ops[i];
         operand_t&  o  = out.ops[out.op_count++];
-        o.read  = op.actions & ZYDIS_OPERAND_ACTION_READ;
-        o.write = op.actions & ZYDIS_OPERAND_ACTION_WRITE;
+        o.read  = (op.actions & ZYDIS_OPERAND_ACTION_MASK_READ) != 0;
+        o.write = (op.actions & ZYDIS_OPERAND_ACTION_MASK_WRITE) != 0;
         switch (op.type) {
         case ZYDIS_OPERAND_TYPE_REGISTER:
             o.cls = op_class_t::reg;
@@ -81,33 +81,34 @@ std::optional<insn_t> engine_t::decode(uint64_t va, const uint8_t* buf,
         }
     }
 
-    switch (instr.mnemonic) {
-    case ZYDIS_MNEMONIC_CALL: out.flow = flow_t::call; break;
-    case ZYDIS_MNEMONIC_JMP:  out.flow = flow_t::jmp;  break;
-    case ZYDIS_MNEMONIC_RET:  out.flow = flow_t::ret;  break;
-    default:
-        if (instr.meta.category == ZYDIS_CATEGORY_COND_BR)
-            out.flow = flow_t::jcc;
-        break;
+    switch (instr.meta.category) {
+    case ZYDIS_CATEGORY_CALL:      out.flow = flow_t::call; break;
+    case ZYDIS_CATEGORY_UNCOND_BR: out.flow = flow_t::jmp;  break;
+    case ZYDIS_CATEGORY_COND_BR:   out.flow = flow_t::jcc;  break;
+    case ZYDIS_CATEGORY_RET:       out.flow = flow_t::ret;  break;
+    default: break;
     }
 
     if (out.flow != flow_t::none && out.flow != flow_t::ret) {
-        // Branch target: first operand
+        // A memory operand resolves the pointer slot, not the branch
+        // destination. Only relative immediates are statically direct targets.
         for (size_t i = 0; i < instr.operand_count_visible; ++i) {
+            if (ops[i].type != ZYDIS_OPERAND_TYPE_IMMEDIATE || !ops[i].imm.is_relative)
+                continue;
             uint64_t abs = 0;
             if (ZydisCalcAbsoluteAddress(&instr, &ops[i], va, &abs) == ZYAN_STATUS_SUCCESS) {
                 out.has_rel_target = true;
-                out.rel_target     = abs;
+                out.rel_target     = x64_ ? abs : static_cast<uint32_t>(abs);
                 break;
             }
         }
     }
 
-    // Rip-relative data reference (first memory operand with RIP base)
+    // Address-size override selects EIP-relative addressing even in x64.
     for (size_t i = 0; i < instr.operand_count_visible; ++i) {
         const auto& op = ops[i];
         if (op.type != ZYDIS_OPERAND_TYPE_MEMORY) continue;
-        if (op.mem.base != ZYDIS_REGISTER_RIP) continue;
+        if (op.mem.base != ZYDIS_REGISTER_RIP && op.mem.base != ZYDIS_REGISTER_EIP) continue;
         uint64_t abs = 0;
         if (ZydisCalcAbsoluteAddress(&instr, &op, va, &abs) == ZYAN_STATUS_SUCCESS) {
             out.has_rip_rel    = true;

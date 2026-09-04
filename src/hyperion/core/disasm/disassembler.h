@@ -21,7 +21,7 @@ enum class InsnType : u8 {
 enum class OpType : u8 { None, Reg, Imm, Mem };
 
 // Field order is chosen for size, not readability: the natural ordering pads
-// this out to 40 bytes, and an Insn carries four of them for every decoded
+// this out to 40 bytes, and an Insn carries five of them for every decoded
 // instruction in the image. Keeping the 8-byte members first packs it to 32
 struct Operand {
     u64    val  = 0;
@@ -37,7 +37,7 @@ struct Operand {
 // keeps one of these per instruction in the DB and another per basic block
 struct Insn {
     va_t        addr;
-    Operand     ops[4];
+    Operand     ops[5]; // Includes the mask and trailing immediate of AVX-512.
     char        op_str[64];
     char        mnemonic[12];
     u8          bytes[15];

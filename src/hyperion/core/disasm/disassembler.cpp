@@ -3,6 +3,7 @@
 #include <fmt/format.h>
 #include <algorithm>
 #include <cstring>
+#include <iterator>
 
 namespace hype {
 
@@ -27,6 +28,8 @@ void Disassembler::set_arch(Arch arch) {
 
 static InsnType classify(const ZydisDecodedInstruction& insn) {
     const auto m = insn.mnemonic;
+    if (insn.meta.category == ZYDIS_CATEGORY_RET)
+        return InsnType::Ret;
     if (insn.meta.category == ZYDIS_CATEGORY_COND_BR)
         return InsnType::Jcc;
     if (insn.meta.category == ZYDIS_CATEGORY_SETCC)
@@ -78,6 +81,10 @@ bool Disassembler::decode(va_t addr, const u8* data, size_t len, Insn& out,
     if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(&impl_->decoder, data, len, &zi, zo)))
         return false;
 
+    // Callers reuse records, including after RIP-relative loads. An unresolved
+    // memory operand must never inherit the previous instruction's address.
+    std::fill(std::begin(out.ops), std::end(out.ops), Operand{});
+    std::fill(std::begin(out.bytes), std::end(out.bytes), u8{});
     out.addr = addr;
     out.len = static_cast<u8>(zi.length);
     out.mnemonic_id = static_cast<u16>(zi.mnemonic);
@@ -93,9 +100,10 @@ bool Disassembler::decode(va_t addr, const u8* data, size_t len, Insn& out,
         else out.mnemonic[0] = '\0';
         out.op_str[0] = '\0';
     } else {
-        char buf[256];
-        ZydisFormatterFormatInstruction(&impl_->formatter, &zi, zo,
-            zi.operand_count_visible, buf, sizeof(buf), addr, nullptr);
+        char buf[256]{};
+        if (!ZYAN_SUCCESS(ZydisFormatterFormatInstruction(&impl_->formatter, &zi, zo,
+            zi.operand_count_visible, buf, sizeof(buf), addr, nullptr)))
+            return false;
 
         const char* sp = std::strchr(buf, ' ');
         if (sp) {
@@ -110,12 +118,13 @@ bool Disassembler::decode(va_t addr, const u8* data, size_t len, Insn& out,
     }
 
     out.op_count = 0;
-    for (u8 i = 0; i < zi.operand_count_visible && i < 4; ++i) {
+    static_assert(sizeof(out.ops) / sizeof(Operand) >= ZYDIS_MAX_OPERAND_COUNT_VISIBLE);
+    for (u8 i = 0; i < zi.operand_count_visible; ++i) {
         auto& zop = zo[i];
         auto& op = out.ops[i];
         op.size = zop.size;
-        op.read = (zop.actions & ZYDIS_OPERAND_ACTION_READ) != 0;
-        op.write = (zop.actions & ZYDIS_OPERAND_ACTION_WRITE) != 0;
+        op.read = (zop.actions & ZYDIS_OPERAND_ACTION_MASK_READ) != 0;
+        op.write = (zop.actions & ZYDIS_OPERAND_ACTION_MASK_WRITE) != 0;
 
         switch (zop.type) {
         case ZYDIS_OPERAND_TYPE_REGISTER:
@@ -124,9 +133,11 @@ bool Disassembler::decode(va_t addr, const u8* data, size_t len, Insn& out,
             break;
         case ZYDIS_OPERAND_TYPE_IMMEDIATE:
             op.type = OpType::Imm;
-            if (zop.imm.is_relative)
+            if (zop.imm.is_relative) {
                 ZydisCalcAbsoluteAddress(&zi, &zop, addr, &op.val);
-            else
+                if (zi.machine_mode == ZYDIS_MACHINE_MODE_LONG_COMPAT_32)
+                    op.val = static_cast<u32>(op.val);
+            } else
                 op.val = zop.imm.value.u;
             break;
         case ZYDIS_OPERAND_TYPE_MEMORY:
@@ -135,8 +146,9 @@ bool Disassembler::decode(va_t addr, const u8* data, size_t len, Insn& out,
             op.mem.index = static_cast<u16>(zop.mem.index);
             op.mem.scale = zop.mem.scale;
             op.mem.disp = zop.mem.disp.value;
-            if (zop.mem.base == ZYDIS_REGISTER_RIP || zop.mem.base == ZYDIS_REGISTER_EIP)
-                ZydisCalcAbsoluteAddress(&zi, &zop, addr, &op.val);
+            // Also resolve displacement-only/moffs addresses, especially x86
+            // globals and IAT slots. Register-dependent forms remain zero.
+            ZydisCalcAbsoluteAddress(&zi, &zop, addr, &op.val);
             break;
         default:
             op.type = OpType::None;

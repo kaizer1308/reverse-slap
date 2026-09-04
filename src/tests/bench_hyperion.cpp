@@ -2,6 +2,7 @@
 #include "core/infra/diag.hpp"
 #include "core/disasm/hyperion_session.hpp"
 #include "core/loader/pe_loader.h"
+#include "disasm_accuracy.hpp"
 
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
@@ -37,6 +38,26 @@ size_t private_bytes() {
     if (!GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&counters), sizeof(counters)))
         return 0;
     return counters.PrivateUsage;
+}
+
+nlohmann::json benchmark_accuracy() {
+    nlohmann::json reports = nlohmann::json::array();
+    for (bool x64 : {false, true}) {
+        for (bool random : {false, true}) {
+            const auto corpus = random ? disasm_accuracy::random_samples(x64)
+                                       : disasm_accuracy::fixtures(x64);
+            const auto start = clock_type::now();
+            const auto report = disasm_accuracy::evaluate(corpus, x64);
+            reports.push_back({{"arch", x64 ? "x64" : "x86"},
+                {"corpus", random ? "random_seed_5A17C0DE" : "fixtures_and_truncations"},
+                {"cases", report.cases}, {"decoded", report.decoded}, {"exact", report.exact},
+                {"mismatches", report.mismatches},
+                {"exact_percent", 100.0 * report.exact / report.cases},
+                {"oracle_check_ms", std::chrono::duration<double, std::milli>(clock_type::now() - start).count()}});
+        }
+    }
+    return {{"scope", "x86/x64 wrapper semantic fidelity to pinned Zydis; not code/data discovery accuracy"},
+            {"instruction_record_bytes", sizeof(hype::Insn)}, {"corpora", reports}};
 }
 
 // Back-to-back linear sweeps over the same executable bytes, with and
@@ -188,11 +209,13 @@ int main(int argc, char** argv) {
     std::vector<std::pair<std::string, std::string>> images;
     int runs = 6;
     bool load_only = false;
+    bool accuracy_only = false;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         if (arg == "--output" && i + 1 < argc) { output_path = argv[++i]; continue; }
         if (arg == "--runs" && i + 1 < argc) { runs = std::atoi(argv[++i]); continue; }
         if (arg == "--load") { load_only = true; continue; }
+        if (arg == "--accuracy-only") { accuracy_only = true; continue; }
         // --threads N sets SLOP_WORKER_THREADS for this process so scaling
         // can be measured without touching the environment.
         if (arg == "--threads" && i + 1 < argc) {
@@ -210,7 +233,10 @@ int main(int argc, char** argv) {
 
     try {
         nlohmann::json result;
-        if (images.empty()) {
+        result["accuracy"] = benchmark_accuracy();
+        if (accuracy_only) {
+            result["images"] = nlohmann::json::array();
+        } else if (images.empty()) {
             result["images"] = nlohmann::json::array({
                 benchmark_image("o0", SLOP_DECOMP_TARGET_O0_PATH, runs, true),
                 benchmark_image("o2", SLOP_DECOMP_TARGET_O2_PATH, runs, true),

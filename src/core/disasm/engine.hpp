@@ -47,11 +47,11 @@ struct insn_t {
     uint8_t       op_count = 0;
     operand_t     ops[ZYDIS_MAX_OPERAND_COUNT_VISIBLE];
 
-    // Absolute branch destination when flow != none/jcc-with-no-target
+    // Direct relative branch destination, never an indirect pointer slot.
     bool       has_rel_target = false;
     uint64_t   rel_target     = 0;
 
-    // First rip-relative memory operand's absolute VA (data references)
+    // First RIP/EIP-relative memory operand's absolute VA (data references)
     bool       has_rip_rel    = false;
     uint64_t   rip_rel_target = 0;
 
