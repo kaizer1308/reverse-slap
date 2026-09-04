@@ -351,6 +351,599 @@ std::string hex64(uint64_t v) {
     return buf;
 }
 
+// ---- AI-rich output enrichment (additive only, never removes keys) ----
+// Every VA the server returns is a decimal u64. Agents copy/paste hex, need
+// symbol context, units, enum meanings, and next-step guidance to stay
+// accurate. The helpers below mirror every address as 0x-hex, resolve known
+// symbols, decode raw Windows/network constants, and attach per-action hints.
+// All enrichment is best-effort and exception-free: it must never fail a call.
+
+std::string addr_hex_str(uint64_t v) {
+    char buf[32] = "";
+    std::snprintf(buf, sizeof(buf), "0x%llX", static_cast<unsigned long long>(v));
+    return buf;
+}
+
+std::string mem_protect_str(uint32_t p) {
+    const uint32_t base = p & 0xFFu;
+    std::string s;
+    switch (base) {
+    case 0x01: s = "NOACCESS"; break;
+    case 0x02: s = "R--"; break;
+    case 0x04: s = "RW-"; break;
+    case 0x08: s = "RW-COPY"; break;
+    case 0x10: s = "--X"; break;
+    case 0x20: s = "R-X"; break;
+    case 0x40: s = "RWX"; break;
+    case 0x80: s = "RX-COPY"; break;
+    default:   s = "UNKNOWN"; break;
+    }
+    if (p & 0x100u) s += "+GUARD";
+    if (p & 0x200u) s += "+NOCACHE";
+    if (p & 0x400u) s += "+WRITECOMBINE";
+    return s;
+}
+
+std::string mem_state_str(uint32_t st) {
+    if (st & 0x1000u)  return "COMMIT";
+    if (st & 0x2000u)  return "RESERVE";
+    if (st & 0x10000u) return "FREE";
+    return "UNKNOWN";
+}
+
+std::string mem_type_str(uint32_t t) {
+    if (t & 0x1000000u) return "IMAGE";
+    if (t & 0x40000u)   return "MAPPED";
+    if (t & 0x20000u)   return "PRIVATE";
+    return "UNKNOWN";
+}
+
+const char* net_proto_str(uint32_t p) {
+    switch (p) {
+    case 6:  return "tcp";
+    case 17: return "udp";
+    case 1:  return "icmp";
+    default: return "other";
+    }
+}
+
+const char* net_dir_str(uint32_t d) {
+    // traffic_store: 0 = outbound, 1 = inbound
+    return d == 0 ? "outbound" : "inbound";
+}
+
+const char* hw_type_str(uint32_t t) {
+    switch (t) {
+    case 0: return "exec";
+    case 1: return "write";
+    case 3: return "read_write";
+    default: return "unknown";
+    }
+}
+
+std::string rflags_str(uint64_t f) {
+    // set-flag mnemonics only, so the agent can read ZF/SF/etc at a glance
+    static const char* kNames[22] = {
+        "CF", nullptr, "PF", nullptr, "AF", nullptr, "ZF", "SF",
+        "TF", "IF", "DF", "OF", "IOPL1", "IOPL2", "NT", nullptr,
+        "RF", "VM", "AC", "VIF", "VIP", "ID",
+    };
+    std::string s;
+    for (int i = 0; i < 22; ++i) {
+        if (!kNames[i]) continue;
+        if (f & (1ull << i)) {
+            if (!s.empty()) s += "+";
+            s += kNames[i];
+        }
+    }
+    return s.empty() ? "none" : s;
+}
+
+struct enrich_ctx_t {
+    std::unordered_map<uint64_t, std::string> syms;        // user renames
+    std::unordered_map<uint64_t, std::string> hype_names;  // analyzer names
+    std::string image_name;
+    uint64_t    image_base = 0;
+    uint64_t    image_size = 0;
+    bool        have_image = false;
+};
+
+enrich_ctx_t snapshot_enrich_ctx() {
+    enrich_ctx_t ctx;
+    try {
+        auto snaps = ds::symbols_snapshot();
+        ctx.syms.reserve(snaps.size());
+        for (auto& [va, nm] : snaps) ctx.syms.emplace(va, nm);
+    } catch (...) {}
+    try {
+        // caller holds g_tool_mu; take the binary lock in the same order as
+        // loaded_image_json (tool mutex -> state mutex) so this cannot deadlock
+        std::lock_guard lk(ds::state_mutex());
+        auto& bin = ds::get();
+        if (bin.ready) {
+            ctx.have_image = true;
+            ctx.image_name = bin.name;
+            ctx.image_base = bin.base;
+            ctx.image_size = bin.pe.size_of_image;
+            if (bin.hype && bin.hype->ready()) {
+                const auto& nm = bin.hype->db().names;
+                ctx.hype_names.reserve(nm.size());
+                for (const auto& [va, s] : nm) ctx.hype_names.emplace(va, s);
+            }
+        }
+    } catch (...) {}
+    return ctx;
+}
+
+std::string resolve_enrich_name(uint64_t va, const enrich_ctx_t& ctx) {
+    auto it = ctx.syms.find(va);
+    if (it != ctx.syms.end() && !it->second.empty()) return it->second;
+    auto jt = ctx.hype_names.find(va);
+    if (jt != ctx.hype_names.end()) return jt->second;
+    return {};
+}
+
+std::string modoff_str(uint64_t va, const enrich_ctx_t& ctx) {
+    if (!ctx.have_image || ctx.image_name.empty()) return {};
+    if (va < ctx.image_base) return {};
+    if (ctx.image_size && va >= ctx.image_base + ctx.image_size) return {};
+    char buf[32] = "";
+    std::snprintf(buf, sizeof(buf), "+0x%llX",
+                  static_cast<unsigned long long>(va - ctx.image_base));
+    return ctx.image_name + buf;
+}
+
+bool is_addr_key(const std::string& k) {
+    // decimal-u64 VA fields the server emits; keep in sync with handlers
+    static const char* kKeys[] = {
+        "va", "addr", "from", "base", "entry", "entry_va", "function_va",
+        "vftable_va", "td_va", "vtable_va", "target", "dispatcher",
+        "image_base", "module_base", "ntos_base", "lstar", "service_table",
+        "peb_address", "ldr_address", "process_heap", "teb_address",
+        "handler", "frame", "ret_addr", "frame_ptr", "rip", "rsp", "rbp",
+        "start", "end", "header", "back_edge_src", "address", "slot_va",
+        "assign_addr", "vftable", "module", "func", "fn_va",
+    };
+    for (const char* c : kKeys)
+        if (k == c) return true;
+    return false;
+}
+
+bool is_addr_array_key(const std::string& k) {
+    static const char* kKeys[] = {
+        "targets", "entries", "matches", "references", "callsites",
+        "methods", "successors", "preds", "succs", "slots",
+    };
+    for (const char* c : kKeys)
+        if (k == c) return true;
+    return false;
+}
+
+// decode raw constants on region-like / packet-like / bp-like objects
+void decode_enrich_object(json& o) {
+    try {
+        // memory region: {base,size,protect,state,type}
+        if (o.contains("base") && o.contains("size") && o.contains("protect") &&
+            (o.at("protect").is_number_unsigned() || o.at("protect").is_number_integer())) {
+            const uint32_t p = static_cast<uint32_t>(o.at("protect").get<int64_t>());
+            if (!o.contains("protect_str")) o["protect_str"] = mem_protect_str(p);
+            if (o.contains("state") &&
+                (o.at("state").is_number_unsigned() || o.at("state").is_number_integer()) &&
+                !o.contains("state_str"))
+                o["state_str"] = mem_state_str(static_cast<uint32_t>(o.at("state").get<int64_t>()));
+            if (o.contains("type") && !o.at("type").is_string() &&
+                (o.at("type").is_number_unsigned() || o.at("type").is_number_integer()) &&
+                !o.contains("type_str"))
+                o["type_str"] = mem_type_str(static_cast<uint32_t>(o.at("type").get<int64_t>()));
+            if (!o.contains("units"))
+                o["units"] = {{"base", "VA decimal, see base_hex"},
+                              {"size", "bytes"},
+                              {"protect/state/type", "raw Windows constants, see *_str"}};
+        }
+        // network packet / held intercept: {protocol,direction,...}
+        if (o.contains("protocol") &&
+            (o.at("protocol").is_number_unsigned() || o.at("protocol").is_number_integer()) &&
+            (o.contains("direction") || o.contains("local") || o.contains("remote"))) {
+            if (!o.contains("protocol_str"))
+                o["protocol_str"] = net_proto_str(static_cast<uint32_t>(o.at("protocol").get<int64_t>()));
+            if (o.contains("direction") &&
+                (o.at("direction").is_number_unsigned() || o.at("direction").is_number_integer()) &&
+                !o.contains("direction_str"))
+                o["direction_str"] = net_dir_str(static_cast<uint32_t>(o.at("direction").get<int64_t>()));
+        }
+        // standalone direction (block_ip/port/process echo the int back)
+        if (o.contains("direction") &&
+            (o.at("direction").is_number_unsigned() || o.at("direction").is_number_integer()) &&
+            !o.contains("direction_str") &&
+            (o.contains("blocked") || o.contains("rule_id"))) {
+            o["direction_str"] = net_dir_str(static_cast<uint32_t>(o.at("direction").get<int64_t>()));
+        }
+        // hardware breakpoint record: {slot,type,len,hardware}
+        if (o.contains("slot") && o.contains("len") && o.contains("type") &&
+            (o.at("type").is_number_unsigned() || o.at("type").is_number_integer()) &&
+            !o.contains("type_str")) {
+            o["type_str"] = hw_type_str(static_cast<uint32_t>(o.at("type").get<int64_t>()));
+            if (!o.contains("type_help"))
+                o["type_help"] = "0=exec 1=write 3=read_write; len is 1/2/4/8";
+        }
+        // register state: {rip,flags,...}
+        if (o.contains("rip") && o.contains("flags") &&
+            (o.at("flags").is_number_unsigned() || o.at("flags").is_number_integer()) &&
+            !o.contains("flags_str")) {
+            const uint64_t fl = o.at("flags").is_number_unsigned()
+                ? o.at("flags").get<uint64_t>()
+                : static_cast<uint64_t>(o.at("flags").get<int64_t>());
+            o["flags_str"] = rflags_str(fl);
+        }
+        // xray complexity rating scale
+        if (o.contains("complexity_rating") && o.at("complexity_rating").is_string() &&
+            !o.contains("complexity_rating_help")) {
+            o["complexity_rating_help"] =
+                "branch-count scale: simple<=5 branches, moderate<=10, complex<=20, "
+                "very_complex<=50, extremely_complex>50";
+        }
+        // xray entropy verdict vocabulary
+        if (o.contains("overall_entropy") && o.contains("verdict") &&
+            !o.contains("verdict_help")) {
+            o["verdict_help"] =
+                "window verdicts: low_entropy|normal|high_entropy|encrypted_or_compressed "
+                "(window entropy>7.0); overall>7.5 means almost certainly packed/encrypted";
+        }
+        // obfuscation / anti-analysis scores are 0-100
+        if (o.contains("obfuscation_score_pct") && !o.contains("score_help"))
+            o["score_help"] = "0-100; higher means more obfuscated (junk/opaque/indirect patterns)";
+        if (o.contains("anti_analysis_score_pct") && !o.contains("score_help"))
+            o["score_help"] = "0-100; higher means more anti-debug/VM/timing/trap detections";
+    } catch (...) {}
+}
+
+void enrich_json_value(json& v, const enrich_ctx_t& ctx, int depth) {
+    if (depth > 14) return;
+    try {
+        if (v.is_object()) {
+            std::vector<std::string> keys;
+            keys.reserve(v.size());
+            for (auto it = v.begin(); it != v.end(); ++it) keys.push_back(it.key());
+            for (const auto& k : keys) {
+                // NOTE: never hold v.at(k) across a v[...] insertion below;
+                // object insertion may rehash and invalidate the reference.
+                bool addr_num = false;
+                int64_t addr_sv = 0;
+                {
+                    const json& cur = v.at(k);
+                    if ((cur.is_number_unsigned() || cur.is_number_integer()) &&
+                        is_addr_key(k)) {
+                        addr_num = true;
+                        addr_sv = cur.is_number_unsigned()
+                            ? static_cast<int64_t>(cur.get<uint64_t>())
+                            : cur.get<int64_t>();
+                    }
+                }
+                if (addr_num && addr_sv >= 0) {
+                    const uint64_t va = static_cast<uint64_t>(addr_sv);
+                    const std::string hk = k + "_hex";
+                    if (!v.contains(hk)) v[hk] = addr_hex_str(va);
+                    if (va != 0) {
+                        const std::string nm = resolve_enrich_name(va, ctx);
+                        if (!nm.empty() && !v.contains("symbol") &&
+                            !v.contains("name") && !v.contains(k + "_name"))
+                            v[k + "_name"] = nm;
+                        const std::string mo = modoff_str(va, ctx);
+                        if (!mo.empty()) {
+                            const std::string mk = k + "_modoff";
+                            if (!v.contains(mk)) v[mk] = mo;
+                        }
+                    }
+                } else {
+                    const json& cur = v.at(k);
+                    if (cur.is_array() && is_addr_array_key(k) && !cur.empty() &&
+                        cur.size() <= 20000) {
+                        bool all_ints = true;
+                        for (const auto& e : cur) {
+                            if (!e.is_number_unsigned() && !e.is_number_integer()) {
+                                all_ints = false;
+                                break;
+                            }
+                        }
+                        if (all_ints) {
+                            const std::string hk = k + "_hex";
+                            if (!v.contains(hk)) {
+                                json hx = json::array();
+                                for (const auto& e : cur) {
+                                    int64_t sv = e.is_number_unsigned()
+                                        ? static_cast<int64_t>(e.get<uint64_t>())
+                                        : e.get<int64_t>();
+                                    hx.push_back(addr_hex_str(
+                                        sv < 0 ? 0 : static_cast<uint64_t>(sv)));
+                                }
+                                v[hk] = std::move(hx);
+                            }
+                        }
+                    }
+                }
+                enrich_json_value(v.at(k), ctx, depth + 1);
+            }
+            decode_enrich_object(v);
+        } else if (v.is_array()) {
+            if (v.size() > 20000) return;
+            for (auto& e : v) enrich_json_value(e, ctx, depth + 1);
+        }
+    } catch (...) {}
+}
+
+const char* hint_for_tool_action(const std::string& tool, const std::string& action) {
+    // one-line next-step guidance so the agent chains calls correctly
+    if (tool == "target") {
+        if (action == "list") return "Pick a pid, then target.attach {pid}. Use target.status to confirm backend first.";
+        if (action == "attach") return "Next: target.modules + memory.regions to map the target; disasm.loaded shows whether the image auto-loaded at its runtime base.";
+        if (action == "status") return "attached=false means all memory/debugger actions will refuse; image.ready=false means static tools need disasm.load or an explicit path.";
+        if (action == "modules") return "Bases are runtime VAs (ASLR). Pass a module base to dump_module, or an address inside it to memory.read / debugger.bp_set.";
+        if (action == "regions") return "size is bytes; protect/state/type are raw Windows constants, read *_str. COMMIT+RWX regions are the usual scan targets.";
+        if (action == "dump_module") return "complete=false means unreadable spans were zero-filled (strict=false); verify imports with disasm.pe on the dumped file.";
+        if (action == "threads") return "start is a VA (see start_hex); resolve owner function with disasm.functions or decomp.function.";
+        if (action == "handles") return "count is returned rows, total is the full table; granted_access is a raw mask.";
+    } else if (tool == "memory") {
+        if (action == "read") return "len is bytes actually returned (may be short on partial reads). Use format u32/u64 for pointers, utf8 for strings. Values carry addr_hex for copy/paste.";
+        if (action == "scan") return "Refine with rescan (same width/kind), inspect scan_state, release with scan_reset. Hits carry addr_hex; read them with memory.read.";
+        if (action == "rescan") return "Narrowing only: rescan filters the previous hit set. Start over with scan + scan_reset for a new value type.";
+        if (action == "aob") return "Pattern is IDA-style hex with ?? wildcards. Matches carry *_hex; verify with memory.read or disasm.disassemble.";
+        if (action == "pointerscan") return "chains[].addresses are the pointer path (see *_hex); depth/offsets are in bytes. Re-verify chains with memory.read u64.";
+        if (action == "siggen") return "pattern/mask use x/? wildcards; yara is ready to reuse. unique=false means occurrences>1, widen the range.";
+        if (action == "live_crypto") return "Scans committed live memory (default is the loaded module range). Matches carry va_hex; cross-check constants with analyze.signatures.";
+        if (action == "watch_add" || action == "watch_list") return "Poll watch_list to sample values; width is bytes. frozen_bits only applies when freeze=true.";
+    } else if (tool == "disasm") {
+        if (action == "loaded") return "image.ready=false: load first. hype.ready=false: poll loaded until progress=1; blocks/globals/vtables/decomp all wait on it.";
+        if (action == "functions") return "Pass a function-start va (see va_hex) to decomp.function, xray.cfg, or disasm.xrefs. total is the full index; returned==limit means truncated, raise limit to 10000.";
+        if (action == "xrefs") return "from is the referencing instruction VA (see from_hex). kind call>jump>write>read>offset. Verify callers by disassembling from.";
+        if (action == "strings") return "total_scanned is bytes scanned, not hits; truncated=true means limit was hit. Set include_exec=true to also scan code sections.";
+        if (action == "disassemble") return "Live memory wins when attached, else the file image. count is decoded instructions; engine=hyperion uses the same Zydis core as the index.";
+        if (action == "pe") return "rva fields are file-relative: VA = image_base + rva (see image_base_hex). exec/writable decode characteristics.";
+        if (action == "blocks") return "entry is the function start; succs/preds are block-start VAs (see *_hex). Loops list header/back_edge_src for cycle analysis.";
+        if (action == "symbols") return "User renames only; analyzer names live in functions[].name. Rename with symbol_set (empty name clears).";
+        if (action == "load") return "Poll disasm.loaded until hype.ready=true before decomp/xray/re calls.";
+    } else if (tool == "debugger") {
+        if (action == "status") return "state idle|running|paused. Only paused state allows regs/callstack/seh/set_register. hwbp_supported=false means hw breakpoints will refuse.";
+        if (action == "bp_set") return "After continue/step actions, call wait_halt(timeout_ms) then regs/callstack. type 0=exec 1=write 3=read_write (see type_str).";
+        if (action == "continue" || action == "step_into" || action == "step_over" || action == "step_out") return "This only resumes; follow with wait_halt then regs to learn where it stopped and why.";
+        if (action == "wait_halt") return "halted=false is a timeout, not a stop. On halted=true read regs + callstack + events for reason.";
+        if (action == "regs") return "rip is the stop VA (see rip_hex/rip_name); flags_str decodes RFLAGS. Mutate with set_register while paused.";
+        if (action == "callstack") return "ret_addr entries carry *_hex/*_name; scanned=true frames are heuristic. Symbolize rip via disasm.functions first.";
+        if (action == "trace_run") return "trace is bounded (256 steps); text may be absent for unreadable bytes. Disassemble rip for fuller context.";
+    } else if (tool == "xray") {
+        if (action == "cfg" || action == "complexity") return "Pass a function-start VA from disasm.functions. block_count/edge_count/back_edges feed cyclomatic=edges-blocks+2. Cross-check entry with decomp.function.";
+        if (action == "cff") return "flattened=false carries no dispatcher (no score). flattened=true lists dispatcher + state_blocks; recover with devirt.recover_cfg.";
+        if (action == "obfuscation") return "score_pct is 0-100. warning means addr did not decode (data, not code). Confirm with disasm.disassemble first.";
+        if (action == "anti_analysis") return "score_pct is 0-100; detections[].type/detail name the check. Verify INT3/timing hits by disassembling address.";
+        if (action == "hooks") return "functions_checked is min(index,max_functions); hooks carry address_hex/target_hex. Compare prologue_bytes against a clean image.";
+        if (action == "syscalls") return "syscall_number is the SSN; resolve NT names via driver.symbols_lookup on ntoskrnl.";
+        if (action == "apihash") return "Searches THIS image's imports only (bare API and DLL!API forms), not a global dictionary. unresolved = total_queried-resolved_count.";
+        if (action == "entropy") return "overall>7.5 or verdict encrypted_or_compressed suggests packing. windows[] capped by window_limit (0=summary only).";
+        if (action == "gadgets") return "text is the gadget disassembly; count is capped by limit. Filter ret/jmp/call endings for ROP/JOP chains.";
+        if (action == "crypto_range") return "Matches carry va_hex; constant/value name the hit. Confirm in-context with disasm.disassemble.";
+    } else if (tool == "decomp") {
+        return "function_va is the identity anchor (signature/body names follow user>hyperion>sub_rva precedence and may differ). lines[].va==0 marks synthetic lines. Set annotate_bytes=true for VA-prefixed text.";
+    } else if (tool == "re") {
+        if (action == "rtti_scan") return "td_va/vtable_va carry *_hex; methods[] are bare VAs, symbolize via disasm.functions. Fallback path (no hype) returns vftables[] instead of methods.";
+        if (action == "vftable") return "targets[] are function VAs (see targets_hex); resolve each with decomp.function or disasm.xrefs.";
+        if (action == "danger") return "iat_va is the import slot; callsites[] are call sites (see callsites_hex). Verify with disasm.xrefs on iat_va.";
+        if (action == "libsig") return "hits carry va/function_va hex; requested-count is misses. Confirm matches by disassembling va.";
+    } else if (tool == "analyze") {
+        if (action == "packer") return "packed=false with confidence<0.5 is a clean MSVC-style build. Detections carry type/protector/detail/location; sections[] entropy>7.0 suggests packing.";
+        if (action == "signatures") return "signatures[] are crypto-constant hits (offset is file offset); named_functions[] are analyzer names (RTTI/vtable/thunk included, NOT FLIRT-verified).";
+        if (action == "diff") return "count is non-identical functions shown (cap 500); totals{added,removed,modified,identical} cover the full pair. similarity is 0-1.";
+    } else if (tool == "emulate") {
+        return "stopped_reason names the halt (return/timeout/count/fault). regs echo final state; trace[] is bounded by trace_max. Maps are extra regions beyond the code window; imports/IAT are NOT mapped.";
+    } else if (tool == "patch") {
+        if (action == "journal") return "patches[] carry va + before/after hex blobs. total is patch records; indexes_dirty=true means static tools rebuild on next call.";
+        if (action == "full_pass") return "scores are 0-100 obfuscation ratings; score_reduction=pre-post. steps[] show per-pass success/note. dry_run=true previews without writing.";
+        return "Mutates the file-image session only (not live memory; use memory.write for that). Follow write_bytes with patch.rebuild(addr) so disasm/decomp reflect the edit.";
+    } else if (tool == "devirt") {
+        if (action == "identify") return "confidence_pct is 0-100; likely_vm=false means no VM on this clean function. On likely_vm=true, feed table+entry_size into handlers.";
+        if (action == "prove_predicates") return "predicates[] with proven_always_taken/never_taken=true are opaque; patch with patch.resolve_opaque.";
+        if (action == "iat_audit") return "named/unnamed_valid/invalid count import slots; unnamed_candidates[] carry slot_va/target hex for manual repair.";
+        if (action == "recover_cfg") return "flattened=false with mode=none is a normal function. corroborated=true means dynamic runs agree with the static map.";
+        return "Themida jobs are async: themida_start returns id, poll themida_job until terminal, cancel with themida_cancel. Static actions need a loaded image.";
+    } else if (tool == "types") {
+        if (action == "declare") return "declared counts structs+enums created. Accepted: struct Name { u32 a; ... }; and packed forms struct Name {...} packed; / packed struct Name {...};. Verify with get_struct.";
+        if (action == "format_at") return "rendered is display text; source=file uses the image, live=true uses attached memory. addr_hex echoes the VA.";
+        if (action == "read_field") return "hex/uint/int/double are all coercions of the same bytes; source names file|target. Confirm layout with get_struct first.";
+        return "Catalog persists per binary hash; load the intended binary first. Sizes/offsets are bytes; packed removes padding.";
+    } else if (tool == "notes") {
+        return "Annotations persist per binary hash and mirror into the UI. set_comment with empty text clears (cleared=true). bookmark_toggle flips; call twice to test direction.";
+    } else if (tool == "driver") {
+        if (action == "status") return "kernel_active=false means kernel-read actions (kernel_read/ssdt/peb/symbols/integrity) will refuse with structured errors; backend shows the active path.";
+        if (action == "symbols_nearest") return "address is the symbol start; offset_from_start = queried_addr - address. queried addr is echoed as addr_hex when provided.";
+        if (action == "integrity_checks") return "hooks[] carry hook_owner for attribution; clean[] are verified exports. Only 19 hardcoded ntoskrnl exports are scanned.";
+        if (action == "peb_modules") return "Compare the three LDR lists: entries missing from one list suggest hiding. base/entry_point carry hex mirrors.";
+        return "Kernel-address actions lazily resolve the kernel DTB; ntos_base=0 in a failure means the kernel context was never established. Check status first.";
+    } else if (tool == "inject") {
+        return "status.kernel_active must be true. loadlibrary fires LoadImageNotify (visible); manual_map avoids LDR + LoadImageNotify. erase_pe_header/protect_sections default true for stealth.";
+    } else if (tool == "network") {
+        if (action == "packets") return "protocol/direction are raw ints, read *_str (6=tcp 17=udp; 0=outbound 1=inbound). payload_hex capped at 96B; fetch full bytes via stream_data.";
+        if (action == "stream_data") return "bytes is returned length, not the stream total; offset/len page through it. text substitutes '.' for non-printables.";
+        return "Capture flow: capture_start -> packets/dns/streams/stats -> capture_stop. Kernel actions need slopdrvr (see driver.status); store actions work without it.";
+    } else if (tool == "frida") {
+        return "Handles are opaque: session/script ids come from attach/script_create, never OS pids. script_unload is terminal. Drain async output with messages(), call exports with rpc().";
+    } else if (tool == "persist") {
+        return "save returns id; load echoes id/name/created_at + data. hype_save writes a .hdb dir; hype_load merges names+comments only (not xrefs/types).";
+    } else if (tool == "detect") {
+        return "hidden_modules compares EnumDeviceDrivers vs SystemModuleInformation; sysinfo_only entries are the suspicious set. kernel_callbacks handlers carry *_hex; resolve owners via driver.symbols_nearest.";
+    } else if (tool == "fs") {
+        return "Host filesystem, not target memory. read_file caps text at 4KB / hex at 8KB (use max_bytes). Paths should be absolute.";
+    } else if (tool == "web") {
+        return "Outbound GET/POST from the host. text capped at 64KB; status is the HTTP code. Unrelated to network/proxy capture.";
+    } else if (tool == "proxy") {
+        return "Localhost HTTP inspection proxy. entries[] capped by limit; entry(id) shows headers; replay(id) only works for plain HTTP (CONNECT tunnels are metadata-only).";
+    } else if (tool == "script") {
+        return "Lua 5.4 over the shared session (loads/renames visible everywhere). print() is captured; return values serialize as 'return: <value>'. Default timeout 5s, cap 60s.";
+    }
+    return nullptr;
+}
+
+void enrich_payload(const std::string& tool, const json& args, json& payload) {
+    try {
+        if (!payload.is_object() || payload.contains("error")) return;
+        const std::string action =
+            (args.contains("action") && args.at("action").is_string())
+                ? args.at("action").get<std::string>()
+                : std::string{};
+        enrich_ctx_t ctx = snapshot_enrich_ctx();
+        enrich_json_value(payload, ctx, 0);
+        // per-function context: echo queried addr + owning function + names
+        try {
+            if ((tool == "xray" || tool == "decomp" || tool == "devirt") &&
+                args.contains("addr")) {
+                uint64_t q = 0;
+                const json& av = args.at("addr");
+                if (av.is_number_unsigned()) q = av.get<uint64_t>();
+                else if (av.is_number_integer() && av.get<int64_t>() >= 0)
+                    q = static_cast<uint64_t>(av.get<int64_t>());
+                else if (av.is_string())
+                    q = std::stoull(av.get<std::string>(), nullptr, 0);
+                if (q != 0) {
+                    if (!payload.contains("queried_addr")) payload["queried_addr"] = q;
+                    if (!payload.contains("queried_addr_hex"))
+                        payload["queried_addr_hex"] = addr_hex_str(q);
+                    const std::string qn = resolve_enrich_name(q, ctx);
+                    if (!qn.empty() && !payload.contains("queried_name"))
+                        payload["queried_name"] = qn;
+                    const std::string qm = modoff_str(q, ctx);
+                    if (!qm.empty() && !payload.contains("queried_modoff"))
+                        payload["queried_modoff"] = qm;
+                    // owning function start (legacy index + hype db)
+                    try {
+                        std::lock_guard lk(ds::state_mutex());
+                        auto& bin = ds::get();
+                        if (bin.ready) {
+                            if (auto c = bin.fns.containing(q)) {
+                                if (!payload.contains("func_start"))
+                                    payload["func_start"] = *c;
+                                if (!payload.contains("func_start_hex"))
+                                    payload["func_start_hex"] = addr_hex_str(*c);
+                                const std::string fn = resolve_enrich_name(*c, ctx);
+                                if (!fn.empty() && !payload.contains("func_name"))
+                                    payload["func_name"] = fn;
+                                for (const auto& f : bin.fns.functions()) {
+                                    if (f.va == *c) {
+                                        if (!payload.contains("func_size"))
+                                            payload["func_size"] = f.size;
+                                        if (!payload.contains("func_size_help"))
+                                            payload["func_size_help"] = "bytes of decoded extent";
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    } catch (...) {}
+                }
+            }
+        } catch (...) {}
+        // pagination surfacing: returned vs limit/total
+        try {
+            const char* kArrs[] = {"functions", "strings", "symbols",     "instructions",
+                                   "refs_to",   "blocks",  "gadgets",     "packets",
+                                   "hits",      "hooks",   "syscalls",    "matches",
+                                   "entries",   "streams", "connections", "classes"};
+            for (const char* k : kArrs) {
+                if (payload.contains(k) && payload.at(k).is_array() &&
+                    !payload.contains("returned")) {
+                    payload["returned"] = payload.at(k).size();
+                    break;
+                }
+            }
+            if (args.contains("limit") &&
+                (args.at("limit").is_number_unsigned() ||
+                 args.at("limit").is_number_integer())) {
+                const int64_t lim = args.at("limit").is_number_unsigned()
+                    ? static_cast<int64_t>(args.at("limit").get<uint64_t>())
+                    : args.at("limit").get<int64_t>();
+                if (payload.contains("returned") && !payload.contains("truncated") &&
+                    lim > 0 &&
+                    payload.at("returned").get<int64_t>() >= lim)
+                    payload["truncated_likely"] =
+                        "returned rows hit the limit; raise limit for complete results";
+            }
+            if (payload.contains("total") && payload.contains("returned") &&
+                !payload.contains("truncated") &&
+                payload.at("total").is_number() && payload.at("returned").is_number()) {
+                const int64_t tot = payload.at("total").get<int64_t>();
+                const int64_t ret = payload.at("returned").get<int64_t>();
+                if (ret < tot) {
+                    payload["truncated"] = true;
+                    // exact truncation is known: drop the heuristic flag
+                    if (payload.contains("truncated_likely"))
+                        payload.erase("truncated_likely");
+                }
+            }
+        } catch (...) {}
+        if (const char* h = hint_for_tool_action(tool, action)) {
+            if (!payload.contains("ai_hint")) payload["ai_hint"] = h;
+        }
+        // units legend for the most unit-confused actions
+        try {
+            if ((tool == "target" && (action == "modules" || action == "regions")) ||
+                (tool == "memory" &&
+                 (action == "read" || action == "scan" || action == "pointerscan")) ||
+                (tool == "disasm" && (action == "functions" || action == "pe")) ||
+                (tool == "network" && (action == "stats" || action == "packets"))) {
+                if (!payload.contains("units")) {
+                    if (tool == "target" && action == "modules")
+                        payload["units"] = {{"base", "VA decimal, see base_hex"},
+                                            {"size", "bytes"}};
+                    else if (tool == "target" && action == "regions")
+                        payload["units"] = {{"base", "VA decimal, see base_hex"},
+                                            {"size", "bytes"}};
+                    else if (tool == "memory" && action == "read")
+                        payload["units"] = {{"addr", "VA decimal, see addr_hex"},
+                                            {"len", "bytes actually returned"}};
+                    else if (tool == "disasm" && action == "functions")
+                        payload["units"] = {{"va", "function-start VA decimal, see va_hex"},
+                                            {"size", "bytes of decoded extent"}};
+                }
+            }
+        } catch (...) {}
+    } catch (...) {}
+}
+
+void enrich_error(const std::string& tool, const json& args, json& payload) {
+    try {
+        if (!payload.is_object() || !payload.contains("error")) return;
+        if (payload.contains("remediation")) return;
+        const std::string err = payload.at("error").is_string()
+            ? payload.at("error").get<std::string>()
+            : std::string{};
+        std::string fix;
+        if (err.find("no target attached") != std::string::npos)
+            fix = "Call target.list to find a pid, then target.attach {pid}; confirm with target.status.";
+        else if (err.find("no image") != std::string::npos ||
+                 err.find("no binary") != std::string::npos ||
+                 err.find("not loaded") != std::string::npos)
+            fix = "Call disasm.loaded to inspect state, then disasm.load {path} (or pass an explicit path arg).";
+        else if (err.find("analysis in progress") != std::string::npos ||
+                 err.find("not-ready") != std::string::npos ||
+                 err.find("hype.ready") != std::string::npos)
+            fix = "Poll disasm.loaded until image.hype.ready=true, then retry.";
+        else if (err.find("kernel") != std::string::npos ||
+                 err.find("driver") != std::string::npos ||
+                 err.find("DTB") != std::string::npos ||
+                 err.find("slopdrvr") != std::string::npos)
+            fix = "Check driver.status; kernel-read actions need slopdrvr active with a resolved kernel context.";
+        else if (err.find("debugger") != std::string::npos ||
+                 err.find("paused") != std::string::npos ||
+                 err.find("wait_halt") != std::string::npos)
+            fix = "Attach with debugger.attach {pid}, continue/step, then wait_halt(timeout_ms) and regs/callstack while paused.";
+        else if (err.find("unknown action") != std::string::npos)
+            fix = "The error already enumerates valid actions; retry with one of those (see tools/list schema).";
+        else if (err.find("address not mapped") != std::string::npos ||
+                 err.find("base may differ") != std::string::npos)
+            fix = "The VA is outside the loaded image; confirm base via disasm.loaded and use target.modules for runtime (ASLR) bases.";
+        if (!fix.empty()) payload["remediation"] = fix;
+        (void)tool;
+        (void)args;
+    } catch (...) {}
+}
+
+
 const char* arch_from_hype(hype::Arch a) {
     switch (a) {
     case hype::Arch::X86:   return "x86";
@@ -6640,44 +7233,78 @@ nlohmann::json call_tool(const std::string& name, const nlohmann::json& args,
                          bool& is_error, infra::cancel_token_t cancel) {
     is_error = false;
     try {
-        // frida and magicmida have their own locks so dont hold ours
-        if (name == "frida") return tool_frida(args, cancel);
+        // frida and magicmida have their own locks so dont hold ours;
+        // enrichment still applies on the way out (best-effort, never throws)
+        if (name == "frida") {
+            json out = tool_frida(args, cancel);
+            try {
+                enrich_payload(name, args, out);
+            } catch (...) {}
+            return out;
+        }
         if (name == "devirt") {
             const std::string action = args.value("action", std::string{});
-            if (action.rfind("themida_", 0) == 0) return tool_devirt(args);
+            if (action.rfind("themida_", 0) == 0) {
+                json out = tool_devirt(args);
+                try {
+                    enrich_payload(name, args, out);
+                } catch (...) {}
+                return out;
+            }
         }
         std::lock_guard lk(g_tool_mu);
-        if (name == "app")      return tool_app(args);
-        if (name == "target")   return tool_target(args);
-        if (name == "memory")   return tool_memory(args);
-        if (name == "disasm")   return tool_disasm(args);
-        if (name == "debugger") return tool_debugger(args);
-        if (name == "driver")   return tool_driver(args);
-        if (name == "inject")   return tool_inject(args);
-        if (name == "emulate")  return tool_emulate(args);
-        if (name == "analyze")  return tool_analyze(args);
-        if (name == "network")  return tool_network(args);
-        if (name == "proxy")    return tool_proxy(args);
-        if (name == "persist")  return tool_persist(args);
-        if (name == "re")       return tool_re(args);
-        if (name == "script")   return tool_script(args);
-        if (name == "decomp")   return tool_decomp(args);
-        if (name == "detect")   return tool_detect(args);
-        if (name == "fs")       return tool_fs(args);
-        if (name == "web")      return tool_web(args);
-        if (name == "xray")     return tool_xray(args);
-        if (name == "patch")    return tool_patch(args);
-        if (name == "types")    return tool_types(args);
-        if (name == "notes")    return tool_notes(args);
-        if (name == "devirt")   return tool_devirt(args);
-        is_error = true;
-        return {{"error", "unknown tool: " + name}};
+        json out;
+        bool found = true;
+        if (name == "app")      out = tool_app(args);
+        else if (name == "target")   out = tool_target(args);
+        else if (name == "memory")   out = tool_memory(args);
+        else if (name == "disasm")   out = tool_disasm(args);
+        else if (name == "debugger") out = tool_debugger(args);
+        else if (name == "driver")   out = tool_driver(args);
+        else if (name == "inject")   out = tool_inject(args);
+        else if (name == "emulate")  out = tool_emulate(args);
+        else if (name == "analyze")  out = tool_analyze(args);
+        else if (name == "network")  out = tool_network(args);
+        else if (name == "proxy")    out = tool_proxy(args);
+        else if (name == "persist")  out = tool_persist(args);
+        else if (name == "re")       out = tool_re(args);
+        else if (name == "script")   out = tool_script(args);
+        else if (name == "decomp")   out = tool_decomp(args);
+        else if (name == "detect")   out = tool_detect(args);
+        else if (name == "fs")       out = tool_fs(args);
+        else if (name == "web")      out = tool_web(args);
+        else if (name == "xray")     out = tool_xray(args);
+        else if (name == "patch")    out = tool_patch(args);
+        else if (name == "types")    out = tool_types(args);
+        else if (name == "notes")    out = tool_notes(args);
+        else if (name == "devirt")   out = tool_devirt(args);
+        else found = false;
+        if (!found) {
+            is_error = true;
+            json err = {{"error", "unknown tool: " + name}};
+            try {
+                enrich_error(name, args, err);
+            } catch (...) {}
+            return err;
+        }
+        try {
+            enrich_payload(name, args, out);
+        } catch (...) {}
+        return out;
     } catch (const std::exception& e) {
         is_error = true;
-        return {{"error", e.what()}};
+        json err = {{"error", e.what()}};
+        try {
+            enrich_error(name, args, err);
+        } catch (...) {}
+        return err;
     } catch (...) {
         is_error = true;
-        return {{"error", "unknown tool failure"}};
+        json err = {{"error", "unknown tool failure"}};
+        try {
+            enrich_error(name, args, err);
+        } catch (...) {}
+        return err;
     }
 }
 
