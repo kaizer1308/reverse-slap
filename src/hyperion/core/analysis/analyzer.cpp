@@ -103,7 +103,9 @@ const u8* Analyzer::va_to_ptr(va_t addr, size_t* max_len) {
 }
 
 bool Analyzer::over_budget() {
-    if (insn_budget_ == 0 || db_.insns.size() < insn_budget_) return false;
+    if (insn_budget_ == 0) return false;
+    std::lock_guard lk(descend_mu_);
+    if (db_.insns.size() < insn_budget_) return false;
     if (!budget_hit_.exchange(true, std::memory_order_relaxed))
         spdlog::warn("analysis: instruction budget of {} reached, "
                      "the database covers part of the image", insn_budget_);
@@ -166,9 +168,12 @@ void Analyzer::run() {
     {
         std::unordered_set<va_t> rtti_visited;
         const auto& classes = rtti_.classes();
-        const size_t total = classes.size();
-        size_t seen_cls = 0;
-        const size_t report_step = total > 40 ? (total / 40) : 1;
+        // Serial pass: function records are cheap, and pre-filtering methods
+        // whose body is already decoded keeps the parallel pass dense.
+        // (Collected methods stay unmarked: descend() claims them through
+        // the shared visited set itself.)
+        std::unordered_set<va_t> seen;
+        std::vector<va_t> methods;
         for (const auto& cls : classes) {
             for (va_t method : cls.methods) {
                 if (!db_.funcs.count(method)) {
@@ -178,17 +183,20 @@ void Analyzer::run() {
                     function.name = name != db_.names.end() ? name->second : fmt::format("sub_{:X}", method - img_.base);
                     db_.add_func(std::move(function));
                 }
-                if (rtti_visited.count(method)) continue;
-                if (db_.insns.count(method)) { rtti_visited.insert(method); continue; }
-                descend(method, rtti_visited);
-            }
-            ++seen_cls;
-            if ((seen_cls % report_step) == 0) {
-                // slide progress from 0.38 -> 0.41 as classes are consumed
-                progress_ = 0.38f + 0.03f * (float(seen_cls) / float(total));
-                if (bail()) return;
+                if (db_.insns.count(method)) continue;
+                if (!seen.insert(method).second) continue;
+                methods.push_back(method);
             }
         }
+        std::atomic<size_t> methods_done{0};
+        parallel_for(pool_, methods.size(), [&](size_t i) {
+            if (cancel_.load(std::memory_order_relaxed)) return;
+            descend(methods[i], rtti_visited);
+            const size_t done = methods_done.fetch_add(1) + 1;
+            // slide progress from 0.38 -> 0.41 as methods are consumed
+            progress_ = 0.38f + 0.03f * (static_cast<float>(done) / static_cast<float>(methods.size()));
+        });
+        if (bail()) return;
     }
     phase("rtti_descend");
 
@@ -237,12 +245,22 @@ void Analyzer::recursive_descent() {
     if (insn_budget_ && est_insns > insn_budget_) est_insns = insn_budget_;
     if (est_insns > 0) db_.insns.reserve(est_insns);
 
-    std::unordered_set<va_t> visited;
-    descend(img_.entry, visited);
+    // Roots are independent work items sharing one visited set: whichever
+    // worker pops an address first claims it, so the decoded set is the
+    // same as the serial run while decode itself fans out.
+    std::vector<va_t> roots;
+    roots.push_back(img_.entry);
     for (auto& exp : img_.exports)
-        if (!exp.forwarded && is_code_addr(exp.addr)) descend(exp.addr, visited);
+        if (!exp.forwarded && is_code_addr(exp.addr)) roots.push_back(exp.addr);
     for (auto& runtime : img_.runtime_funcs)
-        descend(runtime.start, visited);
+        roots.push_back(runtime.start);
+
+    std::unordered_set<va_t> visited;
+    // Serial root loop: the overlap pruning inside descend_queue already
+    // skips re-decoding covered ranges, and the instruction-map inserts
+    // serialize through one lock anyway — fanning the roots out only adds
+    // redundant decode plus lock contention (measured slower, not faster).
+    for (va_t root : roots) descend(root, visited);
 }
 
 void Analyzer::descend(va_t addr, std::unordered_set<va_t>& visited) {
@@ -250,14 +268,33 @@ void Analyzer::descend(va_t addr, std::unordered_set<va_t>& visited) {
 
     std::queue<va_t> wl;
     wl.push(addr);
+    descend_queue(wl, visited);
+}
+
+void Analyzer::descend_queue(std::queue<va_t>& wl,
+                             std::unordered_set<va_t>& visited) {
+    // Batched inserts: one lock per 128 instructions instead of one per
+    // instruction. Overlapping walks may buffer the same address twice;
+    // decode is deterministic so the overwrite is identical content.
+    std::vector<std::pair<va_t, Insn>> pending;
+    pending.reserve(128);
+    auto flush = [&] {
+        if (pending.empty()) return;
+        std::lock_guard lk(descend_mu_);
+        for (auto& [addr, insn] : pending) db_.insns.insert_or_assign(addr, insn);
+        pending.clear();
+    };
+
+    size_t since_hit_check = 0;
 
     while (!wl.empty()) {
         if (cancel_.load(std::memory_order_relaxed)) return;
-        if (over_budget()) return;
         va_t cur = wl.front(); wl.pop();
-        if (visited.count(cur)) continue;
-        if (!is_code_addr(cur)) continue;
-        visited.insert(cur);
+        {
+            std::lock_guard lk(descend_mu_);
+            if (!visited.insert(cur).second) continue;
+            if (!is_code_addr(cur)) continue;
+        }
 
         size_t max_len = 0;
         const u8* ptr = va_to_ptr(cur, &max_len);
@@ -270,24 +307,55 @@ void Analyzer::descend(va_t addr, std::unordered_set<va_t>& visited) {
             if (!decode_insn(insn_addr, ptr + off, max_len - off, insn)) {
                 break;
             }
-            const va_t decoded_addr = insn.addr;
-            auto [it, inserted] = db_.insns.insert_or_assign(decoded_addr, std::move(insn));
-            const Insn& decoded = it->second;
-            off += decoded.len;
-            if (over_budget()) return;
-
-            if (decoded.is_ret()) break;
-            if (decoded.is_call()) {
-                va_t t = decoded.branch_target();
-                if (t && !visited.count(t)) wl.push(t);
+            // Prune redundant overlap: another walk already decoded this
+            // address, and decode is deterministic, so that walk covers our
+            // suffix exactly — stopping loses nothing. Checked throttled;
+            // our own buffered addresses are never in the map yet, so a hit
+            // always means another worker's coverage.
+            if (++since_hit_check >= 32) {
+                since_hit_check = 0;
+                bool covered = false;
+                {
+                    std::lock_guard lk(descend_mu_);
+                    covered = db_.insns.count(insn_addr) != 0;
+                }
+                if (covered) break;
             }
-            if (decoded.is_branch()) {
-                va_t t = decoded.branch_target();
-                if (t && !visited.count(t)) wl.push(t);
-                if (decoded.type == InsnType::Jmp) break;
+            pending.emplace_back(insn.addr, insn);
+            if (pending.size() >= 128) {
+                flush();
+                if (over_budget()) return;
+            }
+            off += insn.len;
+
+            if (insn.is_ret()) break;
+            if (insn.is_call()) {
+                va_t t = insn.branch_target();
+                if (t) {
+                    bool known = false;
+                    {
+                        std::lock_guard lk(descend_mu_);
+                        known = visited.count(t) != 0;
+                    }
+                    if (!known) wl.push(t);
+                }
+            }
+            if (insn.is_branch()) {
+                va_t t = insn.branch_target();
+                if (t) {
+                    bool known = false;
+                    {
+                        std::lock_guard lk(descend_mu_);
+                        known = visited.count(t) != 0;
+                    }
+                    if (!known) wl.push(t);
+                }
+                if (insn.type == InsnType::Jmp) break;
             }
         }
+        flush();
     }
+    flush();
 }
 
 void Analyzer::detect_functions() {
@@ -306,13 +374,20 @@ void Analyzer::detect_functions() {
         entries.insert(rf.start);
     }
 
-    // call targets reached from confirmed code only
-    for (auto& [addr, insn] : db_.insns) {
-        if (insn.is_call()) {
-            va_t t = insn.branch_target();
-            if (t && db_.insns.count(t)) entries.insert(t);
-        }
-    }
+    // call targets reached from confirmed code only. Snapshot first: the
+    // scan is read-only and fans out, the set merge stays serial.
+    std::vector<const Insn*> all_insns;
+    all_insns.reserve(db_.insns.size());
+    for (auto& [addr, insn] : db_.insns) all_insns.push_back(&insn);
+    std::vector<va_t> call_targets(all_insns.size(), 0);
+    parallel_for(pool_, all_insns.size(), [&](size_t i) {
+        const Insn& insn = *all_insns[i];
+        if (!insn.is_call()) return;
+        va_t t = insn.branch_target();
+        if (t && db_.insns.count(t)) call_targets[i] = t;
+    });
+    for (va_t t : call_targets)
+        if (t) entries.insert(t);
 
     for (va_t e : entries) {
         Function func;
@@ -339,8 +414,11 @@ void Analyzer::detect_thunks() {
         iat_names[imp.iat_addr] = imp.name;
 
     u32 found = 0;
-    for (auto& seg : img_.segments) {
-        if (!seg.executable() || seg.data.empty()) continue;
+    std::atomic<u32> found_atomic{0};
+    // Section shards are independent (writes go through the DB's own locks).
+    parallel_for(pool_, img_.segments.size(), [&](size_t s) {
+        const auto& seg = img_.segments[s];
+        if (!seg.executable() || seg.data.empty()) return;
         const u8* data = seg.data.data();
         size_t sz = seg.data.size();
 
@@ -355,18 +433,24 @@ void Analyzer::detect_thunks() {
             auto it = iat_names.find(target);
             if (it == iat_names.end()) continue;
 
-            if (!db_.funcs.count(insn_addr)) {
-                Function func;
-                func.entry = insn_addr;
-                func.name = it->second;
-                db_.add_func(std::move(func));
-            } else {
-                db_.funcs[insn_addr].name = it->second;
+            // Structural funcs access serializes here; the byte scan above
+            // stays parallel and hits are rare.
+            {
+                std::lock_guard lk(funcs_mu_);
+                if (!db_.funcs.count(insn_addr)) {
+                    Function func;
+                    func.entry = insn_addr;
+                    func.name = it->second;
+                    db_.add_func(std::move(func));
+                } else {
+                    db_.funcs[insn_addr].name = it->second;
+                }
             }
             db_.set_name(insn_addr, it->second);
-            ++found;
+            ++found_atomic;
         }
-    }
+    });
+    found = found_atomic.load();
     spdlog::info("detected {} import thunks", found);
 }
 
@@ -412,11 +496,26 @@ void Analyzer::remove_junk_code() {
 }
 
 void Analyzer::build_cfgs(const std::unordered_set<va_t>* only) {
+    // Snapshot the scope first: workers mutate their own Function's blocks
+    // while the map structure stays fixed (no inserts/erases in this phase).
+    std::vector<Function*> scope;
+    scope.reserve(db_.funcs.size());
     for (auto& [entry, func] : db_.funcs) {
         if (only && !only->count(entry)) continue;
         func.blocks.clear();
         func.block_addrs.clear();
         func.analyzed = false;
+        scope.push_back(&func);
+    }
+    parallel_for(pool_, scope.size(), [&](size_t i) {
+        if (cancel_.load(std::memory_order_relaxed)) return;
+        build_one_cfg(*scope[i]);
+    });
+}
+
+void Analyzer::build_one_cfg(Function& func) {
+    const va_t entry = func.entry;
+    {
         std::unordered_set<va_t> visited;
         std::queue<va_t> wl;
         wl.push(entry);
@@ -468,22 +567,29 @@ void Analyzer::build_cfgs(const std::unordered_set<va_t>* only) {
             // push_back doubles, so a block can carry up to its own size again
             // in slack; across millions of instructions that is gigabytes
             bb.insns.shrink_to_fit();
+            // Queued addresses with no decoded instruction (an unreached
+            // .pdata entry, a branch into padding) yield empty blocks with
+            // end == start. They carry no instructions and, by construction
+            // above, no successors either, so drop them instead of
+            // publishing zero-length ranges to the blocks APIs. Every succ
+            // consumer already guards its block lookups.
+            if (bb.insns.empty()) continue;
             func.block_addrs.push_back(bb.start);
             func.blocks[bb.start] = std::move(bb);
         }
-
-        for (auto& [ba, block] : func.blocks) {
-            std::sort(block.succs.begin(), block.succs.end());
-            block.succs.erase(std::unique(block.succs.begin(), block.succs.end()), block.succs.end());
-            block.preds.clear();
-        }
-        for (auto& [ba, block] : func.blocks)
-            for (va_t s : block.succs)
-                if (func.blocks.count(s))
-                    func.blocks[s].preds.push_back(ba);
-
-        func.analyzed = true;
     }
+
+    for (auto& [ba, block] : func.blocks) {
+        std::sort(block.succs.begin(), block.succs.end());
+        block.succs.erase(std::unique(block.succs.begin(), block.succs.end()), block.succs.end());
+        block.preds.clear();
+    }
+    for (auto& [ba, block] : func.blocks)
+        for (va_t s : block.succs)
+            if (func.blocks.count(s))
+                func.blocks[s].preds.push_back(ba);
+
+    func.analyzed = true;
 }
 
 void Analyzer::discover_cfg_fixed_point() {
@@ -549,11 +655,19 @@ void Analyzer::discover_cfg_fixed_point() {
 }
 
 void Analyzer::detect_switches(const std::unordered_set<va_t>* only) {
-    u32 tables_found = 0;
+    std::atomic<u32> tables_found{0};
 
+    std::vector<Function*> scope;
+    scope.reserve(db_.funcs.size());
     for (auto& [entry, func] : db_.funcs) {
         if (!func.analyzed) continue;
         if (only && !only->count(entry)) continue;
+        scope.push_back(&func);
+    }
+    parallel_for(pool_, scope.size(), [&](size_t i) {
+        if (cancel_.load(std::memory_order_relaxed)) return;
+        Function& func = *scope[i];
+        const va_t entry = func.entry;
 
         for (auto& [ba, block] : func.blocks) {
             if (block.insns.size() < 2) continue;
@@ -576,13 +690,16 @@ void Analyzer::detect_switches(const std::unordered_set<va_t>* only) {
                 u32 max_entries = static_cast<u32>(max_len / 8);
                 if (max_entries > 256) max_entries = 256;
 
-                for (u32 i = 0; i < max_entries; ++i) {
+                for (u32 e = 0; e < max_entries; ++e) {
                     va_t target = 0;
-                    std::memcpy(&target, tbl + i * 8, 8);
+                    std::memcpy(&target, tbl + e * 8, 8);
                     if (!is_code_addr(target)) break;
                     block.succs.push_back(target);
-                    recovered_edges_[last.addr].push_back(target);
-                    cfg_dirty_.insert(entry);
+                    {
+                        std::lock_guard lk(edge_mu_);
+                        recovered_edges_[last.addr].push_back(target);
+                        cfg_dirty_.insert(entry);
+                    }
                 }
                 ++tables_found;
                 continue;
@@ -623,25 +740,31 @@ void Analyzer::detect_switches(const std::unordered_set<va_t>* only) {
             u32 avail = static_cast<u32>(max_len / 4);
             if (max_cases > avail) max_cases = avail;
 
-            for (u32 i = 0; i < max_cases; ++i) {
+            for (u32 e = 0; e < max_cases; ++e) {
                 i32 offset = 0;
-                std::memcpy(&offset, tbl + i * 4, 4);
+                std::memcpy(&offset, tbl + e * 4, 4);
                 va_t target = table_base + offset;
                 if (!is_code_addr(target)) break;
                 block.succs.push_back(target);
-                recovered_edges_[last.addr].push_back(target);
-                cfg_dirty_.insert(entry);
+                {
+                    std::lock_guard lk(edge_mu_);
+                    recovered_edges_[last.addr].push_back(target);
+                    cfg_dirty_.insert(entry);
+                }
             }
             ++tables_found;
         }
-    }
-    spdlog::info("detected {} switch tables", tables_found);
+    });
+    spdlog::info("detected {} switch tables", tables_found.load());
 }
 
 void Analyzer::build_xrefs() {
     // Most instructions contribute at least one xref, so size the flat list
     // and both direction maps from the instruction count rather than letting
-    // them grow (and rehash, and relink) their way there
+    // them grow (and rehash, and relink) their way there.
+    // Deliberately serial: the per-instruction work is a few branch checks,
+    // so a chunked fan-out costs more in snapshot/merge overhead than the
+    // scan itself (measured slower, not faster).
     db_.xrefs.reserve(db_.insns.size());
     db_.xrefs_to.reserve(db_.insns.size() / 2);
     db_.xrefs_from.reserve(db_.insns.size() / 2);
@@ -677,8 +800,12 @@ void Analyzer::build_xrefs() {
 
 void Analyzer::find_strings() {
     constexpr size_t kMaxStringLen = 256;
-    for (auto& seg : img_.segments) {
-        if (seg.data.empty()) continue;
+    // One output per segment, concatenated in segment order: deterministic.
+    std::vector<std::vector<std::pair<va_t, std::string>>> outs(img_.segments.size());
+    parallel_for(pool_, img_.segments.size(), [&](size_t s) {
+        const Segment& seg = img_.segments[s];
+        if (seg.data.empty()) return;
+        auto& out = outs[s];
         size_t i = 0;
         while (i < seg.data.size()) {
             if (seg.data[i] >= 0x20 && seg.data[i] < 0x7F) {
@@ -687,14 +814,16 @@ void Analyzer::find_strings() {
                     ++i;
                 if (i - start >= 4 && i < seg.data.size() && seg.data[i] == 0) {
                     size_t len = (std::min)(i - start, kMaxStringLen);
-                    std::string s(seg.data.begin() + start, seg.data.begin() + start + len);
-                    db_.strings.emplace_back(seg.va + start, std::move(s));
+                    std::string str(seg.data.begin() + start, seg.data.begin() + start + len);
+                    out.emplace_back(seg.va + start, std::move(str));
                 }
             } else {
                 ++i;
             }
         }
-    }
+    });
+    for (auto& out : outs)
+        for (auto& entry : out) db_.strings.emplace_back(entry.first, std::move(entry.second));
     spdlog::info("found {} strings", db_.strings.size());
 }
 
@@ -704,6 +833,7 @@ void Analyzer::find_string_refs() {
     for (auto& [addr, s] : db_.strings)
         str_addrs.insert(addr);
 
+    // Serial like build_xrefs above: the LEA scan is too cheap to fan out.
     u32 refs_added = 0;
     for (auto& [addr, insn] : db_.insns) {
         if (insn.type != InsnType::Lea) continue;
@@ -720,14 +850,17 @@ void Analyzer::find_string_refs() {
 }
 
 void Analyzer::detect_vtables() {
-    u32 found = 0;
-    for (auto& seg : img_.segments) {
-        if (seg.executable() || seg.data.empty()) continue;
-        if (seg.name != ".rdata" && seg.name != ".data") continue;
+    const size_t ptr_sz = (img_.arch == Arch::X64 || img_.arch == Arch::ARM64 || img_.arch == Arch::PPC) ? 8 : 4;
+    // Per-segment candidates merged in segment order: deterministic.
+    std::vector<std::vector<Vtable>> outs(img_.segments.size());
+    parallel_for(pool_, img_.segments.size(), [&](size_t s) {
+        const Segment& seg = img_.segments[s];
+        if (seg.executable() || seg.data.empty()) return;
+        if (seg.name != ".rdata" && seg.name != ".data") return;
 
         const u8* data = seg.data.data();
         size_t sz = seg.data.size();
-        size_t ptr_sz = (img_.arch == Arch::X64 || img_.arch == Arch::ARM64 || img_.arch == Arch::PPC) ? 8 : 4;
+        auto& out = outs[s];
 
         for (size_t i = 0; i + ptr_sz * 2 <= sz; i += ptr_sz) {
             // need at least 2 consecutive code pointers to consider it a vtable
@@ -757,42 +890,65 @@ void Analyzer::detect_vtables() {
             }
 
             if (vt.entries.size() >= 2) {
-                db_.set_name(vt.addr, fmt::format("vtable_{:X}", vt.addr));
-                for (size_t s = 0; s < vt.entries.size(); ++s)
-                    db_.set_name(vt.addr + s * ptr_sz,
-                                 fmt::format("vtable_{:X}_slot{}", vt.addr, s));
-                db_.vtables.push_back(std::move(vt));
-                ++found;
+                out.push_back(std::move(vt));
                 i = j - ptr_sz; // advance past this vtable
             }
+        }
+    });
+    u32 found = 0;
+    for (auto& out : outs) {
+        for (auto& vt : out) {
+            db_.set_name(vt.addr, fmt::format("vtable_{:X}", vt.addr));
+            for (size_t s = 0; s < vt.entries.size(); ++s)
+                db_.set_name(vt.addr + s * ptr_sz,
+                             fmt::format("vtable_{:X}_slot{}", vt.addr, s));
+            db_.vtables.push_back(std::move(vt));
+            ++found;
         }
     }
     spdlog::info("detected {} vtables", found);
 }
 
 void Analyzer::detect_globals() {
-    u32 found = 0;
-    for (auto& [addr, insn] : db_.insns) {
-        for (u8 i = 0; i < insn.op_count; ++i) {
-            auto& op = insn.ops[i];
-            if (op.type != OpType::Mem || op.val == 0) continue;
+    std::vector<const Insn*> all;
+    all.reserve(db_.insns.size());
+    for (auto& [addr, insn] : db_.insns) all.push_back(&insn);
 
-            va_t target = op.val;
-            auto* sec = section_for(target);
-            if (!sec) continue;
-            if (sec->executable()) continue;
-            if (sec->name != ".data" && sec->name != ".bss") continue;
-            if (db_.globals.count(target)) {
+    // Per-chunk (addr, size) hits merged in snapshot order; the merge keeps
+    // the widest access per address, which is order-independent.
+    const size_t chunks = chunk_count(pool_, all.size());
+    std::vector<std::vector<std::pair<va_t, u32>>> outs(chunks);
+    parallel_for_chunks(pool_, all.size(), [&](size_t c, size_t begin, size_t end) {
+        auto& out = outs[c];
+        for (size_t k = begin; k < end; ++k) {
+            const Insn& insn = *all[k];
+            for (u8 i = 0; i < insn.op_count; ++i) {
+                auto& op = insn.ops[i];
+                if (op.type != OpType::Mem || op.val == 0) continue;
+
+                va_t target = op.val;
+                auto* sec = section_for(target);
+                if (!sec) continue;
+                if (sec->executable()) continue;
+                if (sec->name != ".data" && sec->name != ".bss") continue;
+                out.emplace_back(target, operand_size_bytes(op, 4));
+            }
+        }
+    });
+    u32 found = 0;
+    for (auto& out : outs) {
+        for (auto& [target, sz] : out) {
+            auto it = db_.globals.find(target);
+            if (it != db_.globals.end()) {
                 // update size if wider access
-                u32 sz = operand_size_bytes(op, 4);
-                if (sz > db_.globals[target].size)
-                    db_.globals[target].size = sz;
+                if (sz > it->second.size)
+                    it->second.size = sz;
                 continue;
             }
 
             Global g;
             g.addr = target;
-            g.size = operand_size_bytes(op, 4);
+            g.size = sz;
             g.name = fmt::format("g_var_{:X}", target);
             db_.globals[target] = std::move(g);
             db_.set_name(target, fmt::format("g_var_{:X}", target));
@@ -836,17 +992,39 @@ void Analyzer::detect_noreturn() {
         "_Exit", "quick_exit", "_abort", "FatalExit"
     };
 
-    u32 count = 0;
-    for (auto& [entry, func] : db_.funcs) {
+    std::vector<Function*> order;
+    order.reserve(db_.funcs.size());
+    for (auto& [entry, func] : db_.funcs) order.push_back(&func);
+
+    // Pass 1 (name-based) writes disjoint flags, so it fans out directly.
+    std::atomic<u32> count{0};
+    parallel_for(pool_, order.size(), [&](size_t i) {
+        Function& func = *order[i];
         for (auto& nr_name : known_noreturn) {
             if (func.name.find(nr_name) != std::string::npos) {
                 func.noreturn = true;
                 ++count;
-                goto next_func;
+                return;
             }
         }
+    });
 
-        if (func.analyzed && !func.blocks.empty()) {
+    // Pass 2 (structural) reads other functions' flags, so snapshot them
+    // first: concurrent read-your-neighbour/write-your-own would race.
+    // Rounds run to a fixed point so multi-level noreturn chains (B calls
+    // noreturn A, C calls B, ...) resolve fully and deterministically —
+    // the old serial pass propagated them only in lucky hash order.
+    std::vector<char> add(order.size(), 0);
+    for (int round = 0; round < 8; ++round) {
+        std::unordered_set<va_t> noreturn_entries;
+        for (auto* f : order)
+            if (f->noreturn) noreturn_entries.insert(f->entry);
+
+        std::fill(add.begin(), add.end(), 0);
+        parallel_for(pool_, order.size(), [&](size_t i) {
+            Function& func = *order[i];
+            if (func.noreturn) return;
+            if (!func.analyzed || func.blocks.empty()) return;
             bool has_ret = false;
             for (auto& [ba, bb] : func.blocks) {
                 for (auto& insn : bb.insns) {
@@ -854,33 +1032,36 @@ void Analyzer::detect_noreturn() {
                 }
                 if (has_ret) break;
             }
-            if (!has_ret) {
-                bool has_exit_path = false;
-                for (auto& [ba, bb] : func.blocks) {
-                    if (bb.succs.empty() && !bb.insns.empty() && !bb.insns.back().is_ret()) {
-                        auto& last = bb.insns.back();
-                        if (last.is_call()) {
-                            va_t t = last.branch_target();
-                            if (t && db_.funcs.count(t) && db_.funcs[t].noreturn)
-                                continue;
-                        }
+            if (has_ret) return;
+            bool has_exit_path = false;
+            for (auto& [ba, bb] : func.blocks) {
+                if (bb.succs.empty() && !bb.insns.empty() && !bb.insns.back().is_ret()) {
+                    auto& last = bb.insns.back();
+                    if (last.is_call()) {
+                        va_t t = last.branch_target();
+                        if (t && noreturn_entries.count(t))
+                            continue;
                     }
-                    if (!bb.succs.empty()) has_exit_path = true;
                 }
-                if (!has_exit_path && func.blocks.size() > 0) {
-                    func.noreturn = true;
-                    ++count;
-                }
+                if (!bb.succs.empty()) has_exit_path = true;
+            }
+            if (!has_exit_path && func.blocks.size() > 0) add[i] = 1;
+        });
+
+        size_t added = 0;
+        for (size_t i = 0; i < order.size(); ++i) {
+            if (add[i] && !order[i]->noreturn) {
+                order[i]->noreturn = true;
+                ++added;
+                ++count;
             }
         }
-        next_func:;
+        if (added == 0) break;
     }
-    spdlog::info("detected {} noreturn functions", count);
+    spdlog::info("detected {} noreturn functions", count.load());
 }
 
 void Analyzer::detect_tail_calls() {
-    u32 count = 0;
-
     // Retyping a jump xref used to std::find_if over the whole flat xref
     // vector per candidate, which is quadratic once an image has millions of
     // them. Index the flat vector by source address once instead.
@@ -889,51 +1070,68 @@ void Analyzer::detect_tail_calls() {
     for (size_t i = 0; i < db_.xrefs.size(); ++i)
         flat_by_from[db_.xrefs[i].from].push_back(i);
 
+    // Pass 1 (read-only) fans out; pass 2 mutates the xref stores serially.
+    std::vector<Function*> order;
+    order.reserve(db_.funcs.size());
     for (auto& [entry, func] : db_.funcs) {
-        if (!func.analyzed) continue;
-        va_t func_end = 0;
-        for (auto& [ba, bb] : func.blocks)
-            if (bb.end > func_end) func_end = bb.end;
+        if (func.analyzed) order.push_back(&func);
+    }
+    const size_t chunks = chunk_count(pool_, order.size());
+    std::vector<std::vector<std::pair<va_t, va_t>>> outs(chunks);
+    parallel_for_chunks(pool_, order.size(), [&](size_t c, size_t begin, size_t end) {
+        auto& out = outs[c];
+        for (size_t k = begin; k < end; ++k) {
+            Function& func = *order[k];
+            const va_t entry = func.entry;
+            va_t func_end = 0;
+            for (auto& [ba, bb] : func.blocks)
+                if (bb.end > func_end) func_end = bb.end;
 
-        for (auto& [ba, bb] : func.blocks) {
-            if (bb.insns.empty()) continue;
-            auto& last = bb.insns.back();
-            if (last.type != InsnType::Jmp) continue;
+            for (auto& [ba, bb] : func.blocks) {
+                if (bb.insns.empty()) continue;
+                auto& last = bb.insns.back();
+                if (last.type != InsnType::Jmp) continue;
 
-            va_t target = last.branch_target();
-            if (!target) continue;
+                va_t target = last.branch_target();
+                if (!target) continue;
 
-            bool is_tail = false;
-            if (db_.funcs.count(target) && target != entry)
-                is_tail = true;
-            else if (target < entry || target >= func_end)
-                if (!func.blocks.count(target))
+                bool is_tail = false;
+                if (db_.funcs.count(target) && target != entry)
                     is_tail = true;
+                else if (target < entry || target >= func_end)
+                    if (!func.blocks.count(target))
+                        is_tail = true;
 
-            if (is_tail) {
-                bool retyped = false;
-                const auto candidates = flat_by_from.find(last.addr);
-                if (candidates != flat_by_from.end()) {
-                    for (size_t i : candidates->second) {
-                        Xref& x = db_.xrefs[i];
-                        if (x.to != target || x.type != XrefType::CodeJump) continue;
-                        x.type = XrefType::CodeCall;
-                        retyped = true;
-                        break;
-                    }
-                }
-                if (retyped) {
-                    for (auto& xr : db_.xrefs_to[target])
-                        if (xr.from == last.addr && xr.type == XrefType::CodeJump)
-                            xr.type = XrefType::CodeCall;
-                    for (auto& xr : db_.xrefs_from[last.addr])
-                        if (xr.to == target && xr.type == XrefType::CodeJump)
-                            xr.type = XrefType::CodeCall;
-                } else {
-                    db_.add_xref({last.addr, target, XrefType::CodeCall});
-                }
-                ++count;
+                if (is_tail) out.emplace_back(last.addr, target);
             }
+        }
+    });
+
+    u32 count = 0;
+    for (auto& out : outs) {
+        for (auto& [from, target] : out) {
+            bool retyped = false;
+            const auto candidates = flat_by_from.find(from);
+            if (candidates != flat_by_from.end()) {
+                for (size_t i : candidates->second) {
+                    Xref& x = db_.xrefs[i];
+                    if (x.to != target || x.type != XrefType::CodeJump) continue;
+                    x.type = XrefType::CodeCall;
+                    retyped = true;
+                    break;
+                }
+            }
+            if (retyped) {
+                for (auto& xr : db_.xrefs_to[target])
+                    if (xr.from == from && xr.type == XrefType::CodeJump)
+                        xr.type = XrefType::CodeCall;
+                for (auto& xr : db_.xrefs_from[from])
+                    if (xr.to == target && xr.type == XrefType::CodeJump)
+                        xr.type = XrefType::CodeCall;
+            } else {
+                db_.add_xref({from, target, XrefType::CodeCall});
+            }
+            ++count;
         }
     }
     spdlog::info("detected {} tail calls", count);
@@ -971,12 +1169,30 @@ void Analyzer::detect_calling_conventions() {
 }
 
 void Analyzer::propagate_dataflow(const std::unordered_set<va_t>* only) {
-    u32 resolved = 0;
+    std::atomic<u32> resolved{0};
 
+    std::vector<Function*> scope;
+    scope.reserve(db_.funcs.size());
     for (auto& [entry, func] : db_.funcs) {
         if (!func.analyzed || func.blocks.empty()) continue;
         if (only && !only->count(entry)) continue;
+        scope.push_back(&func);
+    }
+    // Helper: record one resolution under a single lock so the first-writer
+    // accounting stays exact across workers.
+    auto resolve = [&](va_t site, va_t target, va_t entry) {
+        std::lock_guard lk(edge_mu_);
+        if (!db_.resolved_indirect.count(site)) {
+            ++resolved;
+            cfg_dirty_.insert(entry);
+        }
+        db_.resolved_indirect[site] = target;
+    };
 
+    parallel_for(pool_, scope.size(), [&](size_t i) {
+        if (cancel_.load(std::memory_order_relaxed)) return;
+        Function& func = *scope[i];
+        const va_t entry = func.entry;
         std::unordered_map<u16, va_t> reg_vals;
 
         for (auto& ba : func.block_addrs) {
@@ -1003,11 +1219,7 @@ void Analyzer::propagate_dataflow(const std::unordered_set<va_t>* only) {
                     insn.op_count > 0 && insn.ops[0].type == OpType::Reg) {
                     auto it = reg_vals.find(insn.ops[0].reg);
                     if (it != reg_vals.end() && it->second != 0 && is_code_addr(it->second)) {
-                        if (!db_.resolved_indirect.count(insn.addr)) {
-                            ++resolved;
-                            cfg_dirty_.insert(entry);
-                        }
-                        db_.resolved_indirect[insn.addr] = it->second;
+                        resolve(insn.addr, it->second, entry);
                     }
                 }
                 else if ((insn.is_call() || insn.type == InsnType::Jmp) &&
@@ -1022,11 +1234,7 @@ void Analyzer::propagate_dataflow(const std::unordered_set<va_t>* only) {
                             va_t target = 0;
                             std::memcpy(&target, ptr, (img_.arch == Arch::X64 || img_.arch == Arch::ARM64 || img_.arch == Arch::PPC) ? 8 : 4);
                             if (is_code_addr(target)) {
-                                if (!db_.resolved_indirect.count(insn.addr)) {
-                                    ++resolved;
-                                    cfg_dirty_.insert(entry);
-                                }
-                                db_.resolved_indirect[insn.addr] = target;
+                                resolve(insn.addr, target, entry);
                             }
                         }
                     }
@@ -1035,14 +1243,21 @@ void Analyzer::propagate_dataflow(const std::unordered_set<va_t>* only) {
                 if (insn.is_call()) reg_vals.clear();
             }
         }
-    }
-    spdlog::info("dataflow: resolved {} indirect call/jump targets", resolved);
+    });
+    spdlog::info("dataflow: resolved {} indirect call/jump targets", resolved.load());
 }
 
 void Analyzer::detect_loops() {
-    u32 count = 0;
+    std::atomic<u32> count{0};
+    std::vector<Function*> scope;
+    scope.reserve(db_.funcs.size());
     for (auto& [entry, func] : db_.funcs) {
-        if (!func.analyzed || !func.blocks.count(entry)) continue;
+        if (func.analyzed && func.blocks.count(entry)) scope.push_back(&func);
+    }
+    parallel_for(pool_, scope.size(), [&](size_t i) {
+        if (cancel_.load(std::memory_order_relaxed)) return;
+        Function& func = *scope[i];
+        const va_t entry = func.entry;
         func.loops.clear();
 
         // Cooper-Harvey-Kennedy dominators over a reverse-postorder index:
@@ -1074,7 +1289,7 @@ void Analyzer::detect_loops() {
         const int kNoDom = -1;
         std::vector<int> idom(order.size(), kNoDom);
         const int entry_idx = rpo_index.count(entry) ? rpo_index[entry] : kNoDom;
-        if (entry_idx == kNoDom) continue;
+        if (entry_idx == kNoDom) return;
         idom[entry_idx] = entry_idx;
 
         const auto intersect = [&](int a, int b) {
@@ -1155,71 +1370,99 @@ void Analyzer::detect_loops() {
                 ++count;
             }
         }
-    }
-    spdlog::info("detected {} loops", count);
+    });
+    spdlog::info("detected {} loops", count.load());
 }
 
 void Analyzer::recover_structs() {
-    u32 count = 0;
-
     // The builtin ids never move, so resolve them once instead of four
     // name lookups per recovered field
     const TypeDef* builtin_u8  = db_.types.find_by_name("u8");
     const TypeDef* builtin_u16 = db_.types.find_by_name("u16");
     const TypeDef* builtin_u32 = db_.types.find_by_name("u32");
     const TypeDef* builtin_u64 = db_.types.find_by_name("u64");
+    const u32 id_u8  = builtin_u8  ? builtin_u8->id  : 0;
+    const u32 id_u16 = builtin_u16 ? builtin_u16->id : 0;
+    const u32 id_u32 = builtin_u32 ? builtin_u32->id : 0;
+    const u32 id_u64 = builtin_u64 ? builtin_u64->id : 0;
 
+    struct candidate_t {
+        std::string name;
+        u32 total_size = 0;
+        std::vector<std::pair<i64, u32>> fields;  // (offset, size), sorted
+    };
+
+    std::vector<Function*> order;
+    order.reserve(db_.funcs.size());
     for (auto& [entry, func] : db_.funcs) {
-        if (!func.analyzed) continue;
+        if (func.analyzed) order.push_back(&func);
+    }
+    // Scan fans out (read-only); the TypeSystem commit below stays serial.
+    const size_t chunks = chunk_count(pool_, order.size());
+    std::vector<std::vector<candidate_t>> outs(chunks);
+    parallel_for_chunks(pool_, order.size(), [&](size_t c, size_t begin, size_t end) {
+        auto& out = outs[c];
+        for (size_t k = begin; k < end; ++k) {
+            Function& func = *order[k];
+            const va_t entry = func.entry;
 
-        struct Access { u16 base_reg; i64 offset; u32 size; };
-        std::unordered_map<u16, std::vector<Access>> accesses;
+            struct Access { u16 base_reg; i64 offset; u32 size; };
+            std::unordered_map<u16, std::vector<Access>> accesses;
 
-        for (auto& [ba, bb] : func.blocks) {
-            for (auto& insn : bb.insns) {
-                for (u8 i = 0; i < insn.op_count; ++i) {
-                    auto& op = insn.ops[i];
-                    if (op.type != OpType::Mem) continue;
-                    if (op.mem.base == 0) continue;
-                    // skip RSP/RBP-based (stack frame)
-                    if (is_stack_register(op.mem.base)) continue;
-                    if (op.mem.disp < 0) continue;
-                    if (op.mem.disp > 4096) continue;
+            for (auto& [ba, bb] : func.blocks) {
+                for (auto& insn : bb.insns) {
+                    for (u8 i = 0; i < insn.op_count; ++i) {
+                        auto& op = insn.ops[i];
+                        if (op.type != OpType::Mem) continue;
+                        if (op.mem.base == 0) continue;
+                        // skip RSP/RBP-based (stack frame)
+                        if (is_stack_register(op.mem.base)) continue;
+                        if (op.mem.disp < 0) continue;
+                        if (op.mem.disp > 4096) continue;
 
-                    Access a;
-                    a.base_reg = op.mem.base;
-                    a.offset = op.mem.disp;
-                    a.size = operand_size_bytes(op, 8);
-                    accesses[a.base_reg].push_back(a);
+                        Access a;
+                        a.base_reg = op.mem.base;
+                        a.offset = op.mem.disp;
+                        a.size = operand_size_bytes(op, 8);
+                        accesses[a.base_reg].push_back(a);
+                    }
                 }
             }
+
+            for (auto& [reg, accs] : accesses) {
+                if (accs.size() < 3) continue;
+
+                std::set<std::pair<i64, u32>> fields_set;
+                for (auto& a : accs)
+                    fields_set.insert({a.offset, a.size});
+                if (fields_set.size() < 3) continue;
+
+                candidate_t cand;
+                cand.name = fmt::format("struct_{:X}_{}", entry, reg);
+                for (auto& [off, sz] : fields_set) {
+                    cand.fields.emplace_back(off, sz);
+                    if (static_cast<u32>(off) + sz > cand.total_size)
+                        cand.total_size = static_cast<u32>(off) + sz;
+                }
+                out.push_back(std::move(cand));
+            }
         }
+    });
 
-        for (auto& [reg, accs] : accesses) {
-            if (accs.size() < 3) continue;
-
-            std::set<std::pair<i64, u32>> fields_set;
-            for (auto& a : accs)
-                fields_set.insert({a.offset, a.size});
-            if (fields_set.size() < 3) continue;
-
-            std::string name = fmt::format("struct_{:X}_{}", entry, reg);
-            auto* existing = db_.types.find_by_name(name);
+    u32 count = 0;
+    for (auto& out : outs) {
+        for (auto& cand : out) {
+            auto* existing = db_.types.find_by_name(cand.name);
             if (existing) continue;
 
-            u32 total_size = 0;
-            for (auto& [off, sz] : fields_set)
-                if (static_cast<u32>(off) + sz > total_size)
-                    total_size = static_cast<u32>(off) + sz;
-
-            u32 sid = db_.types.add_struct(name, total_size);
-            for (auto& [off, sz] : fields_set) {
+            u32 sid = db_.types.add_struct(cand.name, cand.total_size);
+            for (auto& [off, sz] : cand.fields) {
                 u32 type_id = 0;
-                if (sz == 1 && builtin_u8) type_id = builtin_u8->id;
-                else if (sz == 2 && builtin_u16) type_id = builtin_u16->id;
-                else if (sz == 4 && builtin_u32) type_id = builtin_u32->id;
-                else if (sz == 8 && builtin_u64) type_id = builtin_u64->id;
-                else if (builtin_u32) type_id = builtin_u32->id;
+                if (sz == 1 && id_u8) type_id = id_u8;
+                else if (sz == 2 && id_u16) type_id = id_u16;
+                else if (sz == 4 && id_u32) type_id = id_u32;
+                else if (sz == 8 && id_u64) type_id = id_u64;
+                else if (id_u32) type_id = id_u32;
                 db_.types.add_field(sid, fmt::format("field_{:X}", off), type_id,
                                     static_cast<u32>(off));
             }
@@ -1251,17 +1494,21 @@ void Analyzer::populate_data_sections() {
     }
     if (total_data_bytes > 0) db_.data_items.reserve(std::min<size_t>(total_data_bytes / (ptr_sz * 4), 65536));
 
-    for (auto& seg : img_.segments) {
-        if (seg.executable() || seg.data.empty()) continue;
+    // Per-segment item lists merged in segment order (addresses are disjoint
+    // across segments, so the merge is deterministic).
+    std::vector<std::vector<DataItem>> outs(img_.segments.size());
+    parallel_for(pool_, img_.segments.size(), [&](size_t s) {
+        const Segment& seg = img_.segments[s];
+        if (seg.executable() || seg.data.empty()) return;
 
         bool large = seg.data.size() > kLargeSectionThreshold;
         const u8* data = seg.data.data();
         size_t sz = seg.data.size();
+        auto& out = outs[s];
 
         for (size_t i = 0; i + ptr_sz <= sz; i += ptr_sz) {
             va_t addr = seg.va + i;
 
-            if (db_.data_items.count(addr)) continue;
             if (str_addrs.count(addr)) continue;
             if (iat_addrs.count(addr)) continue;
 
@@ -1287,9 +1534,8 @@ void Analyzer::populate_data_sections() {
                     j += ptr_sz;
                 }
                 if (run >= kZeroRunThreshold) {
-                    db_.data_items[addr] = {addr, ds, DataStyle::Align, false};
+                    out.push_back({addr, ds, DataStyle::Align, false});
                     i = j - ptr_sz;
-                    ++defined;
                     continue;
                 }
             }
@@ -1298,13 +1544,22 @@ void Analyzer::populate_data_sections() {
                 continue;
 
             if (is_code_addr(val)) {
-                db_.data_items[addr] = {addr, ds, DataStyle::Pointer, false};
+                out.push_back({addr, ds, DataStyle::Pointer, false});
             } else {
-                db_.data_items[addr] = {addr, ds, DataStyle::Raw, false};
+                out.push_back({addr, ds, DataStyle::Raw, false});
             }
-            ++defined;
+        }
+    });
+
+    u32 defined_out = 0;
+    for (auto& out : outs) {
+        for (auto& item : out) {
+            if (db_.data_items.count(item.addr)) continue;
+            db_.data_items[item.addr] = item;
+            ++defined_out;
         }
     }
+    defined = defined_out;
 
     for (auto& imp : img_.imports) {
         auto it = db_.data_items.find(imp.iat_addr);
@@ -1395,39 +1650,47 @@ void Analyzer::propagate_interproc_types() {
 
     u32 propagated = 0;
 
-    for (auto& [entry, func] : db_.funcs) {
-        auto kit = known_sigs.find(func.name);
-        if (kit != known_sigs.end()) {
-            db_.signatures[entry] = kit->second;
-            ++propagated;
-        }
-    }
+    // Loop 1 (known library names) and loop 2 (parameter surface) only
+    // insert disjoint signature entries: collect in parallel, commit serially.
+    std::vector<Function*> order;
+    order.reserve(db_.funcs.size());
+    for (auto& [entry, func] : db_.funcs) order.push_back(&func);
 
-    for (auto& [entry, func] : db_.funcs) {
-        if (!func.analyzed) continue;
+    const size_t sig_chunks = chunk_count(pool_, order.size());
+    std::vector<std::vector<std::pair<va_t, FuncSignature>>> sig_outs(sig_chunks);
+    parallel_for_chunks(pool_, order.size(), [&](size_t c, size_t begin, size_t end) {
+        auto& out = sig_outs[c];
+        for (size_t k = begin; k < end; ++k) {
+            Function& func = *order[k];
+            const va_t entry = func.entry;
+            auto kit = known_sigs.find(func.name);
+            if (kit != known_sigs.end()) {
+                out.emplace_back(entry, kit->second);
+                continue;
+            }
+            if (!func.analyzed) continue;
 
-        int param_reg_count = 0;
-        bool uses_rcx = false, uses_rdx = false, uses_r8 = false, uses_r9 = false;
+            int param_reg_count = 0;
+            bool uses_rcx = false, uses_rdx = false, uses_r8 = false, uses_r9 = false;
 
-        for (auto& [ba, bb] : func.blocks) {
-            for (auto& insn : bb.insns) {
-                for (u8 i = 0; i < insn.op_count; ++i) {
-                    if (insn.ops[i].type == OpType::Reg) {
-                        if (insn.ops[i].reg == 1) uses_rcx = true;
-                        if (insn.ops[i].reg == 2) uses_rdx = true;
-                        if (insn.ops[i].reg == 8) uses_r8 = true;
-                        if (insn.ops[i].reg == 9) uses_r9 = true;
+            for (auto& [ba, bb] : func.blocks) {
+                for (auto& insn : bb.insns) {
+                    for (u8 i = 0; i < insn.op_count; ++i) {
+                        if (insn.ops[i].type == OpType::Reg) {
+                            if (insn.ops[i].reg == 1) uses_rcx = true;
+                            if (insn.ops[i].reg == 2) uses_rdx = true;
+                            if (insn.ops[i].reg == 8) uses_r8 = true;
+                            if (insn.ops[i].reg == 9) uses_r9 = true;
+                        }
                     }
                 }
             }
-        }
 
-        if (uses_r9) param_reg_count = 4;
-        else if (uses_r8) param_reg_count = 3;
-        else if (uses_rdx) param_reg_count = 2;
-        else if (uses_rcx) param_reg_count = 1;
+            if (uses_r9) param_reg_count = 4;
+            else if (uses_r8) param_reg_count = 3;
+            else if (uses_rdx) param_reg_count = 2;
+            else if (uses_rcx) param_reg_count = 1;
 
-        if (!db_.signatures.count(entry)) {
             FuncSignature sig;
             sig.param_count = param_reg_count;
             sig.return_type = "int64_t";
@@ -1435,12 +1698,26 @@ void Analyzer::propagate_interproc_types() {
                 sig.param_names.push_back(fmt::format("a{}", p + 1));
                 sig.param_types.push_back("int64_t");
             }
-            db_.signatures[entry] = std::move(sig);
+            out.emplace_back(entry, std::move(sig));
+        }
+    });
+    for (auto& out : sig_outs) {
+        for (auto& [entry, sig] : out) {
+            if (!db_.signatures.count(entry)) {
+                db_.signatures[entry] = std::move(sig);
+                ++propagated;
+            }
         }
     }
 
-    for (auto& [entry, func] : db_.funcs) {
-        if (!func.analyzed) continue;
+    // Loop 3 (call-site propagation) is currently a read-only no-op
+    // placeholder: every analyzed function already owns a signature from
+    // the commit above, so the lookup below can never insert. Fans out
+    // freely.
+    parallel_for(pool_, order.size(), [&](size_t k) {
+        Function& func = *order[k];
+        const va_t entry = func.entry;
+        if (!func.analyzed) return;
         for (auto& [ba, bb] : func.blocks) {
             for (auto& insn : bb.insns) {
                 if (!insn.is_call()) continue;
@@ -1451,20 +1728,28 @@ void Analyzer::propagate_interproc_types() {
                 auto& callee_sig = sit->second;
 
                 if (callee_sig.return_type != "int64_t") {
-                    auto& caller_sig = db_.signatures[entry];
-                    (void)caller_sig;
+                    auto caller_it = db_.signatures.find(entry);
+                    (void)caller_it;
                 }
             }
         }
-    }
+    });
 
     spdlog::info("interproc: propagated {} function signatures", propagated + (u32)db_.signatures.size());
 }
 
 bool Analyzer::decode_insn(va_t addr, const u8* data, size_t len, Insn& out) {
-    if (use_capstone())
+    if (use_capstone()) {
+        // Capstone's shared handle carries decode state: serialize. The
+        // x86/x64 Zydis path below stays lock-free (const decoder,
+        // formatter skipped), which is where the time goes.
+        std::lock_guard lk(cap_mu_);
         return cap_disasm_.decode(addr, data, len, out);
-    return disasm_.decode(addr, data, len, out);
+    }
+    // Analysis never reads mnemonic/op_str text (classification keys off
+    // InsnType/mnemonic_id/operands), so skip the formatter per instruction.
+    // Decompile/display paths re-render on demand via format_text().
+    return disasm_.decode(addr, data, len, out, false);
 }
 
 std::vector<Insn> Analyzer::decode_insn_range(va_t start, const u8* data, size_t len) {

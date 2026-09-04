@@ -4,6 +4,7 @@
 
 #include "harness.hpp"
 
+#include "core/disasm/binary_state.hpp"
 #include "core/disasm/engine.hpp"
 #include "core/disasm/function_index.hpp"
 #include "core/disasm/pe_parser.hpp"
@@ -213,6 +214,21 @@ TEST_CASE(strings_scan_real_image_finds_data) {
     REQUIRE_GT(total_hits, 10u);   // MSVC binaries carry plenty of strings
 }
 
+TEST_CASE(pe_parse_slop_target_runtime_funcs) {
+    auto pe = pe_parse(slop_target_bytes().data(), slop_target_bytes().size());
+    REQUIRE(pe.ok);
+    // x64 MSVC output carries .pdata with thousands of exact function ranges
+    REQUIRE_GT(pe.runtime_funcs.size(), 1000u);
+    for (const auto& rf : pe.runtime_funcs) {
+        REQUIRE(rf.end_rva > rf.begin_rva);
+        // Every entry must land in the file inside an executable section
+        REQUIRE(pe.rva_to_offset(rf.begin_rva).has_value());
+        const auto* sec = pe.section_for_rva(rf.begin_rva);
+        REQUIRE(sec != nullptr);
+        REQUIRE(sec->is_executable());
+    }
+}
+
 // === function index + xrefs against the real image ===
 
 TEST_CASE(function_index_discovers_entrypoint) {
@@ -239,6 +255,41 @@ TEST_CASE(function_index_discovers_entrypoint) {
     auto owner = fi.containing(entry_va);
     REQUIRE(owner.has_value());
     REQUIRE_EQ(*owner, entry_va);
+}
+
+TEST_CASE(function_index_seeded_from_pdata_and_covers_terminator) {
+    const auto& bytes = slop_target_bytes();
+    auto pe = pe_parse(bytes.data(), bytes.size());
+    REQUIRE(pe.ok);
+    REQUIRE_GT(pe.runtime_funcs.size(), 1000u);
+
+    engine_t eng;
+    REQUIRE(eng.init());
+
+    function_index_t fi;
+    REQUIRE(fi.build(pe, bytes, eng, pe.image_base));
+
+    // Compiler-reported functions are all present (plus heuristic extras)
+    REQUIRE_GE(fi.functions().size(), pe.runtime_funcs.size());
+
+    // Spot-check: a .pdata start is a discovered function start
+    const uint64_t pdata_start = pe.image_base + pe.runtime_funcs.front().begin_rva;
+    bool found = false;
+    for (const auto& f : fi.functions())
+        if (f.va == pdata_start) { found = true; break; }
+    REQUIRE(found);
+
+    // The terminating instruction belongs to its function: containing() must
+    // resolve the last byte, not just the entry address
+    const uint64_t entry_va = pe.image_base + pe.entry_rva;
+    const function_t* entry_fn = nullptr;
+    for (const auto& f : fi.functions())
+        if (f.va == entry_va) { entry_fn = &f; break; }
+    REQUIRE(entry_fn != nullptr);
+    REQUIRE_GT(entry_fn->size, 1u);
+    auto last = fi.containing(entry_fn->va + entry_fn->size - 1);
+    REQUIRE(last.has_value());
+    REQUIRE_EQ(*last, entry_fn->va);
 }
 
 TEST_CASE(xref_index_builds_and_consistent) {
@@ -268,4 +319,32 @@ TEST_CASE(xref_index_builds_and_consistent) {
         if (++checked >= 64) break;
     }
     REQUIRE(seen_refs > 0);
+}
+
+TEST_CASE(binary_state_parallel_load_deterministic) {
+    // The sync stages (functions/xrefs/strings) build concurrently: two
+    // loads must produce identical indexes.
+    namespace bs = slop::core::disasm::binary_state;
+    size_t prev_fns = 0, prev_xrefs = 0, prev_strings = 0;
+    uint64_t prev_first = 0, prev_last = 0;
+    for (int run = 0; run < 2; ++run) {
+        REQUIRE(bs::load_file(SLOP_TARGET_EXE_PATH));
+        const auto& bin = bs::get();
+        REQUIRE(bin.ready);
+        const size_t nf = bin.fns.functions().size();
+        REQUIRE_GT(nf, 1000u);
+        if (run > 0) {
+            REQUIRE_EQ(nf, prev_fns);
+            REQUIRE_EQ(bin.xrefs.total(), prev_xrefs);
+            REQUIRE_EQ(bin.strings.size(), prev_strings);
+            REQUIRE_EQ(bin.fns.functions().front().va, prev_first);
+            REQUIRE_EQ(bin.fns.functions().back().va, prev_last);
+        }
+        prev_fns = nf;
+        prev_xrefs = bin.xrefs.total();
+        prev_strings = bin.strings.size();
+        prev_first = bin.fns.functions().front().va;
+        prev_last = bin.fns.functions().back().va;
+        bs::unload();
+    }
 }

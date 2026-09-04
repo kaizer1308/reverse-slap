@@ -7,7 +7,10 @@
 #include "rtti.h"
 #include "threading/worker_pool.h"
 #include "threading/task_scheduler.h"
+#include "threading/parallel.h"
 #include <atomic>
+#include <mutex>
+#include <queue>
 #include <unordered_set>
 
 namespace hype {
@@ -54,6 +57,10 @@ private:
     // fixed point uses it so later rounds touch just the functions whose CFG
     // actually changed instead of rebuilding the whole image every round
     void build_cfgs(const std::unordered_set<va_t>* only = nullptr);
+    // One function's CFG; disjoint per function so the parallel_for in
+    // build_cfgs can run these concurrently (reads shared maps, writes only
+    // the one Function).
+    void build_one_cfg(Function& func);
     void discover_cfg_fixed_point();
     void remove_junk_code();
     void detect_switches(const std::unordered_set<va_t>* only = nullptr);
@@ -74,6 +81,10 @@ private:
     void propagate_interproc_types();
 
     void descend(va_t addr, std::unordered_set<va_t>& visited);
+    // Shared BFS body: drains a thread-local queue while `visited` and the
+    // instruction DB stay shared under descend_mu_, so every address is
+    // decoded exactly once no matter how roots are sharded across workers.
+    void descend_queue(std::queue<va_t>& wl, std::unordered_set<va_t>& visited);
     bool over_budget();   // latches budget_hit_ the first time it trips
     const u8* va_to_ptr(va_t addr, size_t* max_len = nullptr);
     bool is_iat_addr(va_t addr) const;
@@ -115,6 +126,20 @@ private:
     std::atomic<bool>  budget_hit_{false};
     // Shared with sweep workers so decode_range can probe cancellation.
     std::shared_ptr<std::atomic<bool>> cancel_shared_{std::make_shared<std::atomic<bool>>(false)};
+    // Guards the shared descent state (visited sets + db_.insns inserts +
+    // budget accounting). Decode itself runs outside the lock; the
+    // Capstone handle below is the only decoder with shared mutable state.
+    std::mutex descend_mu_;
+    // Guards recovered_edges_, cfg_dirty_ and resolved_indirect during the
+    // parallel per-function passes (switches, dataflow).
+    std::mutex edge_mu_;
+    // Guards db_.funcs structure (insert/find) during parallel phases whose
+    // hot loop is otherwise read-only (thunk scan). Value writes stay
+    // disjoint per function.
+    std::mutex funcs_mu_;
+    // Capstone's handle is not safe for concurrent disassembly; the x86/x64
+    // Zydis path needs no lock (const decoder, formatter skipped).
+    std::mutex cap_mu_;
     std::unordered_map<va_t, std::vector<va_t>> recovered_edges_;
     // functions that gained an edge or a resolved target in the last round
     std::unordered_set<va_t> cfg_dirty_;

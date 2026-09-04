@@ -43,6 +43,14 @@ struct pe_export_t {
     std::string forwarder;
 };
 
+// One IMAGE_RUNTIME_FUNCTION_ENTRY from the Exception directory (x64 .pdata):
+// exact [begin, end) function bounds from the compiler, independent of any
+// decode heuristic.
+struct pe_runtime_func_t {
+    uint32_t begin_rva = 0;
+    uint32_t end_rva   = 0;   // exclusive
+};
+
 struct pe_data_dir_t {
     uint32_t rva  = 0;
     uint32_t size = 0;
@@ -60,6 +68,7 @@ struct pe_image_t {
     std::vector<pe_section_t> sections;
     std::vector<pe_import_dll_t> imports;
     std::vector<pe_export_t>     exports;
+    std::vector<pe_runtime_func_t> runtime_funcs;   // Exception dir, may be empty
 
     pe_data_dir_t data_dirs[16] = {};
 

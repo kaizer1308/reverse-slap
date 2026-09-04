@@ -16,6 +16,7 @@
 #include <cstdio>
 #include <cctype>
 #include <fstream>
+#include <future>
 #include <iterator>
 #include <unordered_set>
 
@@ -234,30 +235,98 @@ bool load_file(const std::string& path, uint64_t base_override) {
 
     // stage timings: a slow open should name the index that is slow
     using clock_t_ = std::chrono::steady_clock;
-    auto stage = clock_t_::now();
-    const auto stage_ms = [&stage] {
-        const auto now = clock_t_::now();
-        const double ms = std::chrono::duration<double, std::milli>(now - stage).count();
-        stage = now;
-        return ms;
-    };
 
-    if (!g_bin.fns.build(g_bin.pe, g_bin.file, g_bin.eng, g_bin.base))   { unload_locked(); return false; }
-    const double fns_ms = stage_ms();
-    if (!g_bin.xrefs.build(g_bin.pe, g_bin.file, g_bin.eng, g_bin.base)) { unload_locked(); return false; }
-    const double xrefs_ms = stage_ms();
-
-    // strings from the data sections, exec sections are skipped
-    for (const auto& s : g_bin.pe.sections) {
-        if (s.is_executable() || s.raw_size == 0) continue;
-        if (static_cast<size_t>(s.raw_offset) + s.raw_size > g_bin.file.size()) continue;
-        auto part = disasm::extract_strings(
-            g_bin.file.data() + s.raw_offset, s.raw_size,
-            g_bin.base + s.rva, 4, 200'000);
-        g_bin.strings.insert(g_bin.strings.end(),
-                             std::make_move_iterator(part.begin()),
-                             std::make_move_iterator(part.end()));
+    // Hyperion first: begin() parses synchronously (fast) into session-owned
+    // storage, then analysis runs on its worker thread overlapping the sync
+    // index builds below. On any sync failure the session is torn down
+    // (joining the worker) before returning.
+    g_bin.hype = std::make_unique<hyperion_session::session_t>();
+    if (!g_bin.hype->start(g_bin.file.data(), g_bin.file.size(), g_bin.base)) {
+        slop::core::infra::diag::warn("hyperion", g_bin.hype->error());
+        g_bin.hype.reset();
     }
+
+    // The three sync stages are mutually independent (read-only over the
+    // parsed image + file bytes), so they build concurrently. Each owns its
+    // decode engine; outputs merge on this thread afterwards, keeping every
+    // downstream consumer's view deterministic.
+    struct fns_result_t {
+        bool ok = false;
+        disasm::function_index_t index;
+        double ms = 0.0;
+    };
+    struct xrefs_result_t {
+        bool ok = false;
+        disasm::xref_index_t index;
+        double ms = 0.0;
+    };
+    struct strings_result_t {
+        std::vector<disasm::string_hit_t> hits;
+        double ms = 0.0;
+    };
+    const disasm::pe_image_t& pe = g_bin.pe;
+    const std::vector<uint8_t>& file = g_bin.file;
+    const uint64_t base = g_bin.base;
+
+    fns_result_t fns_res;
+    xrefs_result_t xrefs_res;
+    strings_result_t strings_res;
+    try {
+        // Launch inside the guard: std::async itself can throw (e.g. thread
+        // resource exhaustion), and load_file must fail clean, never throw
+        // across the Lua/MCP/UI boundary.
+        auto fns_fut = std::async(std::launch::async, [&]() {
+            const auto start = clock_t_::now();
+            fns_result_t r;
+            disasm::engine_t eng;
+            r.ok = eng.init(pe.pe32plus) && r.index.build(pe, file, eng, base);
+            r.ms = std::chrono::duration<double, std::milli>(clock_t_::now() - start).count();
+            return r;
+        });
+        auto xrefs_fut = std::async(std::launch::async, [&]() {
+            const auto start = clock_t_::now();
+            xrefs_result_t r;
+            disasm::engine_t eng;
+            r.ok = eng.init(pe.pe32plus) && r.index.build(pe, file, eng, base);
+            r.ms = std::chrono::duration<double, std::milli>(clock_t_::now() - start).count();
+            return r;
+        });
+        auto strings_fut = std::async(std::launch::async, [&]() {
+            const auto start = clock_t_::now();
+            strings_result_t r;
+            // strings from the data sections, exec sections are skipped
+            for (const auto& s : pe.sections) {
+                if (s.is_executable() || s.raw_size == 0) continue;
+                if (static_cast<size_t>(s.raw_offset) + s.raw_size > file.size()) continue;
+                auto part = disasm::extract_strings(
+                    file.data() + s.raw_offset, s.raw_size,
+                    base + s.rva, 4, 200'000);
+                r.hits.insert(r.hits.end(),
+                              std::make_move_iterator(part.begin()),
+                              std::make_move_iterator(part.end()));
+            }
+            r.ms = std::chrono::duration<double, std::milli>(clock_t_::now() - start).count();
+            return r;
+        });
+        fns_res = fns_fut.get();
+        xrefs_res = xrefs_fut.get();
+        strings_res = strings_fut.get();
+    } catch (...) {
+        g_bin.hype.reset();
+        unload_locked();
+        return false;
+    }
+    if (!fns_res.ok || !xrefs_res.ok) {
+        g_bin.hype.reset();
+        unload_locked();
+        return false;
+    }
+    g_bin.fns = std::move(fns_res.index);
+    g_bin.xrefs = std::move(xrefs_res.index);
+    g_bin.strings = std::move(strings_res.hits);
+    const double fns_ms = fns_res.ms;
+    const double xrefs_ms = xrefs_res.ms;
+    const double strings_ms = strings_res.ms;
 
     session_meta_t meta;
     load_meta(g_bin, meta);
@@ -268,8 +337,6 @@ bool load_file(const std::string& path, uint64_t base_override) {
     // the type catalog rides the same per hash store, rebind on load
     slop::core::re::type_catalog::bind_binary(g_bin.file.data(), g_bin.file.size());
 
-    const double strings_ms = stage_ms();
-
     char timing[160];
     std::snprintf(timing, sizeof(timing),
                   " (functions %.0f ms, xrefs %.0f ms, strings %.0f ms)",
@@ -279,14 +346,9 @@ bool load_file(const std::string& path, uint64_t base_override) {
         std::to_string(g_bin.xrefs.total()) + " xrefs, " +
         std::to_string(g_bin.strings.size()) + " strings" + timing);
 
-    // hyperion analysis in the background, small binaries finish in under a second and big ones stay responsive through the ready flag
-    g_bin.hype = std::make_unique<hyperion_session::session_t>();
-    if (!g_bin.hype->start(g_bin.file.data(), g_bin.file.size(), g_bin.base)) {
-        slop::core::infra::diag::warn("hyperion", g_bin.hype->error());
-        g_bin.hype.reset();
-    } else {
-        g_bin.hype->queue_names(g_bin.symbols);
-    }
+    // The background analysis was kicked off before the sync stages so the
+    // two overlap; mirror any renames the persisted store already holds.
+    if (g_bin.hype) g_bin.hype->queue_names(g_bin.symbols);
     return true;
 }
 

@@ -76,12 +76,20 @@ public:
     ~Disassembler();
 
     void set_arch(Arch arch);
-    bool decode(va_t addr, const u8* data, size_t len, Insn& out);
+    // want_text=false skips the Zydis formatter (mnemonic comes from the
+    // enum name table, op_str stays empty). Analysis decodes every
+    // instruction in the image and never reads the text; formatting there
+    // is pure overhead. Display/decompile paths keep the default.
+    bool decode(va_t addr, const u8* data, size_t len, Insn& out, bool want_text = true);
     std::vector<Insn> decode_range(va_t start, const u8* data, size_t len);
     // Cancellation-aware variant: probes the predicate every 4 KiB of input
     // so a section sweep can be interrupted between chunks, not after it.
     std::vector<Insn> decode_range(va_t start, const u8* data, size_t len,
                                    const std::function<bool()>& cancelled);
+    // Re-render "mnemonic operands" for an instruction decoded with
+    // want_text=false (analysis builds skip operand text). Decompiler
+    // fallbacks use it so unlifted instructions still show their operands.
+    static std::string format_text(const Insn& insn, Arch arch);
 
 private:
     struct Impl;

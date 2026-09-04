@@ -37,6 +37,7 @@ std::vector<string_hit_t> extract_strings(const uint8_t* data, size_t len,
             utf16_printable(data[i], data[i + 1])) {
             size_t j = i;
             std::string s;
+            s.reserve(64);
             while (j + 1 < len && utf16_printable(data[j], data[j + 1]) && s.size() < 4096) {
                 s.push_back(static_cast<char>(data[j]));
                 j += 2;
@@ -61,6 +62,7 @@ std::vector<string_hit_t> extract_strings(const uint8_t* data, size_t len,
         if (ascii_printable(data[i])) {
             size_t j = i;
             std::string s;
+            s.reserve(64);
             while (j < len && ascii_printable(data[j]) && s.size() < 4096) {
                 s.push_back(static_cast<char>(data[j]));
                 ++j;

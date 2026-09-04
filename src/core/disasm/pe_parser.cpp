@@ -241,6 +241,34 @@ pe_image_t pe_parse(const uint8_t* d, size_t len) {
         }
     }
 
+    // Exception directory (index 3): RUNTIME_FUNCTION entries give exact
+    // function bounds on x64. Parsed structurally (no decode), so the
+    // function index can seed from the compiler's own data instead of
+    // validating every prologue by decoding toward a ret.
+    {
+        const uint32_t exc_rva  = img.data_dirs[3].rva;
+        const uint32_t exc_size = img.data_dirs[3].size;
+        if (exc_rva && exc_size >= 12) {
+            auto dir_off = img.rva_to_offset(exc_rva);
+            if (dir_off && *dir_off + 12 <= len) {
+                // Clamp the entry count the same way the table size does:
+                // a corrupt size must not turn into millions of entries.
+                size_t count = exc_size / 12;
+                constexpr size_t kMaxEntries = 500'000;
+                if (count > kMaxEntries) count = kMaxEntries;
+                const size_t avail = (len - *dir_off) / 12;
+                if (count > avail) count = avail;
+                for (size_t i = 0; i < count; ++i) {
+                    const size_t o = *dir_off + i * 12;
+                    const uint32_t begin = rd32(d + o);
+                    const uint32_t end   = rd32(d + o + 4);
+                    if (begin == 0 || end <= begin) continue;
+                    img.runtime_funcs.push_back({begin, end});
+                }
+            }
+        }
+    }
+
     return img;
 }
 

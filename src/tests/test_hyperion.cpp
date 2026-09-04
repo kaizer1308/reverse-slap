@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <fstream>
 #include <iterator>
 #include <string>
@@ -59,10 +60,13 @@ TEST_CASE(hyperion_session_analyzes_slop_target) {
     REQUIRE_GT(db.insns.size(), 0u);
     REQUIRE_GT(db.strings.size(), 0u);
 
-    // Every function has at least one basic block.
+    // Every function with decoded code at its entry has at least one basic
+    // block. Entries that were never decoded (an unreached .pdata entry, a
+    // stub with no code) are name placeholders with no blocks rather than
+    // zero-length ones.
     for (const auto& [entry, f] : db.funcs) {
         (void)entry;
-        REQUIRE_FALSE(f.blocks.empty());
+        if (db.insns.count(f.entry)) REQUIRE_FALSE(f.blocks.empty());
     }
 
     ds::unload();
@@ -215,6 +219,103 @@ TEST_CASE(hyperion_status_snapshot_tracks_lifecycle) {
     }
     ds::unload();
     REQUIRE_FALSE(ds::hype_status().has_image);
+}
+
+TEST_CASE(hyperion_decode_without_text_keeps_classification) {
+    // Analysis builds skip the formatter: mnemonic id, type, operands and
+    // branch targets must be intact with op_str empty, and format_text()
+    // must restore display text from the stored bytes on demand.
+    hype::Disassembler decoder;
+    decoder.set_arch(hype::Arch::X64);
+    hype::Insn out{};
+
+    static const uint8_t call[] = {0xE8, 0x10, 0x00, 0x00, 0x00};
+    REQUIRE(decoder.decode(0x140001000, call, sizeof(call), out, false));
+    REQUIRE(out.op_str[0] == '\0');
+    REQUIRE(out.mnemonic[0] != '\0');
+    REQUIRE(out.type == hype::InsnType::Call);
+    REQUIRE_EQ(out.branch_target(), 0x140001000ull + 5 + 0x10);
+
+    const std::string text = hype::Disassembler::format_text(out, hype::Arch::X64);
+    REQUIRE(text.find("call") != std::string::npos);
+
+    // Full-text decode still embeds operands directly.
+    hype::Insn full{};
+    REQUIRE(decoder.decode(0x140001000, call, sizeof(call), full));
+    REQUIRE(full.op_str[0] != '\0');
+    REQUIRE_EQ(hype::Disassembler::format_text(full, hype::Arch::X64), text);
+}
+
+TEST_CASE(hyperion_parallel_matches_serial) {
+    // Single-threaded analysis must produce the same database as the
+    // multi-threaded run: same decoded set, functions, xrefs and strings.
+    // SLOP_WORKER_THREADS is read per session (no cache), so the suite can
+    // flip counts within one process.
+    const auto& bytes = slop_target_bytes();
+
+    _putenv_s("SLOP_WORKER_THREADS", "1");
+    hs::session_t serial;
+    REQUIRE(serial.start_sync(bytes.data(), bytes.size(), 0));
+    const auto& sdb = serial.db();
+    const size_t s_insns = sdb.insns.size(), s_funcs = sdb.funcs.size();
+    const size_t s_xrefs = sdb.xrefs.size(), s_strings = sdb.strings.size();
+    const size_t s_vtables = sdb.vtables.size(), s_globals = sdb.globals.size();
+    uint64_t s_sum = 0;
+    for (const auto& [addr, insn] : sdb.insns) s_sum += addr;
+    REQUIRE_GT(s_insns, 1000u);
+
+    _putenv_s("SLOP_WORKER_THREADS", "");
+    hs::session_t parallel;
+    REQUIRE(parallel.start_sync(bytes.data(), bytes.size(), 0));
+    const auto& pdb = parallel.db();
+    REQUIRE_EQ(pdb.insns.size(), s_insns);
+    REQUIRE_EQ(pdb.funcs.size(), s_funcs);
+    REQUIRE_EQ(pdb.xrefs.size(), s_xrefs);
+    REQUIRE_EQ(pdb.strings.size(), s_strings);
+    REQUIRE_EQ(pdb.vtables.size(), s_vtables);
+    REQUIRE_EQ(pdb.globals.size(), s_globals);
+    uint64_t p_sum = 0;
+    for (const auto& [addr, insn] : pdb.insns) p_sum += addr;
+    REQUIRE_EQ(p_sum, s_sum);
+}
+
+TEST_CASE(hyperion_parallel_deterministic) {
+    // Two multi-threaded runs must agree exactly (chunk merges are index
+    // ordered, descent claims are atomic): catches data races that only
+    // show up as fluctuating counts.
+    const auto& bytes = slop_target_bytes();
+    _putenv_s("SLOP_WORKER_THREADS", "");
+
+    size_t prev_insns = 0, prev_funcs = 0, prev_xrefs = 0;
+    uint64_t prev_sum = 0;
+    for (int run = 0; run < 2; ++run) {
+        hs::session_t session;
+        REQUIRE(session.start_sync(bytes.data(), bytes.size(), 0));
+        const auto& db = session.db();
+        uint64_t sum = 0;
+        size_t blocks = 0, edges = 0;
+        for (const auto& [entry, f] : db.funcs) {
+            (void)entry;
+            blocks += f.blocks.size();
+            for (const auto& [ba, bb] : f.blocks) {
+                (void)ba;
+                edges += bb.succs.size();
+            }
+        }
+        for (const auto& [addr, insn] : db.insns) sum += addr;
+        if (run > 0) {
+            REQUIRE_EQ(db.insns.size(), prev_insns);
+            REQUIRE_EQ(db.funcs.size(), prev_funcs);
+            REQUIRE_EQ(db.xrefs.size(), prev_xrefs);
+            REQUIRE_EQ(sum, prev_sum);
+        }
+        prev_insns = db.insns.size();
+        prev_funcs = db.funcs.size();
+        prev_xrefs = db.xrefs.size();
+        prev_sum = sum;
+        REQUIRE_GT(blocks, 0u);
+        REQUIRE_GT(edges, 0u);
+    }
 }
 
 TEST_CASE(hyperion_decoder_preserves_operand_actions) {

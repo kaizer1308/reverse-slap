@@ -39,6 +39,39 @@ size_t private_bytes() {
     return counters.PrivateUsage;
 }
 
+// Back-to-back linear sweeps over the same executable bytes, with and
+// without formatter text. Isolates the Zydis formatter share of decode so
+// decode-level changes can be judged without analysis-phase noise.
+nlohmann::json benchmark_decode_sweep(const hype::PEImage& img) {
+    hype::Disassembler dec;
+    dec.set_arch(img.arch);
+    auto sweep = [&](bool want_text) {
+        size_t count = 0;
+        const auto start = clock_type::now();
+        for (const auto& seg : img.segments) {
+            if (!seg.executable() || seg.data.empty()) continue;
+            size_t off = 0;
+            while (off < seg.data.size()) {
+                hype::Insn in;
+                if (dec.decode(seg.va + off, seg.data.data() + off,
+                               seg.data.size() - off, in, want_text)) {
+                    off += in.len ? in.len : 1;
+                    ++count;
+                } else {
+                    ++off;  // 1-byte resync, same as the index builds
+                }
+            }
+        }
+        return std::pair{std::chrono::duration<double, std::milli>(clock_type::now() - start).count(), count};
+    };
+    const auto [with_ms, with_n] = sweep(true);
+    const auto [without_ms, without_n] = sweep(false);
+    std::cerr << "[bench] decode sweep: with_text " << with_ms << " ms, without_text "
+              << without_ms << " ms (" << without_n << " insns)" << std::endl;
+    return {{"with_text_ms", with_ms}, {"without_text_ms", without_n ? without_ms : 0.0},
+            {"insns", without_n}, {"with_text_insns", with_n}};
+}
+
 nlohmann::json benchmark_image(const std::string& label, const std::string& path,
                                int runs, bool decompile_exports) {
     const auto bytes = read_file(path.c_str());
@@ -94,10 +127,21 @@ nlohmann::json benchmark_image(const std::string& label, const std::string& path
     deviations.reserve(analysis_ms.size());
     for (double value : analysis_ms) deviations.push_back(std::abs(value - analysis_median));
 
+    nlohmann::json decode_facts;
+    {
+        // Re-parse (no analysis) for a stable decode-sweep input; the loop
+        // sessions above are destroyed with their images.
+        hype::PELoader loader;
+        if (auto parsed = loader.load_buffer(bytes.data(), bytes.size()))
+            decode_facts = benchmark_decode_sweep(*parsed);
+    }
+
     return {{"label", label}, {"path", path}, {"analysis_runs_ms", analysis_ms},
             {"analysis_median_ms", analysis_median}, {"analysis_mad_ms", median(deviations)},
             {"decompile_median_ms", decompile_ms.empty() ? 0.0 : median(decompile_ms)},
-            {"peak_private_bytes", peak_private}, {"facts", facts}};
+            {"peak_private_bytes", peak_private}, {"facts", facts},
+            {"worker_threads", hype::worker_thread_count()},
+            {"decode_sweep", decode_facts}};
 }
 
 // Times the synchronous half of opening an image in the app: PE parse,
@@ -130,7 +174,8 @@ nlohmann::json benchmark_load(const std::string& label, const std::string& path,
         binary_state::unload();
     }
     return {{"label", label}, {"path", path}, {"load_runs_ms", load_ms},
-            {"load_median_ms", median(load_ms)}, {"facts", facts}};
+            {"load_median_ms", median(load_ms)}, {"facts", facts},
+            {"worker_threads", hype::worker_thread_count()}};
 }
 }
 
@@ -148,6 +193,12 @@ int main(int argc, char** argv) {
         if (arg == "--output" && i + 1 < argc) { output_path = argv[++i]; continue; }
         if (arg == "--runs" && i + 1 < argc) { runs = std::atoi(argv[++i]); continue; }
         if (arg == "--load") { load_only = true; continue; }
+        // --threads N sets SLOP_WORKER_THREADS for this process so scaling
+        // can be measured without touching the environment.
+        if (arg == "--threads" && i + 1 < argc) {
+            _putenv_s("SLOP_WORKER_THREADS", argv[++i]);
+            continue;
+        }
         if (arg == "--image" && i + 1 < argc) {
             const std::string spec = argv[++i];
             const size_t eq = spec.find('=');

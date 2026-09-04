@@ -260,6 +260,70 @@ std::string decompile_text(const hype::Function& func) {
 
 }
 
+TEST_CASE(decomp_lifter_conditions_without_decode_text) {
+    // Same expectations as decomp_lifter_signed_and_unsigned_conditions, but
+    // the instructions carry no formatted text (analysis builds skip it):
+    // condition mapping must come from the mnemonic id, not the string.
+    auto lift_naked = [](const uint8_t* code, size_t len) {
+        hype::Disassembler decoder;
+        decoder.set_arch(hype::Arch::X64);
+        hype::Function func;
+        func.entry = 0x1000;
+        hype::BasicBlock block;
+        block.start = 0x1000;
+        size_t off = 0;
+        while (off < len) {
+            hype::Insn insn{};
+            if (!decoder.decode(0x1000 + off, code + off, len - off, insn, false)) break;
+            REQUIRE(insn.op_str[0] == '\0');
+            block.insns.push_back(insn);
+            block.end = insn.addr + insn.len;
+            if (insn.is_ret()) break;
+            off += insn.len;
+        }
+        func.block_addrs.push_back(block.start);
+        func.blocks[block.start] = std::move(block);
+        func.analyzed = true;
+        return decompile_text(func);
+    };
+
+    // cmp eax, 5 ; jl target ; ret  then signed less: SF != OF
+    static const uint8_t jl[] = {0x83, 0xF8, 0x05, 0x7C, 0x02, 0xC3};
+    REQUIRE(lift_naked(jl, sizeof(jl)).find("SF != OF") != std::string::npos);
+
+    // cmp eax, 5 ; jbe target ; ret  then unsigned below-or-equal: CF || ZF
+    static const uint8_t jbe[] = {0x83, 0xF8, 0x05, 0x76, 0x02, 0xC3};
+    REQUIRE(lift_naked(jbe, sizeof(jbe)).find("CF || ZF") != std::string::npos);
+}
+
+TEST_CASE(decomp_lifter_unsupported_without_text_stays_visible) {
+    // aesdec with no formatted text must still render as __asm with operands:
+    // the fallback re-renders from the stored bytes on demand.
+    hype::Disassembler decoder;
+    decoder.set_arch(hype::Arch::X64);
+    static const uint8_t aes[] = {0x66, 0x0F, 0x38, 0xDE, 0xCA, 0xC3};
+    hype::Function func;
+    func.entry = 0x1000;
+    hype::BasicBlock block;
+    block.start = 0x1000;
+    size_t off = 0;
+    while (off < sizeof(aes)) {
+        hype::Insn insn{};
+        if (!decoder.decode(0x1000 + off, aes + off, sizeof(aes) - off, insn, false)) break;
+        block.insns.push_back(insn);
+        block.end = insn.addr + insn.len;
+        if (insn.is_ret()) break;
+        off += insn.len;
+    }
+    func.block_addrs.push_back(block.start);
+    func.blocks[block.start] = std::move(block);
+    func.analyzed = true;
+    const std::string text = decompile_text(func);
+    REQUIRE(text.find("__asm") != std::string::npos);
+    REQUIRE(text.find("aesdec") != std::string::npos);
+    REQUIRE(text.find("xmm") != std::string::npos);
+}
+
 TEST_CASE(decomp_lifter_signed_and_unsigned_conditions) {
     // cmp eax, 5 ; jl target ; ret  then signed less: SF != OF
     static const uint8_t jl[] = {0x83, 0xF8, 0x05, 0x7C, 0x02, 0xC3};

@@ -89,6 +89,25 @@ bool function_index_t::build(const pe_image_t& pe, const std::vector<uint8_t>& f
     for (const auto& e : pe.exports) {
         if (e.rva && !e.forwarded) { push_target(base + e.rva); ++stats_.seeds; }
     }
+    // .pdata runtime functions are exact compiler-emitted bounds: seed the
+    // descent so calls inside them are discovered, and remember the bounds so
+    // the exact extent survives even when the linear walk stops early (an
+    // interior jmp/ret, padding, or an undecoded tail).
+    std::unordered_map<uint64_t, uint64_t> pdata_end;   // fn start va -> end va
+    for (const auto& rf : pe.runtime_funcs) {
+        if (rf.begin_rva == 0 || rf.end_rva <= rf.begin_rva) continue;
+        const uint64_t start = base + rf.begin_rva;
+        const uint64_t end   = base + rf.end_rva;
+        const exec_range_t* rng = range_for_va(ranges, start);
+        if (!rng) continue;
+        const uint64_t range_end = rng->va + rng->len;
+        const uint64_t clipped = end < range_end ? end : range_end;
+        if (clipped <= start) continue;
+        auto it = pdata_end.find(start);
+        if (it == pdata_end.end() || clipped > it->second) pdata_end[start] = clipped;
+        worklist.push_back(start);
+        ++stats_.seeds;
+    }
 
     while (!worklist.empty()) {
         if (fns_.size() + claimed.size() >= max_functions) { stats_.truncated = true; break; }
@@ -101,7 +120,7 @@ bool function_index_t::build(const pe_image_t& pe, const std::vector<uint8_t>& f
         if (!rng) continue;
 
         uint64_t va = start;
-        bool terminated_cleanly = false;
+        uint64_t end = start;
 
         while (true) {
             const uint64_t off_in_range = static_cast<size_t>(va - rng->va);
@@ -111,22 +130,31 @@ bool function_index_t::build(const pe_image_t& pe, const std::vector<uint8_t>& f
                                    rng->len - static_cast<size_t>(off_in_range), false);
             if (!insn) break;
 
+            end = va + insn->length;
+
             if (insn->flow == flow_t::call && insn->has_rel_target)
                 push_target(insn->rel_target);
 
-            if (insn->flow == flow_t::ret) { terminated_cleanly = true; break; }
+            if (insn->flow == flow_t::ret) break;
             if (insn->flow == flow_t::jmp) {
                 // Unconditional jump out of the linear window ends the block
-                terminated_cleanly = true;
                 break;
             }
 
             va += insn->length;
         }
 
-        extent[start] = static_cast<size_t>(va - start) +
-                        (terminated_cleanly ? 0u : 1u);
-        if (extent[start] == 0) extent[start] = 1;
+        // The extent covers the terminating instruction itself, so
+        // containing() resolves an address on the final ret/jmp. A .pdata
+        // range for this start is authoritative when it runs longer (the
+        // linear walk stops at the first unconditional transfer, but the
+        // function owns every byte up to its recorded end).
+        size_t sz = static_cast<size_t>(end - start);
+        const auto pdata = pdata_end.find(start);
+        if (pdata != pdata_end.end())
+            sz = std::max(sz, static_cast<size_t>(pdata->second - start));
+        if (sz == 0) sz = 1;
+        extent[start] = sz;
     }
 
     for (const auto& [start, sz] : extent) {
@@ -135,6 +163,17 @@ bool function_index_t::build(const pe_image_t& pe, const std::vector<uint8_t>& f
             fns_.push_back({start, sz});
             ++stats_.rd_functions;
         }
+    }
+
+    // .pdata starts the descent never reached (truncated worklist) still get
+    // exact entries: the bounds are compiler data, not a guess, and covering
+    // them keeps the heuristic sweep below from re-validating known code.
+    for (const auto& [start, pdata_stop] : pdata_end) {
+        if (extent.count(start)) continue;
+        if (fns_.size() + extent.size() >= max_functions) { stats_.truncated = true; break; }
+        extent[start] = static_cast<size_t>(pdata_stop - start);
+        fns_.push_back({start, extent[start]});
+        ++stats_.rd_functions;
     }
 
     // Recursive descent already decoded these spans. Without this the sweep

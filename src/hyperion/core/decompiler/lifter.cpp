@@ -1,4 +1,5 @@
 #include "lifter.h"
+#include "core/disasm/disassembler.h"
 #include <Zydis/Zydis.h>
 #include <fmt/format.h>
 #include <algorithm>
@@ -201,6 +202,47 @@ enum class CondKind {
     ZF, NZF, CF, NCF, LT, GE, LE, GT, BE, A, SF, NSF, OF, NOF, UNKNOWN
 };
 
+// Condition code from the Zydis mnemonic id. Analysis builds skip operand
+// text (and the mnemonic string is only the enum name), so the lifter must
+// not depend on the formatted string. Zydis canonicalizes each condition to
+// one spelling (JZ, JB, ...), so no alias handling is needed. Parity
+// (jp/jnp) and cxz/loop forms have no flag model and stay UNKNOWN, matching
+// the old string parser.
+static CondKind cond_kind_from_id(u16 mnemonic_id) {
+    switch (static_cast<ZydisMnemonic>(mnemonic_id)) {
+    case ZYDIS_MNEMONIC_JZ: case ZYDIS_MNEMONIC_SETZ:
+        return CondKind::ZF;
+    case ZYDIS_MNEMONIC_JNZ: case ZYDIS_MNEMONIC_SETNZ:
+        return CondKind::NZF;
+    case ZYDIS_MNEMONIC_JB: case ZYDIS_MNEMONIC_SETB:
+        return CondKind::CF;
+    case ZYDIS_MNEMONIC_JNB: case ZYDIS_MNEMONIC_SETNB:
+        return CondKind::NCF;
+    case ZYDIS_MNEMONIC_JL: case ZYDIS_MNEMONIC_SETL:
+        return CondKind::LT;
+    case ZYDIS_MNEMONIC_JNL: case ZYDIS_MNEMONIC_SETNL:
+        return CondKind::GE;
+    case ZYDIS_MNEMONIC_JLE: case ZYDIS_MNEMONIC_SETLE:
+        return CondKind::LE;
+    case ZYDIS_MNEMONIC_JNLE: case ZYDIS_MNEMONIC_SETNLE:
+        return CondKind::GT;
+    case ZYDIS_MNEMONIC_JBE: case ZYDIS_MNEMONIC_SETBE:
+        return CondKind::BE;
+    case ZYDIS_MNEMONIC_JNBE: case ZYDIS_MNEMONIC_SETNBE:
+        return CondKind::A;
+    case ZYDIS_MNEMONIC_JS: case ZYDIS_MNEMONIC_SETS:
+        return CondKind::SF;
+    case ZYDIS_MNEMONIC_JNS: case ZYDIS_MNEMONIC_SETNS:
+        return CondKind::NSF;
+    case ZYDIS_MNEMONIC_JO: case ZYDIS_MNEMONIC_SETO:
+        return CondKind::OF;
+    case ZYDIS_MNEMONIC_JNO: case ZYDIS_MNEMONIC_SETNO:
+        return CondKind::NOF;
+    default:
+        return CondKind::UNKNOWN;
+    }
+}
+
 static CondKind cond_kind(const char* mn) {
     const char* c = mn;
     if ((c[0] == 'j' || c[0] == 'J') ||
@@ -256,7 +298,8 @@ Varnode Lifter::emit_condition(const Insn& insn, PcodeBlock& out) {
         return t;
     };
 
-    switch (cond_kind(insn.mnemonic)) {
+    switch (insn.mnemonic_id ? cond_kind_from_id(insn.mnemonic_id)
+                             : cond_kind(insn.mnemonic)) {
     case CondKind::ZF:  return zf;
     case CondKind::NZF: return not_v(zf);
     case CondKind::CF:  return cf;
@@ -496,11 +539,13 @@ void Lifter::lift_insn(const Insn& insn, const AnalysisDB& db, PcodeBlock& out) 
     default: {
         // Unsupported instruction: keep it visible and side-effecting rather
         // than silently deleting semantics (SIMD, atomics, string ops, CMOV).
+        // Operand text is skipped in analysis builds, so re-render it here;
+        // this runs once per unlifted instruction in a decompiled function.
         Varnode intrinsic;
         intrinsic.kind = VarnodeKind::Temp;
         intrinsic.id = next_temp_++;
         intrinsic.size = 8;
-        intrinsic.name = fmt::format("__asm {{ {} {} }}", insn.mnemonic, insn.op_str);
+        intrinsic.name = fmt::format("__asm {{ {} }}", Disassembler::format_text(insn, db.arch));
         Varnode result = alloc_temp(8);
         emit(out, PcodeOp::INTRINSIC, result, {intrinsic});
         break;

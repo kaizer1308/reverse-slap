@@ -19,6 +19,7 @@
 #include "core/analysis/analyzer.h"
 #include "core/decompiler/decompiler.h"
 #include "core/loader/pe_loader.h"
+#include "threading/parallel.h"
 #include "threading/worker_pool.h"
 
 namespace slop::core::disasm::hyperion_session {
@@ -95,7 +96,7 @@ private:
     void build_interval_index();       // after analysis completes
     void invalidate_decomp_cache();
 
-    hype::WorkerPool pool_{4};    // analyzer-internal parallel sweeps
+    hype::WorkerPool pool_{hype::worker_thread_count()};
     hype::PEImage    img_;
     uint64_t         base_override_ = 0;
     std::unique_ptr<hype::Analyzer> analyzer_;

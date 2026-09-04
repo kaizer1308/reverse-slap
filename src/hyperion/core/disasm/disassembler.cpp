@@ -70,7 +70,8 @@ static InsnType classify(const ZydisDecodedInstruction& insn) {
     }
 }
 
-bool Disassembler::decode(va_t addr, const u8* data, size_t len, Insn& out) {
+bool Disassembler::decode(va_t addr, const u8* data, size_t len, Insn& out,
+                          bool want_text) {
     ZydisDecodedInstruction zi;
     ZydisDecodedOperand     zo[ZYDIS_MAX_OPERAND_COUNT];
 
@@ -83,19 +84,29 @@ bool Disassembler::decode(va_t addr, const u8* data, size_t len, Insn& out) {
     out.type = classify(zi);
     std::memcpy(out.bytes, data, zi.length);
 
-    char buf[256];
-    ZydisFormatterFormatInstruction(&impl_->formatter, &zi, zo,
-        zi.operand_count_visible, buf, sizeof(buf), addr, nullptr);
-
-    const char* sp = std::strchr(buf, ' ');
-    if (sp) {
-        const size_t mnemonic_len = (std::min)(static_cast<size_t>(sp - buf), sizeof(out.mnemonic) - 1);
-        std::memcpy(out.mnemonic, buf, mnemonic_len);
-        out.mnemonic[mnemonic_len] = '\0';
-        out.set_op_str(sp + 1);
-    } else {
-        out.set_mnemonic(buf);
+    if (!want_text) {
+        // No formatter: the canonical enum name is enough for every analysis
+        // consumer (branch/operand classification keys off mnemonic_id and
+        // InsnType, never the string). Display paths re-render on demand.
+        const char* mn = ZydisMnemonicGetString(zi.mnemonic);
+        if (mn) out.set_mnemonic(mn);
+        else out.mnemonic[0] = '\0';
         out.op_str[0] = '\0';
+    } else {
+        char buf[256];
+        ZydisFormatterFormatInstruction(&impl_->formatter, &zi, zo,
+            zi.operand_count_visible, buf, sizeof(buf), addr, nullptr);
+
+        const char* sp = std::strchr(buf, ' ');
+        if (sp) {
+            const size_t mnemonic_len = (std::min)(static_cast<size_t>(sp - buf), sizeof(out.mnemonic) - 1);
+            std::memcpy(out.mnemonic, buf, mnemonic_len);
+            out.mnemonic[mnemonic_len] = '\0';
+            out.set_op_str(sp + 1);
+        } else {
+            out.set_mnemonic(buf);
+            out.op_str[0] = '\0';
+        }
     }
 
     out.op_count = 0;
@@ -134,6 +145,30 @@ bool Disassembler::decode(va_t addr, const u8* data, size_t len, Insn& out) {
         ++out.op_count;
     }
     return true;
+}
+
+std::string Disassembler::format_text(const Insn& insn, Arch arch) {
+    if (insn.op_str[0] != '\0') {
+        std::string text(insn.mnemonic);
+        text += ' ';
+        text += insn.op_str;
+        return text;
+    }
+    // Operand text was skipped at decode time; re-decode the stored bytes.
+    // Rare path (unlifted instructions in a decompiled function), so a
+    // thread-local helper decoder is plenty.
+    thread_local Disassembler helper;
+    helper.set_arch(arch);
+    Insn full{};
+    if (insn.len == 0 ||
+        !helper.decode(insn.addr, insn.bytes, insn.len, full, true))
+        return std::string(insn.mnemonic);
+    std::string text(full.mnemonic);
+    if (full.op_str[0] != '\0') {
+        text += ' ';
+        text += full.op_str;
+    }
+    return text;
 }
 
 std::vector<Insn> Disassembler::decode_range(va_t start, const u8* data, size_t len) {
