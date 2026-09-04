@@ -207,13 +207,17 @@ packer_verdict_t packer_analyze(const disasm::pe_image_t& pe,
             out.detections.push_back(std::move(d));
             bump(0.45, nullptr);
         } else if (rep.entropy >= 7.0 && !sec.is_executable() && sec.raw_size > 4096) {
+            // Compressed resources (.rdata/.rsrc) in Rust/MSVC binaries
+            // routinely hit 7.5-7.9 without any packing, so this is a weak
+            // signal on its own and must not tip the verdict by itself.
             packer_detection_t d;
             d.type   = "high_entropy";
             d.detail = "data section '" + std::string(sec.name) + "' entropy " +
-                       std::to_string(rep.entropy).substr(0, 5);
+                       std::to_string(rep.entropy).substr(0, 5) +
+                       " (weak alone: common in Rust/MSVC resources)";
             d.location = sec.rva;
             out.detections.push_back(std::move(d));
-            bump(0.20, nullptr);
+            bump(0.12, nullptr);
         }
         if (rep.writable_exec && sec.raw_size > 0) {
             packer_detection_t d;
@@ -336,12 +340,14 @@ packer_verdict_t packer_analyze(const disasm::pe_image_t& pe,
     }
 
     // TLS callbacks + overlay
+    // TLS alone is normal (RustCRT/MSVC use it); only meaningful alongside
+    // stronger signals, so weight it minimally.
     if (pe.data_dirs[9].size > 0) {   // IMAGE_DIRECTORY_ENTRY_TLS
         packer_detection_t d;
         d.type   = "tls";
-        d.detail = "TLS directory present (callback execution before entry)";
+        d.detail = "TLS directory present (weak alone: normal in Rust/MSVC CRT)";
         out.detections.push_back(std::move(d));
-        bump(0.10, nullptr);
+        bump(0.05, nullptr);
     }
     {
         uint64_t end_of_raw = 0;
@@ -363,7 +369,18 @@ packer_verdict_t packer_analyze(const disasm::pe_image_t& pe,
                                        std::min<size_t>(file.size(), 1024 * 1024));
     out.confidence = std::min(1.0, score);
     out.family     = best_family;
-    out.packed     = out.confidence >= 0.50 || !best_family.empty();
+    // Gate "packed" on a strong signal: high-entropy data sections + TLS +
+    // overlay alone (typical clean Rust/MSVC) must stay packed:false.
+    // Strong = exec entropy, known section/byte family, W+X, tiny imports,
+    // entry layout anomaly, or protector strings.
+    bool strong = !best_family.empty();
+    for (const auto& d : out.detections) {
+        if (d.type == "high_entropy" && d.detail.find("executable section") != std::string::npos) strong = true;
+        if (d.type == "section_name" || d.type == "byte_signature" ||
+            d.type == "string_reference" || d.type == "wx_section" ||
+            d.type == "imports" || d.type == "layout") strong = true;
+    }
+    out.packed = (out.confidence >= 0.55 && strong) || !best_family.empty();
     if (out.packed && out.family.empty()) out.family = "Unknown packer";
     return out;
 }

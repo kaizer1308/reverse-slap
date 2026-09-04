@@ -488,6 +488,90 @@ TEST_CASE(mcp_disasm_symbols_roundtrip_and_file_disassemble) {
     slop::core::disasm::binary_state::unload();
 }
 
+TEST_CASE(mcp_volt_regressions_arg_aliases_limits_assemble) {
+    // Issues 1-5 + 14-15: base/addr aliases, apihash names, honored limits,
+    // multi-instruction assemble, devirt guidance, predicate/iat counters.
+    server_fixture_t fx;
+    bool is_error = true;
+
+    // assemble needs no image: "xor eax, eax; ret" is 31 C0 C3
+    json res = fx.call("disasm", {{"action", "assemble"},
+                                  {"text", "xor eax, eax; ret"}}, is_error);
+    REQUIRE(!is_error);
+    REQUIRE_EQ(res.value("length", 0u), 3u);
+    REQUIRE_STR_EQ(res.value("bytes", "").c_str(), "31c0c3");
+
+    REQUIRE(slop::core::disasm::binary_state::load_file(SLOP_TARGET_EXE_PATH));
+    json loaded = fx.call("disasm", {{"action", "loaded"}}, is_error);
+    REQUIRE_EQ(loaded.value("ready", false), true);
+    const uint64_t base = loaded.at("base").get<uint64_t>();
+    const uint64_t entry_va = loaded.value("entry_va", base);
+
+    // xray.entropy accepts base= alias + honors limit as window cap
+    res = fx.call("xray", {{"action", "entropy"}, {"base", base},
+                           {"size", 4096}, {"window_size", 256},
+                           {"limit", 5}}, is_error);
+    REQUIRE(!is_error);
+    REQUIRE(res.contains("overall_entropy"));
+    REQUIRE_LE(res.at("windows").size(), 5u);
+    REQUIRE(res.contains("total_windows"));
+
+    // xray.pages honors limit
+    res = fx.call("xray", {{"action", "pages"}, {"base", base},
+                           {"size", 8192}, {"limit", 2}}, is_error);
+    REQUIRE(!is_error);
+    REQUIRE_LE(res.at("pages").size(), 2u);
+    REQUIRE(res.contains("total_pages"));
+
+    // xray.apihash accepts plain API names (hashed with the algorithm)
+    res = fx.call("xray", {{"action", "apihash"},
+                           {"hashes", {"LoadLibraryA", "GetProcAddress"}}},
+                  is_error);
+    REQUIRE(!is_error);
+    REQUIRE(res.contains("name_inputs"));
+    REQUIRE_EQ(res.at("name_inputs").size(), 2u);
+
+    // disasm.xrefs honors limit
+    res = fx.call("disasm", {{"action", "xrefs"}, {"addr", entry_va},
+                             {"limit", 5}}, is_error);
+    REQUIRE(!is_error);
+    REQUIRE_LE(res.at("refs_to").size(), 5u);
+    REQUIRE(res.contains("total"));
+
+    // devirt.trace without handlers: structured guidance, not bare "missing"
+    res = fx.call("devirt", {{"action", "trace"}, {"addr", entry_va}},
+                  is_error);
+    REQUIRE(is_error);
+    REQUIRE(res.at("error").get<std::string>().find("handler_table") !=
+            std::string::npos);
+
+    // devirt.handlers accepts addr= as a table alias (clean entry has no
+    // valid table, but the error must come from classification, not arg parse)
+    res = fx.call("devirt", {{"action", "handlers"}, {"addr", base + 0x400}},
+                  is_error);
+    REQUIRE(is_error);
+    const std::string herr = res.at("error").get<std::string>();
+    REQUIRE(herr.find("missing numeric argument") == std::string::npos);
+
+    // prove_predicates reports completed/failed/faulted denominators
+    res = fx.call("devirt", {{"action", "prove_predicates"},
+                             {"addr", entry_va}, {"runs", 2}}, is_error);
+    REQUIRE(!is_error);
+    REQUIRE(res.contains("completed_runs"));
+    REQUIRE(res.contains("failed_runs"));
+    REQUIRE(res.contains("faulted_runs"));
+
+    // iat_audit default audits parsed IAT slots only (no 500k+ overcount)
+    res = fx.call("devirt", {{"action", "iat_audit"}}, is_error);
+    REQUIRE(!is_error);
+    REQUIRE_GT(res.value("named", 0u), 0u);
+    REQUIRE_LE(res.value("slots_scanned", 1000000u),
+               res.value("named", 0u) + res.value("unnamed_valid", 0u) +
+                   res.value("invalid", 0u));
+
+    slop::core::disasm::binary_state::unload();
+}
+
 // === new memory / target / debugger surfaces ===
 
 TEST_CASE(mcp_memory_new_actions_shape) {

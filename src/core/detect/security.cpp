@@ -11,6 +11,7 @@
 #include <evntrace.h>
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <set>
 
@@ -178,15 +179,42 @@ std::vector<etw_session_t> enumerate_etw_sessions(std::string* error) {
         wchar_t logger_name[128];
         wchar_t log_file[256];
     };
+    // QueryAllTraces returns ERROR_SUCCESS (0) on success -- the old code
+    // tested `!code` as failure, inverting the result and discarding the
+    // real error. Zero the blobs and set the name offsets so logger names
+    // actually come back.
     static props_blob_t blobs[64];
     EVENT_TRACE_PROPERTIES* prop_ptrs[64] = {};
     for (ULONG i = 0; i < 64; ++i) {
+        std::memset(&blobs[i], 0, sizeof(blobs[i]));
         blobs[i].props.Wnode.BufferSize = sizeof(props_blob_t);
+        blobs[i].props.Wnode.Flags = WNODE_FLAG_TRACED_GUID;
+        blobs[i].props.LoggerNameOffset = sizeof(EVENT_TRACE_PROPERTIES);
+        blobs[i].props.LogFileNameOffset =
+            sizeof(EVENT_TRACE_PROPERTIES) + sizeof(blobs[i].logger_name);
         prop_ptrs[i] = &blobs[i].props;
     }
     ULONG real = 0;
-    if (!QueryAllTraces(prop_ptrs, 64, &real)) {
-        if (error) *error = "QueryAllTraces failed";
+    const ULONG code = QueryAllTraces(prop_ptrs, 64, &real);
+    if (code != ERROR_SUCCESS) {
+        if (error) {
+            char msg[256] = {};
+            FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM |
+                               FORMAT_MESSAGE_IGNORE_INSERTS,
+                           nullptr, code,
+                           MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
+                           msg, sizeof(msg) - 1, nullptr);
+            std::string detail = msg;
+            while (!detail.empty() &&
+                   (detail.back() == '\r' || detail.back() == '\n' ||
+                    detail.back() == ' ' || detail.back() == '.'))
+                detail.pop_back();
+            char hex[32];
+            snprintf(hex, sizeof(hex), "0x%08lX", code);
+            *error = std::string("QueryAllTraces failed (") + hex + ")" +
+                     (detail.empty() ? "" : ": " + detail) +
+                     " (admin required for system sessions)";
+        }
         return out;
     }
     for (ULONG i = 0; i < real; ++i) {
@@ -230,29 +258,59 @@ callback_report_t enumerate_kernel_callbacks() {
     }
 
     // Walk a notify-routine array discovered via an RIP-relative LEA anchor
-    // inside the corresponding PspSetCreate*NotifyRoutine function
+    // inside the corresponding PspSetCreate*NotifyRoutine function.
+    // Notify arrays store EX_FAST_REF-tagged pointers (low 4 bits are a
+    // refcount, not address bits); mask them before validating. Padding
+    // slots read back as 0 or 0xFFFF... and must be skipped, never reported.
+    const uint64_t nt_end = nt_base + got;
+    auto valid_handler = [&](uint64_t raw, uint64_t* stripped) {
+        if (raw == 0 || raw == ~0ull) return false;
+        const uint64_t addr = raw & ~0xFull; // EX_FAST_REF tag
+        if (addr == 0 || addr == (~0ull & ~0xFull)) return false;
+        if (addr < nt_base || addr >= nt_end) {
+            // Cross-module callbacks exist (drivers), but an unconstrained
+            // first-hit LEA walks into garbage; require the stripped pointer
+            // to at least be canonical kernel space.
+            if (addr < 0xFFFF800000000000ull) return false;
+        }
+        *stripped = addr;
+        return true;
+    };
     auto walk_kind = [&](const char* kind, const uint8_t sig[], size_t len,
                          int slot_count) -> bool {
         for (size_t i = 0; i + len <= got; ++i) {
             if (std::memcmp(img.data() + i, sig, len) != 0) continue;
             int32_t disp;
             std::memcpy(&disp, img.data() + i + 3, 4);
-            const uint64_t array_va = nt_base + i + len + disp;
+            // len is 3 here but keep the general form (instr len 7)
+            const uint64_t array_va = nt_base + i + 7 + disp;
+            if (array_va < nt_base || array_va >= nt_end) continue;
 
-            bool any_valid = false;
+            size_t valid = 0, placeholders = 0;
+            std::vector<std::pair<uint32_t, uint64_t>> cands;
             for (int slot = 0; slot < slot_count; ++slot) {
                 uint64_t handler = 0;
                 if (dev->read_kernel_raw(array_va + slot * 8, &handler,
                                          8) != 8)
                     break;
-                // Slot validity: kernel-space pointer or NULL
-                if (!handler) continue;
-                if (handler < nt_base) break;
-                res.entries.push_back(
-                    {kind, static_cast<uint32_t>(slot), handler});
-                any_valid = true;
+                uint64_t stripped = 0;
+                if (!valid_handler(handler, &stripped)) {
+                    if (handler == 0 || handler == ~0ull ||
+                        (handler & ~0xFull) == 0 ||
+                        (handler & ~0xFull) == (~0ull & ~0xFull))
+                        ++placeholders;
+                    continue;
+                }
+                cands.emplace_back(static_cast<uint32_t>(slot), stripped);
+                ++valid;
             }
-            if (any_valid) return true;
+            // A real notify array is sparse: mostly NULL with a few live
+            // entries. An anchor whose "array" is densely "valid" is a
+            // false-positive LEA elsewhere in the 24MB dump.
+            if (valid == 0 || valid > static_cast<size_t>(slot_count / 2)) continue;
+            for (const auto& [slot, addr] : cands)
+                res.entries.push_back({kind, slot, addr});
+            return true;
         }
         return false;
     };

@@ -109,17 +109,25 @@ void hook_code(uc_engine* uc, uint64_t address, uint32_t size, void* user_data) 
     c->cur_ip = address;
     c->cur_text.clear();
 
+    // If the bytes are unreadable (unmapped callee after a CALL outside the
+    // slice), do NOT decode zeros -- 00 00 decodes as "ADD [rax],al" and
+    // poisons the trace with a fake fall-through. Record the gap instead.
     uint8_t bytes[16] = {};
     const size_t n = size <= sizeof(bytes) ? size : sizeof(bytes);
-    if (n > 0 && uc_mem_read(uc, address, bytes, n) != UC_ERR_OK)
-        std::memset(bytes, 0, sizeof(bytes));
+    bool readable = false;
+    if (n > 0 && uc_mem_read(uc, address, bytes, n) == UC_ERR_OK)
+        readable = true;
 
-    if (auto insn = c->eng.decode(address, bytes, sizeof(bytes)))
-        c->cur_text = insn->text;
+    if (readable) {
+        if (auto insn = c->eng.decode(address, bytes, sizeof(bytes)))
+            c->cur_text = insn->text;
+    } else {
+        c->cur_text = "<unmapped>";
+    }
     if (c->req->trace && c->trace.size() < c->req->trace_max)
         c->trace.push_back({address, c->cur_text});
 
-    if (!c->taint_on || n == 0) return;
+    if (!c->taint_on || n == 0 || !readable) return;
 
     ZydisDecodedInstruction zin{};
     ZydisDecodedOperand     ops[ZYDIS_MAX_OPERAND_COUNT];

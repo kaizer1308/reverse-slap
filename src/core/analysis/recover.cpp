@@ -73,14 +73,22 @@ void seed_regs(emu::run_request_t& req, uint64_t seed) {
         z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
         return z ^ (z >> 31);
     };
+    // NB: rbp is seeded too -- an unseeded (zero) rbp faults every
+    // `MOV rax,[rbp+...]` frame access on the first instructions.
     static const char* kRegs[] = { "rax", "rbx", "rcx", "rdx", "rsi", "rdi",
+                                   "rbp",
                                    "r8", "r9", "r10", "r11", "r12", "r13",
                                    "r14", "r15" };
     for (const char* r : kRegs)
         req.regs[r] = next() | 1;   // never zero: zero-heavy inputs mask branches
 }
 
-// Run the function body under Unicorn with the given seed
+// Run the function body under Unicorn with the given seed.
+// Only the function slice is executable; data sections (.rdata/.data/.pdata)
+// are mapped read-only alongside so plain `MOV rax,[rip+...]` / IAT loads do
+// not fault after a handful of instructions. Cross-function CALLs still stop
+// at the callee (not mapped) with invalid_mem_fetch -- that is inherent to
+// slice emulation, and callers surface it with a note.
 emu::run_result_t run_fn(const xray::image_ref_t& img, uint64_t fn_va,
                          uint64_t seed, bool want_trace) {
     emu::run_request_t req;
@@ -108,6 +116,26 @@ emu::run_result_t run_fn(const xray::image_ref_t& img, uint64_t fn_va,
     req.timeout_ms     = 3000;
     req.trace          = want_trace;
     seed_regs(req, seed);
+
+    // Map data sections so static loads resolve. Skip anything overlapping
+    // the code slice, cap per-section bytes to bound Unicorn memory.
+    const uint64_t code_end = fn_va + req.code.size();
+    for (const auto& s : img.pe->sections) {
+        if (s.is_executable() || s.raw_size == 0) continue;
+        const uint64_t va = img.base + s.rva;
+        const uint64_t vend = va + std::max(s.virtual_size, s.raw_size);
+        if (va < code_end && vend > fn_va) continue; // overlap guard
+        auto off = img.pe->rva_to_offset(s.rva);
+        if (!off || *off + s.raw_size > img.file->size()) continue;
+        constexpr size_t kMaxMap = 4u << 20;
+        const size_t take = std::min<size_t>(s.raw_size, kMaxMap);
+        emu::emu_mem_region_t reg;
+        reg.addr = va;
+        reg.bytes.assign(img.file->data() + *off,
+                         img.file->data() + *off + take);
+        req.maps.push_back(std::move(reg));
+        if (req.maps.size() >= 16) break;
+    }
 
     emu::run_result_t res = emu::emulate_run(req);
     return res;
@@ -220,13 +248,20 @@ recovery_result_t recover_flattened(const xray::image_ref_t& img,
 
 std::vector<predicate_proof_t> prove_predicates(const xray::image_ref_t& img,
                                                 uint64_t fn_va, size_t runs) {
+    return prove_predicates_ex(img, fn_va, runs).proofs;
+}
+
+predicate_batch_t prove_predicates_ex(const xray::image_ref_t& img,
+                                      uint64_t fn_va, size_t runs) {
+    predicate_batch_t batch;
     if (runs == 0) runs = 1;
 
     // Static idiom candidates: jcc right after xor r,r / test r,r
     std::vector<predicate_proof_t> out;
-    std::unordered_map<uint64_t, predicate_proof_t*> by_va;
+    std::unordered_map<uint64_t, size_t> by_va; // index, not pointer: vector may reallocate
     {
         auto insns = decode_run(img, fn_va, 4096);
+        out.reserve(128);
         for (size_t i = 1; i < insns.size(); ++i) {
             const auto& in   = insns[i];
             const auto& prev = insns[i - 1];
@@ -247,16 +282,36 @@ std::vector<predicate_proof_t> prove_predicates(const xray::image_ref_t& img,
             p.text         = in.text;
             p.static_idiom = true;
             p.total_runs   = static_cast<int>(runs);
+            by_va[in.va] = out.size();
             out.push_back(p);
-            by_va[in.va] = &out.back();
         }
     }
 
-    // Dynamic sampling across seeded runs
+    // Dynamic sampling across seeded runs. A run that faults AFTER the branch
+    // still yields a valid direction observation (the trace prefix counts);
+    // only runs with no usable trace are skipped. Faults are tracked for the
+    // caller's note so seen=0/total=N is explainable instead of contradictory.
+    int completed_runs = 0;
+    int failed_runs = 0;
+    int faulted_runs = 0;
+    std::string first_fault;
     for (int r = 0; r < static_cast<int>(runs); ++r) {
         auto rr = run_fn(img, fn_va, 0xBEEF + static_cast<uint64_t>(r) * 7919,
                          true);
-        if (!rr.ok || rr.trace.size() < 2) continue;
+        if (!rr.ok || rr.trace.size() < 2) {
+            ++failed_runs;
+            if (first_fault.empty())
+                first_fault = rr.error.empty() ? rr.stopped_reason : rr.error;
+            continue;
+        }
+        ++completed_runs;
+        if (rr.fault) {
+            ++faulted_runs;
+            if (first_fault.empty())
+                first_fault = "invalid_mem_" + rr.fault->access + " at fault ip " +
+                              std::to_string(rr.fault->ip) + " (slice emulation: only "
+                              "the function slice + data sections are mapped)";
+        }
 
         std::set<uint64_t> counted;
         for (size_t i = 0; i + 1 < rr.trace.size(); ++i) {
@@ -275,12 +330,16 @@ std::vector<predicate_proof_t> prove_predicates(const xray::image_ref_t& img,
                 if (one.size() == 1 && one[0].has_rel_target)
                     target = one[0].rel_target;
             }
-            predicate_proof_t* p = it->second;
-            ++p->seen_runs;
-            if (target != 0 && rr.trace[i + 1].ip == target) ++p->taken_runs;
+            predicate_proof_t& p = out[it->second];
+            ++p.seen_runs;
+            if (target != 0 && rr.trace[i + 1].ip == target) ++p.taken_runs;
         }
     }
 
+    // proven_* keep their original meaning (every requested run observed the
+    // branch and agreed); the batch counts + fault note let callers tell "no
+    // observation because the slice faulted first" apart from "observed and
+    // mixed". Faults after the branch do not invalidate its observation.
     for (auto& p : out) {
         p.proven_always_taken =
             p.seen_runs > 0 && p.taken_runs == p.seen_runs &&
@@ -288,8 +347,22 @@ std::vector<predicate_proof_t> prove_predicates(const xray::image_ref_t& img,
         p.proven_never_taken =
             p.seen_runs > 0 && p.taken_runs == 0 &&
             p.seen_runs == p.total_runs;
+        // total_runs stays the requested count for compat.
+        if (p.seen_runs == 0 && (failed_runs > 0 || faulted_runs > 0)) {
+            p.text += " [no dynamic observation: " +
+                      std::to_string(failed_runs + faulted_runs) + "/" +
+                      std::to_string(p.total_runs) +
+                      " runs unusable (slice-emulation fault" +
+                      (faulted_runs > 0 ? " after branch region" : "") +
+                      (first_fault.empty() ? "" : ": " + first_fault) + ")]";
+        }
     }
-    return out;
+    batch.proofs = std::move(out);
+    batch.completed_runs = completed_runs;
+    batch.failed_runs = failed_runs;
+    batch.faulted_runs = faulted_runs;
+    batch.first_fault = first_fault;
+    return batch;
 }
 
 // invariant observation
@@ -307,6 +380,25 @@ invariant_result_t observe_invariants(const xray::image_ref_t& img,
         if (!rr.ok) {
             res.error = "emulation failed: " +
                         (rr.error.empty() ? rr.stopped_reason : rr.error);
+            return res;
+        }
+        // Slice emulation stops at the first unmapped callee/import: report
+        // the fault with an IAT note instead of bare invalid_mem_read.
+        if (rr.fault) {
+            res.instructions_executed = std::max(res.instructions_executed,
+                                                 rr.instructions);
+            res.stopped_reason = res.stopped_reason.empty()
+                ? std::string("invalid_mem_") + rr.fault->access
+                : res.stopped_reason;
+            res.error =
+                "slice emulation faulted after " +
+                std::to_string(rr.instructions) + " insns at " +
+                std::to_string(rr.fault->ip) + " accessing " +
+                std::to_string(rr.fault->addr) + " (" + rr.fault->access +
+                "); only the function slice + data sections are mapped -- "
+                "calls/jmps to other functions and unmapped IAT/import "
+                "targets stop the run (pass maps= via emulate.run, or use "
+                "devirt handlers for cross-function flow)";
             return res;
         }
         res.instructions_executed = std::max(res.instructions_executed,
@@ -349,18 +441,23 @@ iat_audit_result_t iat_audit(const xray::image_ref_t& img,
             if (fn.iat_rva)
                 known[img.base + fn.iat_rva] = dll.dll + "!" + fn.name;
 
-    // Scan ranges: requested range, or every non-executable data section
+    // Scan ranges: an explicit addr+size range, else the parsed import
+    // address table slots themselves (not every data-section qword). The old
+    // default brute-scanned all non-exec sections as qword==pointer, so ASCII
+    // text/counters/relocs counted as 551k "slots" with 542k "invalid".
     std::vector<std::pair<uint64_t, size_t>> ranges;
     if (scan_va != 0) {
         ranges.emplace_back(scan_va, scan_size);
+    } else if (!known.empty()) {
+        for (const auto& [slot, name] : known)
+            ranges.emplace_back(slot, 8);
     } else {
-        for (const auto& s : img.pe->sections) {
-            if (s.is_executable() || s.raw_size == 0) continue;
-            const size_t len = std::min<uint32_t>(s.raw_size,
-                                                  std::max(s.virtual_size, s.raw_size));
-            ranges.emplace_back(img.base + s.rva,
-                                std::min<size_t>(len, 4u << 20));
-        }
+        // No import table at all: fall back to the import directory region
+        // when present, else report empty instead of scanning megabytes of
+        // unrelated data.
+        res.ok = true;
+        res.note = "no import slots in parsed table; pass addr+size for a targeted scan";
+        return res;
     }
 
     auto is_thunk = [&](uint64_t va) {
@@ -370,19 +467,27 @@ iat_audit_result_t iat_audit(const xray::image_ref_t& img,
         return in.has_value();
     };
 
+    const bool explicit_range = (scan_va != 0);
     for (const auto& [base, len] : ranges) {
         const size_t qwords = len / 8;
         for (size_t i = 0; i < qwords; ++i) {
             const uint64_t slot = base + i * 8;
             uint64_t ptr = 0;
             if (!read_qword_img(img, slot, &ptr) || ptr == 0) continue;
-            ++res.slots_scanned;
 
             const auto it = known.find(slot);
             if (it != known.end()) {
+                // A parsed IAT slot is a slot by construction.
+                ++res.slots_scanned;
                 ++res.named;
                 continue;
             }
+            if (!explicit_range) continue; // known-slots mode: nothing else counts
+            // Explicit-range mode: only image-VA-shaped values are pointer
+            // candidates; ASCII/counters are skipped, not counted invalid.
+            const uint64_t img_end = img.base + img.pe->size_of_image;
+            if (ptr < img.base || ptr >= img_end) continue;
+            ++res.slots_scanned;
             if (is_exec_va(img, ptr) && is_thunk(ptr)) {
                 ++res.unnamed_valid;
                 if (res.unnamed.size() < 128)

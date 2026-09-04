@@ -55,6 +55,17 @@ struct predicate_proof_t {
 std::vector<predicate_proof_t> prove_predicates(const xray::image_ref_t& img,
                                                 uint64_t fn_va, size_t runs = 4);
 
+struct predicate_batch_t {
+    std::vector<predicate_proof_t> proofs;
+    int completed_runs = 0; // runs with a usable trace (branch may still fault after)
+    int failed_runs = 0;    // runs with no usable trace at all
+    int faulted_runs = 0;   // usable-trace runs that still hit a slice fault
+    std::string first_fault;
+};
+
+predicate_batch_t prove_predicates_ex(const xray::image_ref_t& img,
+                                      uint64_t fn_va, size_t runs = 4);
+
 // invariant observation
 
 struct invariant_t {
@@ -93,6 +104,7 @@ struct iat_audit_result_t {
     size_t      unnamed_valid = 0;
     size_t      invalid = 0;
     std::vector<iat_slot_t> unnamed;   // capped sample of healing candidates
+    std::string note;
 };
 
 iat_audit_result_t iat_audit(const xray::image_ref_t& img,

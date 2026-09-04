@@ -102,6 +102,7 @@ namespace {
 using json = nlohmann::json;
 
 std::mutex g_tool_mu;
+std::mutex g_image_mu; // guards g_image so analyze.diff can run off g_tool_mu
 
 // mcp side state
 
@@ -201,11 +202,31 @@ runtime::session_t& need_session() {
 }
 
 uint64_t parse_addr(const json& args, const char* key) {
-    if (!args.contains(key)) fail("missing numeric argument");
+    if (!args.contains(key))
+        fail(std::string("missing numeric argument '") + key + "'");
     const json& v = args.at(key);
     if (v.is_string()) {
         const std::string s = v.get<std::string>();
-        return std::stoull(s, nullptr, 0);
+        // allow surrounding whitespace; stoull throws invalid_argument on
+        // names/expressions instead of leaking a bare conversion error
+        size_t beg = s.find_first_not_of(" \t\r\n");
+        size_t end = s.find_last_not_of(" \t\r\n");
+        const std::string t =
+            (beg == std::string::npos) ? std::string{} : s.substr(beg, end - beg + 1);
+        if (t.empty()) fail(std::string("bad numeric argument '") + key + "': empty string");
+        try {
+            size_t pos = 0;
+            const uint64_t val = std::stoull(t, &pos, 0);
+            if (pos != t.size())
+                fail(std::string("bad numeric argument '") + key +
+                     "': trailing characters in '" + t + "'");
+            return val;
+        } catch (const std::invalid_argument&) {
+            fail(std::string("bad numeric argument '") + key + "': '" + t +
+                 "' is not a number (use 0x... hex or decimal)");
+        } catch (const std::out_of_range&) {
+            fail(std::string("bad numeric argument '") + key + "': '" + t + "' out of range");
+        }
     }
     if (v.is_number_unsigned()) return v.get<uint64_t>();
     if (v.is_number_integer()) {
@@ -213,7 +234,34 @@ uint64_t parse_addr(const json& args, const char* key) {
         if (sv < 0) fail("negative address");
         return static_cast<uint64_t>(sv);
     }
-    fail("bad numeric argument");
+    if (v.is_number_float()) {
+        const double dv = v.get<double>();
+        if (!(dv >= 0.0) || dv > 1.8446744073709552e19)
+            fail(std::string("bad numeric argument '") + key + "': out of range");
+        return static_cast<uint64_t>(dv);
+    }
+    fail(std::string("bad numeric argument '") + key + "'");
+}
+
+// First present key wins; used where agents naturally say base/va/address
+// instead of the canonical addr, or len instead of size.
+uint64_t parse_addr_alias(const json& args, std::initializer_list<const char*> keys) {
+    for (const char* k : keys) {
+        if (args.contains(k)) return parse_addr(args, k);
+    }
+    std::string want;
+    for (const char* k : keys) {
+        if (!want.empty()) want += "|";
+        want += k;
+    }
+    fail("missing numeric argument (expected one of: " + want + ")");
+}
+
+bool has_any(const json& args, std::initializer_list<const char*> keys) {
+    for (const char* k : keys) {
+        if (args.contains(k)) return true;
+    }
+    return false;
 }
 
 std::string require_action(const json& args) {
@@ -1006,6 +1054,7 @@ json hits_json(const std::vector<memory::scan_result_t>& hits, size_t limit) {
 // image cache
 
 image_cache_t& load_image(const std::string& path) {
+    std::lock_guard ilk(g_image_mu);
     if (g_image.path == path && !g_image.file.empty()) return g_image;
 
     std::FILE* f = nullptr;
@@ -2124,22 +2173,68 @@ json tool_disasm(const json& args) {
     }
 
     if (action == "assemble") {
-        // one instruction at a time, like mov rax, rbx
+        // one or more instructions, separated by ';' or newlines:
+        // "xor eax, eax; ret"
         if (!args.contains("text") || !args.at("text").is_string())
             fail("missing text (instruction mnemonic + operands)");
+        const std::string all_text = args.at("text").get<std::string>();
+        const uint64_t base_va = args.contains("base")
+            ? parse_addr(args, "base") : 0x400000;
 
-        ZydisEncoderRequest req{};
-        std::string parse_err = assemble_one(
-            args.at("text").get<std::string>(), 0x400000, req);
-        if (!parse_err.empty()) fail(parse_err);
+        // split into statements on ';' and newlines, drop empties/comments
+        std::vector<std::string> stmts;
+        {
+            std::string cur;
+            for (char ch : all_text) {
+                if (ch == ';' || ch == '\n' || ch == '\r') {
+                    // strip // comments
+                    auto cpos = cur.find("//");
+                    if (cpos != std::string::npos) cur.resize(cpos);
+                    size_t b = cur.find_first_not_of(" \t");
+                    size_t e = cur.find_last_not_of(" \t");
+                    if (b != std::string::npos)
+                        stmts.push_back(cur.substr(b, e - b + 1));
+                    cur.clear();
+                } else {
+                    cur.push_back(ch);
+                }
+            }
+            auto cpos = cur.find("//");
+            if (cpos != std::string::npos) cur.resize(cpos);
+            size_t b = cur.find_first_not_of(" \t");
+            size_t e = cur.find_last_not_of(" \t");
+            if (b != std::string::npos)
+                stmts.push_back(cur.substr(b, e - b + 1));
+        }
+        if (stmts.empty()) fail("empty instruction");
+        if (stmts.size() > 64) fail("too many instructions (max 64 per call)");
 
-        uint8_t buf[16];
-        ZyanUSize encoded_len = sizeof(buf);
-        if (ZYAN_FAILED(ZydisEncoderEncodeInstruction(&req, buf,
-                                                      &encoded_len)))
-            fail("encode failed");
-        return {{"bytes", to_hex(buf, static_cast<size_t>(encoded_len))},
-                {"length", static_cast<uint64_t>(encoded_len)}};
+        std::vector<uint8_t> out_bytes;
+        json lines = json::array();
+        for (size_t si = 0; si < stmts.size(); ++si) {
+            ZydisEncoderRequest req{};
+            std::string parse_err = assemble_one(stmts[si], base_va + out_bytes.size(), req);
+            if (!parse_err.empty())
+                fail("statement " + std::to_string(si + 1) + " '" + stmts[si] +
+                     "': " + parse_err);
+            uint8_t buf[16];
+            ZyanUSize encoded_len = sizeof(buf);
+            if (ZYAN_FAILED(ZydisEncoderEncodeInstruction(&req, buf,
+                                                          &encoded_len)))
+                fail("statement " + std::to_string(si + 1) + " '" + stmts[si] +
+                     "': encode failed (" + std::string(ZydisMnemonicGetString(req.mnemonic) ?
+                         ZydisMnemonicGetString(req.mnemonic) : "?") +
+                     " with " + std::to_string(req.operand_count) + " operands)");
+            out_bytes.insert(out_bytes.end(), buf, buf + encoded_len);
+            lines.push_back({{"text", stmts[si]},
+                             {"bytes", to_hex(buf, static_cast<size_t>(encoded_len))},
+                             {"length", static_cast<uint64_t>(encoded_len)}});
+        }
+        json out = {{"bytes", to_hex(out_bytes.data(), out_bytes.size())},
+                    {"length", static_cast<uint64_t>(out_bytes.size())},
+                    {"count", stmts.size()}};
+        if (stmts.size() > 1) out["lines"] = lines;
+        return out;
     }
 
     if (action == "loaded") {
@@ -2153,12 +2248,35 @@ json tool_disasm(const json& args) {
     }
 
     if (action == "symbols") {
-        auto snaps = ds::symbols_snapshot();
-        std::sort(snaps.begin(), snaps.end());
+        const size_t limit = std::min<size_t>(args.value("limit", 500u), 10000u);
+        // User renames win; Hyperion analyzer names (RTTI/vtable/thunk/sig)
+        // fill the rest so this matches analyze.signatures' named_functions
+        // instead of reporting 0 on a fresh image.
+        std::map<uint64_t, std::pair<std::string, std::string>> merged;
+        {
+            std::lock_guard lk(ds::state_mutex());
+            auto& bin = ds::get();
+            if (bin.ready && bin.hype && bin.hype->ready()) {
+                for (const auto& [va, name] : bin.hype->db().names) {
+                    if (name.find("j_") == 0 || name.find("__imp_") == 0) continue;
+                    merged[va] = {name, "hyperion"};
+                }
+            }
+        }
+        for (const auto& [va, name] : ds::symbols_snapshot())
+            merged[va] = {name, "user"};
         json arr = json::array();
-        for (const auto& [va, name] : snaps)
-            arr.push_back({{"va", va}, {"name", name}});
-        return {{"symbols", arr}, {"count", arr.size()}};
+        for (const auto& [va, pr] : merged) {
+            if (arr.size() >= limit) break;
+            arr.push_back({{"va", va}, {"name", pr.first}, {"source", pr.second}});
+        }
+        json out = {{"symbols", arr}, {"count", arr.size()},
+                    {"total", merged.size()},
+                    {"note", "user renames (source=user) override hyperion analyzer "
+                             "names (source=hyperion); same source as "
+                             "analyze.signatures named_functions"}};
+        if (merged.size() > arr.size()) out["truncated"] = true;
+        return out;
     }
 
     if (action == "symbol_set") {
@@ -2354,7 +2472,8 @@ json tool_disasm(const json& args) {
     }
 
     if (action == "xrefs") {
-        const uint64_t addr = parse_addr(args, "addr");
+        const uint64_t addr = parse_addr_alias(args, {"addr", "base", "va", "address"});
+        const size_t limit = std::min<size_t>(args.value("limit", 500u), 10000u);
 
         // hyperion xrefs are richer so use them when we can
         if (!have_path) {
@@ -2363,6 +2482,7 @@ json tool_disasm(const json& args) {
                 const auto& db = bin.hype->db();
                 const auto  it = db.xrefs_to.find(addr);
                 json arr = json::array();
+                size_t total = 0;
                 if (it != db.xrefs_to.end()) {
                     // a call emits two records for one instruction, keep the strongest kind
                     auto kind_rank = [](hype::XrefType t) {
@@ -2382,11 +2502,17 @@ json tool_disasm(const json& args) {
                         if (b == best.end() || b->second.first < r)
                             best[x.from] = {r, k};
                     }
-                    for (const auto& [from, p] : best)
+                    total = best.size();
+                    for (const auto& [from, p] : best) {
+                        if (arr.size() >= limit) break;
                         arr.push_back({{"from", from}, {"kind", p.second}});
+                    }
                 }
-                return {{"image", img_name}, {"engine", "hyperion"},
-                        {"refs_to", arr}, {"count", arr.size()}};
+                json out = {{"image", img_name}, {"engine", "hyperion"},
+                        {"refs_to", arr}, {"count", arr.size()},
+                        {"total", total}};
+                if (total > arr.size()) out["truncated"] = true;
+                return out;
             }
         }
 
@@ -2395,9 +2521,16 @@ json tool_disasm(const json& args) {
             *xidx_ok = true;
         }
         json arr = json::array();
-        for (const auto& r : xidx->refs_to(addr))
+        size_t total = 0;
+        for (const auto& r : xidx->refs_to(addr)) {
+            ++total;
+            if (arr.size() >= limit) continue;
             arr.push_back({{"from", r.from}, {"kind", xref_kind_name(r.kind)}});
-        return {{"image", img_name}, {"refs_to", arr}, {"count", arr.size()}};
+        }
+        json out = {{"image", img_name}, {"refs_to", arr}, {"count", arr.size()},
+                    {"total", total}};
+        if (total > arr.size()) out["truncated"] = true;
+        return out;
     }
 
     if (action == "strings") {
@@ -2475,21 +2608,34 @@ json tool_disasm(const json& args) {
         }
 
         if (action == "vtables") {
+            const size_t limit = std::min<size_t>(args.value("limit", 500u), 10000u);
             json arr = json::array();
-            for (const auto& vt : db.vtables) {
+            for (size_t i = 0; i < db.vtables.size() && arr.size() < limit; ++i) {
+                const auto& vt = db.vtables[i];
                 json entries = json::array();
                 for (auto e : vt.entries) entries.push_back(e);
                 arr.push_back({{"va", vt.addr}, {"entries", entries},
                                {"count", vt.entries.size()}});
             }
-            return {{"ok", true}, {"vtables", arr}, {"count", arr.size()}};
+            json out = {{"ok", true}, {"vtables", arr}, {"count", arr.size()},
+                        {"total", db.vtables.size()}};
+            if (db.vtables.size() > arr.size()) out["truncated"] = true;
+            return out;
         }
 
         // globals
-        json arr = json::array();
-        for (const auto& [va, g] : db.globals)
-            arr.push_back({{"va", va}, {"size", g.size}, {"name", g.name}});
-        return {{"ok", true}, {"globals", arr}, {"count", arr.size()}};
+        {
+            const size_t limit = std::min<size_t>(args.value("limit", 500u), 10000u);
+            json arr = json::array();
+            for (const auto& [va, g] : db.globals) {
+                if (arr.size() >= limit) break;
+                arr.push_back({{"va", va}, {"size", g.size}, {"name", g.name}});
+            }
+            json out = {{"ok", true}, {"globals", arr}, {"count", arr.size()},
+                        {"total", db.globals.size()}};
+            if (db.globals.size() > arr.size()) out["truncated"] = true;
+            return out;
+        }
     }
 
     fail("disasm: unknown action (assemble|disassemble|loaded|pe|functions|"
@@ -2952,11 +3098,17 @@ json tool_driver(const json& args) {
         std::string err;
         auto mods = runtime::kernel_svc::enumerate_modules(&err);
         if (!err.empty()) fail(err);
+        const size_t limit = std::min<size_t>(args.value("limit", 500u), 2048u);
         json arr = json::array();
-        for (const auto& m : mods)
+        for (size_t i = 0; i < mods.size() && arr.size() < limit; ++i) {
+            const auto& m = mods[i];
             arr.push_back({{"name", m.name}, {"base", m.base},
                            {"size", m.size}});
-        return {{"modules", arr}, {"count", arr.size()}};
+        }
+        json out = {{"modules", arr}, {"count", arr.size()},
+                    {"total", mods.size()}};
+        if (mods.size() > arr.size()) out["truncated"] = true;
+        return out;
     }
 
     if (action == "dump_driver") {
@@ -3860,9 +4012,16 @@ json tool_emulate(const json& args) {
         out["writes"] = arr;
         out["total_writes"] = r.total_writes;
     }
-    if (r.fault)
+    if (r.fault) {
         out["fault"] = {{"ip", r.fault->ip}, {"addr", r.fault->addr},
                         {"access", r.fault->access}};
+        out["note"] = "only the requested code bytes (+ optional maps=) are "
+                      "mapped: CALL/JMP to unmapped callees and loads from "
+                      "unmapped IAT/data stop with invalid_mem_* (trace shows "
+                      "<unmapped>, never synthetic ADD [rax],al). Map "
+                      "surrounding bytes via maps=[{addr,hex}] or enlarge "
+                      "code_len to follow through";
+    }
 
     if (!req.taint_sources.empty()) {
         json ranges = json::array();
@@ -3881,54 +4040,115 @@ json tool_emulate(const json& args) {
 
 // tool: analyze
 
-json tool_analyze(const json& args) {
+json tool_analyze(const json& args,
+                  const infra::cancel_token_t& cancel = {}) {
     const std::string action = require_action(args);
     if (action != "packer" && action != "signatures" && action != "diff")
         fail("analyze: unknown action (packer|signatures|diff)");
 
-    // diff runs two full analyses synchronously so it takes a while
+    // diff is heavy (two full Hyperion analyses + quadratic compare), so it
+    // runs WITHOUT the global tool mutex (see call_tool), honors cancel +
+    // timeout_ms, and caps the pair budget instead of hanging the engine.
     if (action == "diff") {
         if (!args.contains("path_a") || !args.contains("path_b"))
             fail("missing path_a/path_b");
         const std::string pa = args.at("path_a").get<std::string>();
         const std::string pb = args.at("path_b").get<std::string>();
-
-        auto load_and_analyze = [](const std::string& path) {
-            std::ifstream f(path, std::ios::binary);
-            if (!f) fail("cannot open " + path);
-            std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(f)),
-                                       std::istreambuf_iterator<char>{});
-            auto sess = std::make_unique<hs::session_t>();
-            if (!sess->start_sync(bytes.data(), bytes.size(), 0))
-                fail("hyperion analysis failed for " + path + ": " +
-                     sess->error());
-            return sess;
+        const uint32_t timeout_ms = static_cast<uint32_t>(
+            std::clamp(args.value("timeout_ms", 120000), 5000, 1800000));
+        const size_t max_pairs = std::min<size_t>(
+            args.value("max_pairs", 500000u), 10000000u);
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::milliseconds(timeout_ms);
+        auto ms_left = [&]() -> uint64_t {
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= deadline) return 0;
+            return static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    deadline - now).count());
+        };
+        auto check_cancel = [&]() {
+            if (cancel.cancelled()) fail("diff cancelled");
+            if (ms_left() == 0) fail("diff timed out (timeout_ms exceeded)");
         };
 
-        auto sa = load_and_analyze(pa);
-        auto sb = load_and_analyze(pb);
+        auto load_bytes = [](const std::string& path) {
+            std::ifstream f(path, std::ios::binary);
+            if (!f) fail("cannot open " + path);
+            f.seekg(0, std::ios::end);
+            const auto sz = f.tellg();
+            if (sz <= 0) fail("empty file: " + path);
+            if (sz > (256ll << 20)) fail("file too large for diff (>256MB): " + path);
+            f.seekg(0, std::ios::beg);
+            std::vector<uint8_t> bytes(static_cast<size_t>(sz));
+            f.read(reinterpret_cast<char*>(bytes.data()), sz);
+            if (!f) fail("short read on " + path);
+            return bytes;
+        };
+
+        std::vector<uint8_t> bytes_a = load_bytes(pa);
+        check_cancel();
+        std::vector<uint8_t> bytes_b = load_bytes(pb);
+        check_cancel();
+
+        // NOTE: start_sync has no cancel hook, so each side can still take a
+        // while on huge binaries; the deadline applies to the compare phase
+        // and to the boundary between the two analyses.
+        auto sa = std::make_unique<hs::session_t>();
+        if (cancel.cancelled()) fail("diff cancelled");
+        if (!sa->start_sync(bytes_a.data(), bytes_a.size(), 0)) {
+            if (cancel.cancelled()) fail("diff cancelled");
+            fail("hyperion analysis failed for " + pa + ": " + sa->error());
+        }
+        check_cancel();
+        auto sb = std::make_unique<hs::session_t>();
+        if (cancel.cancelled()) fail("diff cancelled");
+        if (!sb->start_sync(bytes_b.data(), bytes_b.size(), 0)) {
+            if (cancel.cancelled()) fail("diff cancelled");
+            fail("hyperion analysis failed for " + pb + ": " + sb->error());
+        }
+        if (cancel.cancelled()) fail("diff cancelled");
 
         hype::BinDiff differ;
-        const auto results = differ.compare(sa->db(), sb->db());
+        hype::BinDiff::options_t opt;
+        opt.max_pairs = max_pairs;
+        std::function<bool()> cancelled_fn = [&]() { return cancel.cancelled(); };
+        opt.cancel = cancel ? &cancelled_fn : nullptr;
+        // absolute steady-clock deadline in BinDiff::now_ms() terms
+        opt.deadline_ms = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count()) +
+            timeout_ms;
+        auto outcome = differ.compare_budgeted(sa->db(), sb->db(), opt);
 
         json arr = json::array();
         const size_t limit = std::min<size_t>(args.value("limit", 500u), 5000u);
         const char* status_name[] = {"added", "removed", "modified", "identical"};
-        for (size_t i = 0; i < results.size() && i < limit; ++i) {
-            const auto& r = results[i];
-            json o = {{"addr_a", r.addr_a}, {"addr_b", r.addr_b},
-                      {"name", r.name},
-                      {"similarity", r.similarity},
-                      {"status", status_name[r.status]}};
+        for (size_t i = 0; i < outcome.results.size() && arr.size() < limit; ++i) {
+            const auto& r = outcome.results[i];
             if (r.status == hype::DiffResult::Identical) continue;  // noise
-            arr.push_back(std::move(o));
+            arr.push_back({{"addr_a", r.addr_a}, {"addr_b", r.addr_b},
+                           {"name", r.name},
+                           {"similarity", r.similarity},
+                           {"status", status_name[r.status]}});
         }
         size_t counts[4] = {0, 0, 0, 0};
-        for (const auto& r : results) ++counts[r.status];
-        return {{"ok", true}, {"diffs", arr}, {"count", arr.size()},
-                {"totals", {{"added", counts[0]}, {"removed", counts[1]},
-                            {"modified", counts[2]},
-                            {"identical", counts[3]}}}};
+        for (const auto& r : outcome.results) ++counts[r.status];
+        json out = {{"ok", true}, {"diffs", arr}, {"count", arr.size()},
+                    {"totals", {{"added", counts[0]}, {"removed", counts[1]},
+                                {"modified", counts[2]},
+                                {"identical", counts[3]}}},
+                    {"funcs_a", sa->db().funcs.size()},
+                    {"funcs_b", sb->db().funcs.size()},
+                    {"pairs_evaluated", outcome.pairs_evaluated},
+                    {"pairs_skipped_size", outcome.pairs_skipped_size},
+                    {"timed_out", outcome.timed_out},
+                    {"cancelled", outcome.cancelled}};
+        if (outcome.timed_out)
+            out["note"] = "pair budget/deadline hit: results are partial "
+                          "(raise max_pairs/timeout_ms for a fuller diff)";
+        if (outcome.cancelled) out["note"] = "diff cancelled: results are partial";
+        return out;
     }
 
     // explicit path into the private cache, else the app loaded binary
@@ -4825,10 +5045,20 @@ json tool_detect(const json& args) {
         auto r = detect::enumerate_kernel_callbacks();
         if (!r.ok) fail(r.error);
         json arr = json::array();
-        for (const auto& e : r.entries)
+        for (const auto& e : r.entries) {
+            // belt-and-braces: never surface padding placeholders
+            if (e.handler == 0 || e.handler == ~0ull ||
+                (e.handler & ~0xFull) == 0 ||
+                (e.handler & ~0xFull) == (~0ull & ~0xFull))
+                continue;
             arr.push_back({{"kind", e.kind}, {"slot", e.slot},
-                           {"handler", e.handler}});
-        return {{"callbacks", arr}, {"count", arr.size()}};
+                           {"handler", e.handler},
+                           {"resolved", e.handler < 0xFFFF800000000000ull ? false : true}});
+        }
+        json out = {{"callbacks", arr}, {"count", arr.size()}};
+        out["note"] = "handlers are EX_FAST_REF-stripped; placeholders "
+                      "(0 / 0xFFFF...) are filtered, never reported";
+        return out;
     }
 
     fail("detect: unknown action (hidden_modules|minifilters|etw_sessions|"
@@ -4979,16 +5209,22 @@ std::string assemble_one(const std::string& text, uint64_t addr,
     out.machine_mode = ZYDIS_MACHINE_MODE_LONG_64;
     out.allowed_encodings = ZYDIS_ENCODABLE_ENCODING_DEFAULT;
 
-    // split on spaces and commas
+    // split on spaces, commas and mem-operand operators so
+    // "[rbx+8]", "[rax+rcx*4-0x10]" tokenize into separate atoms
     std::vector<std::string> tokens;
     std::string cur;
+    auto flush = [&] {
+        // strip stray statement terminators/label colons agents paste in
+        while (!cur.empty() && (cur.back() == ';' || cur.back() == ':'))
+            cur.pop_back();
+        if (!cur.empty()) tokens.push_back(cur);
+        cur.clear();
+    };
     for (char ch : text + ",") {
-        if (ch == ' ' || ch == ',' || ch == '\t') {
-            if (!cur.empty()) tokens.push_back(cur);
-            cur.clear();
-        } else if (ch == '[' || ch == ']') {
-            if (!cur.empty()) tokens.push_back(cur);
-            cur.clear();
+        if (ch == ' ' || ch == ',' || ch == '\t' || ch == ';' || ch == ':') {
+            flush();
+        } else if (ch == '[' || ch == ']' || ch == '+' || ch == '-' || ch == '*') {
+            flush();
             tokens.push_back(std::string(1, ch));
         } else {
             cur += static_cast<char>(std::tolower(
@@ -5037,10 +5273,10 @@ std::string assemble_one(const std::string& text, uint64_t addr,
             while (ti < tokens.size() && tokens[ti] != "]") {
                 ZydisRegister r = ZYDIS_REGISTER_NONE;
                 int64_t sign = 1;
-                bool handled = false;
-                if (tokens[ti] == "+") { sign = 1; ti++; handled = true; }
-                else if (tokens[ti] == "-") { sign = -1; ti++; handled = true; }
-                if (!handled && find_reg(tokens[ti], &r)) {
+                if (tokens[ti] == "+") { sign = 1; ti++; }
+                else if (tokens[ti] == "-") { sign = -1; ti++; }
+                if (ti >= tokens.size()) break;
+                if (find_reg(tokens[ti], &r)) {
                     if (r == ZYDIS_REGISTER_RIP) {
                         op.mem.base = ZYDIS_REGISTER_RIP;
                         op.mem.displacement =
@@ -5052,8 +5288,11 @@ std::string assemble_one(const std::string& text, uint64_t addr,
                     }
                     ti++;
                 } else {
+                    char* end = nullptr;
                     const uint64_t v =
-                        std::strtoull(tokens[ti].c_str(), nullptr, 0);
+                        std::strtoull(tokens[ti].c_str(), &end, 0);
+                    if (end == tokens[ti].c_str())
+                        return "bad memory operand '" + tokens[ti] + "'";
                     op.mem.displacement +=
                         sign * static_cast<int64_t>(v);
                     ti++;
@@ -5067,6 +5306,33 @@ std::string assemble_one(const std::string& text, uint64_t addr,
             }
             if (ti < tokens.size()) ++ti;   // consume ']'
             continue;
+        }
+
+        if (t == "+" || t == "-" || t == "*") {
+            // stray operator outside [...] (e.g. signed immediates split
+            // by the tokenizer) -- fold a leading sign into the next atom
+            if ((t == "+" || t == "-") && ti + 1 < tokens.size() &&
+                tokens[ti + 1] != "]" && tokens[ti + 1] != "[" &&
+                tokens[ti + 1] != "+" && tokens[ti + 1] != "-" &&
+                tokens[ti + 1] != "*") {
+                ZydisRegister rr = ZYDIS_REGISTER_NONE;
+                const std::string& nx = tokens[ti + 1];
+                if (!find_reg(nx, &rr)) {
+                    ZydisEncoderOperand& op =
+                        out.operands[out.operand_count++];
+                    op.type = ZYDIS_OPERAND_TYPE_IMMEDIATE;
+                    char* end = nullptr;
+                    const int64_t sv = std::strtoll(
+                        (t + nx).c_str(), &end, 0);
+                    if (end == (t + nx).c_str())
+                        return "bad immediate '" + t + nx + "'";
+                    op.imm.s = sv;
+                    op.imm.u = static_cast<uint64_t>(sv);
+                    ti += 2;
+                    continue;
+                }
+            }
+            return "unexpected '" + t + "' outside memory operand";
         }
 
         ZydisRegister r = ZYDIS_REGISTER_NONE;
@@ -5083,8 +5349,13 @@ std::string assemble_one(const std::string& text, uint64_t addr,
         ZydisEncoderOperand& op = out.operands[out.operand_count++];
         op.type = ZYDIS_OPERAND_TYPE_IMMEDIATE;
 
-        op.imm.u = std::strtoull(t.c_str(), nullptr, 0);
-        op.imm.s = static_cast<int64_t>(op.imm.u);
+        {
+            char* end = nullptr;
+            const uint64_t uv = std::strtoull(t.c_str(), &end, 0);
+            if (end == t.c_str()) return "bad operand '" + t + "'";
+            op.imm.u = uv;
+            op.imm.s = static_cast<int64_t>(uv);
+        }
         ++ti;
     }
 
@@ -5751,13 +6022,38 @@ json tool_xray(const json& args) {
     }
 
     if (action == "apihash") {
+        std::string algo = args.value("algorithm", std::string{"ror13"});
+        if (algo != "ror13" && algo != "djb2" && algo != "crc32" &&
+            algo != "fnv1a" && algo != "sdbm")
+            fail("bad algorithm (ror13|djb2|crc32|fnv1a|sdbm)");
+        // Accept both integer hashes ("0x..."/decimal/number) and plain API
+        // names ("LoadLibraryA", "kernel32!CreateFileW"). Names are hashed
+        // with the requested algorithm so callers never need to pre-hash.
         std::vector<uint64_t> hashes;
-        auto push_hash = [](std::vector<uint64_t>& v, const json& h) {
-            if (h.is_string()) v.push_back(std::stoull(h.get<std::string>(), nullptr, 0));
-            else if (h.is_number_unsigned()) v.push_back(h.get<uint64_t>());
+        json name_echo = json::array();
+        auto push_hash = [&](std::vector<uint64_t>& v, const json& h) {
+            if (h.is_string()) {
+                const std::string s = h.get<std::string>();
+                try {
+                    size_t pos = 0;
+                    const uint64_t num = std::stoull(s, &pos, 0);
+                    if (pos == s.size()) {
+                        v.push_back(num);
+                        return;
+                    }
+                } catch (...) {}
+                // not numeric: treat as an API name
+                const uint32_t hv = xray::hash_api(s, algo, s.find('!') != std::string::npos);
+                v.push_back(hv);
+                name_echo.push_back({{"name", s}, {"hash", hv}});
+                return;
+            }
+            if (h.is_number_unsigned()) v.push_back(h.get<uint64_t>());
             else if (h.is_number_integer() && h.get<int64_t>() >= 0)
                 v.push_back(static_cast<uint64_t>(h.get<int64_t>()));
-            else fail("bad hash value");
+            else if (h.is_number_float())
+                v.push_back(static_cast<uint64_t>(h.get<double>()));
+            else fail("bad hash value (string name, hex, or integer)");
         };
         if (args.contains("hashes") && args.at("hashes").is_array())
             for (const auto& h : args.at("hashes")) push_hash(hashes, h);
@@ -5765,11 +6061,7 @@ json tool_xray(const json& args) {
             if (!args.contains("hash")) fail("missing hash/hashes");
             push_hash(hashes, args.at("hash"));
         }
-        std::string algo = args.value("algorithm", std::string{"ror13"});
         auto hits = xray::resolve_api_hashes(img, hashes, algo);
-        if (algo != "ror13" && algo != "djb2" && algo != "crc32" &&
-            algo != "fnv1a" && algo != "sdbm")
-            fail("bad algorithm (ror13|djb2|crc32|fnv1a|sdbm)");
         json arr = json::array();
         for (const auto& h : hits)
             arr.push_back({{"hash", h.hash}, {"api", h.api}, {"dll", h.dll}});
@@ -5777,19 +6069,35 @@ json tool_xray(const json& args) {
         out["total_queried"] = hashes.size();
         out["resolved_count"] = arr.size();
         out["resolved"] = arr;
+        if (!name_echo.empty()) out["name_inputs"] = name_echo;
+        if (hits.empty() && !hashes.empty())
+            out["hint"] = "no import matched; pass algorithm=ror13|djb2|crc32|fnv1a|sdbm "
+                          "matching the sample, or pass plain API names (they are hashed for you)";
         return out;
     }
 
     if (action == "entropy" || action == "pages" || action == "crypto_range") {
-        const uint64_t va = parse_addr(args, "addr");
-        const size_t size = args.contains("size")
-            ? static_cast<size_t>(parse_addr(args, "size")) : 4096;
+        // accept base/va/address aliases: agents naturally say base=
+        const uint64_t va = parse_addr_alias(args, {"addr", "base", "va", "address"});
+        const size_t size = has_any(args, {"size", "len", "length"})
+            ? static_cast<size_t>(parse_addr_alias(args, {"size", "len", "length"})) : 4096;
 
         if (action == "entropy") {
-            const size_t window = args.contains("window_size")
-                ? static_cast<size_t>(parse_addr(args, "window_size")) : 256;
-            // honor a limit, zero means summary only
-            const size_t win_limit = args.value("window_limit", size_t{64});
+            const size_t window = has_any(args, {"window_size", "window"})
+                ? static_cast<size_t>(parse_addr_alias(args, {"window_size", "window"})) : 256;
+            // honor limit as well as window_limit (zero means summary only)
+            size_t win_limit = args.value("window_limit", size_t{64});
+            if (args.contains("limit") && !args.contains("window_limit")) {
+                const json& lv = args.at("limit");
+                if (lv.is_number_unsigned()) win_limit = lv.get<size_t>();
+                else if (lv.is_number_integer() && lv.get<int64_t>() >= 0)
+                    win_limit = static_cast<size_t>(lv.get<int64_t>());
+                else if (lv.is_string()) {
+                    try { win_limit = static_cast<size_t>(std::stoull(lv.get<std::string>(), nullptr, 0)); }
+                    catch (...) {}
+                }
+            }
+            win_limit = std::min(win_limit, size_t{4096});
             auto r = xray::entropy_scan(img, va, size, window);
             out["overall_entropy"] = r.overall;
             out["min_window_entropy"] = r.min_window;
@@ -5810,8 +6118,9 @@ json tool_xray(const json& args) {
             return out;
         }
         if (action == "pages") {
-            const size_t ps = args.contains("page_size")
-                ? static_cast<size_t>(parse_addr(args, "page_size")) : 4096;
+            const size_t ps = has_any(args, {"page_size", "window_size", "window"})
+                ? static_cast<size_t>(parse_addr_alias(args, {"page_size", "window_size", "window"})) : 4096;
+            const size_t page_limit = std::min<size_t>(args.value("limit", 1024u), 10000u);
             auto pages = xray::classify_pages(img, va, size, ps);
             json arr = json::array();
             json summary = {{"code", 0}, {"data", 0}, {"encrypted", 0},
@@ -5819,7 +6128,8 @@ json tool_xray(const json& args) {
             auto bump = [&summary](const char* k) {
                 summary[k] = summary[k].get<int>() + 1;
             };
-            for (const auto& p : pages) {
+            for (size_t i = 0; i < pages.size() && arr.size() < page_limit; ++i) {
+                const auto& p = pages[i];
                 arr.push_back({{"address", p.address}, {"size", p.size},
                                {"class", p.klass}, {"entropy", p.entropy},
                                {"insn_ratio", p.insn_ratio},
@@ -5836,6 +6146,8 @@ json tool_xray(const json& args) {
             out["total_pages"] = pages.size();
             out["summary"] = summary;
             out["pages"] = arr;
+            out["count"] = arr.size();
+            out["truncated"] = pages.size() > arr.size();
             return out;
         }
         // crypto_range
@@ -6340,7 +6652,7 @@ json tool_devirt(const json& args) {
     // read only deobfuscation analysis
 
     if (action == "recover_cfg") {
-        const uint64_t fn_va = parse_addr(args, "addr");
+        const uint64_t fn_va = parse_addr_alias(args, {"addr", "entry", "va", "start", "address"});
         const size_t runs = static_cast<size_t>(args.value("runs", 4));
         auto r = recover::recover_flattened(img, fn_va, runs);
         if (!r.ok) fail(r.error);
@@ -6362,11 +6674,11 @@ json tool_devirt(const json& args) {
     }
 
     if (action == "prove_predicates") {
-        const uint64_t fn_va = parse_addr(args, "addr");
+        const uint64_t fn_va = parse_addr_alias(args, {"addr", "entry", "va", "start", "address"});
         const size_t runs = static_cast<size_t>(args.value("runs", 4));
-        auto proofs = recover::prove_predicates(img, fn_va, runs);
+        auto batch = recover::prove_predicates_ex(img, fn_va, runs);
         json arr = json::array();
-        for (const auto& p : proofs)
+        for (const auto& p : batch.proofs)
             arr.push_back({{"jcc_va", p.jcc_va}, {"text", p.text},
                            {"static_idiom", p.static_idiom},
                            {"seen_runs", p.seen_runs},
@@ -6376,11 +6688,23 @@ json tool_devirt(const json& args) {
                            {"proven_never_taken", p.proven_never_taken}});
         out["predicates"] = arr;
         out["count"] = arr.size();
+        out["completed_runs"] = batch.completed_runs;
+        out["failed_runs"] = batch.failed_runs;
+        out["faulted_runs"] = batch.faulted_runs;
+        if (!batch.first_fault.empty()) out["first_fault"] = batch.first_fault;
+        if (batch.failed_runs > 0 || batch.faulted_runs > 0)
+            out["note"] = "slice emulation faulted on " +
+                          std::to_string(batch.failed_runs + batch.faulted_runs) +
+                          "/" + std::to_string(runs) + " runs (" +
+                          batch.first_fault + "); seen_runs counts observations "
+                          "from usable trace prefixes, so seen=0 with faults "
+                          "means the branch was never reached (unmapped "
+                          "callee/import in the slice), not that it is opaque";
         return out;
     }
 
     if (action == "invariants") {
-        const uint64_t fn_va = parse_addr(args, "addr");
+        const uint64_t fn_va = parse_addr_alias(args, {"addr", "entry", "va", "start", "address"});
         const size_t runs = static_cast<size_t>(args.value("runs", 4));
         auto r = recover::observe_invariants(img, fn_va, runs);
         if (!r.ok) fail(r.error);
@@ -6394,10 +6718,10 @@ json tool_devirt(const json& args) {
     }
 
     if (action == "iat_audit") {
-        uint64_t va = args.contains("addr")
-            ? parse_addr(args, "addr") : 0;
-        size_t size = args.contains("size")
-            ? static_cast<size_t>(parse_addr(args, "size")) : (1u << 20);
+        uint64_t va = has_any(args, {"addr", "va", "table", "handler_table"})
+            ? parse_addr_alias(args, {"addr", "va", "table", "handler_table"}) : 0;
+        size_t size = has_any(args, {"size", "len", "length"})
+            ? static_cast<size_t>(parse_addr_alias(args, {"size", "len", "length"})) : (1u << 20);
         auto r = recover::iat_audit(img, va, size);
         if (!r.ok) fail(r.error);
         out["slots_scanned"] = r.slots_scanned;
@@ -6408,13 +6732,17 @@ json tool_devirt(const json& args) {
         for (const auto& s : r.unnamed)
             slots.push_back({{"slot_va", s.slot_va}, {"target", s.target}});
         out["unnamed_candidates"] = slots;
+        out["note"] = r.note.empty()
+            ? "default (no addr) audits parsed IAT slots only; pass addr+size "
+              "for a targeted range (only image-VA-shaped values count)"
+            : r.note;
         return out;
     }
 
     // devirtualization chain
 
     if (action == "identify") {
-        auto r = devirt::identify(img, parse_addr(args, "addr"));
+        auto r = devirt::identify(img, parse_addr_alias(args, {"addr", "entry", "va", "start", "address"}));
         if (!r.ok) fail(r.error);
         out["likely_vm"] = r.likely_vm;
         out["confidence_pct"] = r.confidence_pct;
@@ -6428,9 +6756,10 @@ json tool_devirt(const json& args) {
     }
 
     if (action == "handlers" || action == "opcode_map") {
-        const uint64_t table = parse_addr(args, "table");
-        uint32_t es = args.contains("entry_size")
-            ? static_cast<uint32_t>(parse_addr(args, "entry_size")) : 0;
+        // accept table|handler_table|addr aliases -- agents pass addr=
+        const uint64_t table = parse_addr_alias(args, {"table", "handler_table", "addr", "va", "address"});
+        uint32_t es = has_any(args, {"entry_size", "stride"})
+            ? static_cast<uint32_t>(parse_addr_alias(args, {"entry_size", "stride"})) : 0;
         const size_t maxh = std::min<size_t>(args.value("max_handlers", 256u), 4096u);
         auto r = devirt::classify_handlers(img, table, es, maxh);
         if (!r.ok) fail(r.error);
@@ -6454,27 +6783,62 @@ json tool_devirt(const json& args) {
     }
 
     if (action == "trace" || action == "lift" || action == "pseudocode") {
-        const uint64_t entry = parse_addr(args, "addr");          // VM entry
-        const uint64_t dispatcher = args.contains("dispatcher")
-            ? parse_addr(args, "dispatcher") : 0;
+        const uint64_t entry = parse_addr_alias(args, {"addr", "entry", "va", "start", "address"}); // VM entry
+        const uint64_t dispatcher = has_any(args, {"dispatcher"})
+            ? parse_addr_alias(args, {"dispatcher"}) : 0;
         const size_t max_ops = std::min<size_t>(args.value("max_ops", 512u), 4096u);
 
-        // handlers come from a table walk or a caller supplied list
+        // handlers come from a table walk, a caller supplied list, or
+        // auto-discovery via identify() when neither is given
         std::vector<uint64_t> handler_vas;
-        if (args.contains("handler_table")) {
-            uint64_t table = parse_addr(args, "handler_table");
-            uint32_t es = args.contains("entry_size")
-                ? static_cast<uint32_t>(parse_addr(args, "entry_size")) : 8;
+        if (has_any(args, {"handler_table", "table"})) {
+            uint64_t table = parse_addr_alias(args, {"handler_table", "table"});
+            uint32_t es = has_any(args, {"entry_size", "stride"})
+                ? static_cast<uint32_t>(parse_addr_alias(args, {"entry_size", "stride"})) : 8;
             auto cls = devirt::classify_handlers(img, table, es, 256);
             if (!cls.ok) fail(cls.error);
             for (const auto& h : cls.handlers) handler_vas.push_back(h.va);
             out["entry_size"] = cls.entry_size;
             out["valid_entries"] = cls.valid_entries;
         } else if (args.contains("handlers") && args.at("handlers").is_array()) {
-            for (const auto& v : args.at("handlers"))
-                handler_vas.push_back(std::stoull(v.get<std::string>(), nullptr, 0));
+            for (const auto& v : args.at("handlers")) {
+                if (v.is_string()) {
+                    const std::string s = v.get<std::string>();
+                    try {
+                        handler_vas.push_back(std::stoull(s, nullptr, 0));
+                    } catch (...) {
+                        fail("bad handlers entry '" + s + "' (hex or decimal integer)");
+                    }
+                } else if (v.is_number_unsigned()) handler_vas.push_back(v.get<uint64_t>());
+                else if (v.is_number_integer() && v.get<int64_t>() >= 0)
+                    handler_vas.push_back(static_cast<uint64_t>(v.get<int64_t>()));
+                else if (v.is_number_float())
+                    handler_vas.push_back(static_cast<uint64_t>(v.get<double>()));
+                else fail("bad handlers entry (hex string or integer)");
+            }
         } else {
-            fail("missing handler_table or handlers list");
+            // no table/list: try identify() so plain addr= works with a
+            // clear diagnostic when the function is not VM-shaped
+            auto id = devirt::identify(img, entry);
+            if (!id.ok) fail(id.error);
+            if (id.likely_vm && id.handler_table) {
+                auto cls = devirt::classify_handlers(img, id.handler_table,
+                                                     id.table_entry_size, 256);
+                if (!cls.ok)
+                    fail("auto-discovered table " + hex64(id.handler_table) +
+                         " unusable: " + cls.error + " (pass handler_table/handlers explicitly)");
+                for (const auto& h : cls.handlers) handler_vas.push_back(h.va);
+                out["auto_table"] = id.handler_table;
+                out["entry_size"] = cls.entry_size;
+                out["valid_entries"] = cls.valid_entries;
+            } else {
+                fail("missing handler_table or handlers list; identify() says " +
+                     std::string(id.likely_vm ? "likely_vm" : "not a VM function") +
+                     " (confidence " + std::to_string(id.confidence_pct) +
+                     "%). Run devirt.identify addr=<fn> first; trace/lift/pseudocode "
+                     "require a VM dispatcher (handler_table or handlers list), "
+                     "plain functions are not supported");
+            }
         }
         if (handler_vas.empty()) fail("no handlers to trace");
 
@@ -7116,17 +7480,17 @@ void list_tools(json& out) {
     const char* memory_schema =
         R"({"type":"object","properties":{"action":{"type":"string","enum":["read","write","scan","rescan","scan_state","scan_reset","aob","pointerscan","snapshot","snapshots","diff","snapshot_free","protect","alloc","free","siggen","live_crypto","watch_list","watch_add","watch_remove","watch_clear","watch_set"]},"addr":{"type":"integer"},"len":{"type":"integer"},"format":{"type":"string","enum":["hex","utf8","u8","u32","u64","f32","f64"]},"hex":{"type":"string"},"kind":{"type":"string","enum":["exact","between","bigger","smaller","unknown","increased","increased_by","increased_percent","decreased","decreased_by","decreased_percent","changed","unchanged"]},"width":{"type":"string","enum":["i8","u8","i16","u16","i32","u32","i64","u64","f32","f64","all"]},"rounding":{"type":"string","enum":["exact","rounded","truncated","extreme"]},"value":{},"value2":{},"begin":{"type":"integer"},"end":{"type":"integer"},"pattern":{"type":"string"},"tail":{"type":"string"},"writable":{"oneOf":[{"type":"string","enum":["any","include","exclude"]},{"type":"boolean"}]},"executable":{"type":"string","enum":["any","include","exclude"]},"copy_on_write":{"type":"string","enum":["any","include","exclude"]},"mem_private":{"type":"boolean"},"mem_image":{"type":"boolean"},"mem_mapped":{"type":"boolean"},"read_only":{"type":"boolean"},"no_exec":{"type":"boolean"},"threads":{"type":"integer","minimum":0,"maximum":64},"chunk_bytes":{"type":"integer","minimum":1},"max_results":{"type":"integer","minimum":1},"prot":{"type":"integer"},"target":{"type":"integer"},"depth":{"type":"integer"},"min_offset":{"type":"integer"},"max_offset":{"type":"integer"},"alignment":{"type":"integer"},"static_roots":{"type":"boolean"},"frontier_cap":{"type":"integer","minimum":1},"max_bytes":{"type":"integer"},"a":{"type":"integer"},"b":{"type":"integer"},"id":{"type":"integer"},"all":{"type":"boolean"},"limit":{"type":"integer"},"label":{"type":"string"},"freeze":{"type":"boolean"}},"required":["action"]})";
     const char* disasm_schema =
-        R"({"type":"object","properties":{"action":{"type":"string","enum":["assemble","disassemble","loaded","pe","functions","xrefs","strings","symbols","symbol_set","blocks","globals","vtables","load","unload","analyze_stop"]},"addr":{"type":"integer"},"count":{"type":"integer"},"path":{"type":"string"},"base":{"type":"integer"},"name":{"type":"string"},"text":{"type":"string"},"limit":{"type":"integer"},"min_chars":{"type":"integer"},"include_exec":{"type":"boolean"}},"required":["action"]})";
+        R"({"type":"object","properties":{"action":{"type":"string","enum":["assemble","disassemble","loaded","pe","functions","xrefs","strings","symbols","symbol_set","blocks","globals","vtables","load","unload","analyze_stop"]},"addr":{"type":"integer"},"va":{"type":"integer"},"address":{"type":"integer"},"count":{"type":"integer"},"path":{"type":"string"},"base":{"type":"integer"},"name":{"type":"string"},"text":{"type":"string"},"limit":{"type":"integer"},"min_chars":{"type":"integer"},"include_exec":{"type":"boolean"}},"required":["action"]})";
     const char* debugger_schema =
         R"({"type":"object","properties":{"action":{"type":"string","enum":["attach","detach","status","suspend_all","resume_all","bp_set","bp_clear","continue","step_into","step_over","step_out","wait_halt","regs","events","callstack","seh","set_register","watchpoint_set","watchpoint_clear","watchpoints","trace_run"]},"pid":{"type":"integer"},"addr":{"type":"integer"},"hw":{"type":"boolean"},"type":{"type":"integer"},"len":{"type":"integer"},"timeout_ms":{"type":"integer"},"condition":{"type":"string"},"log":{"type":"string"},"auto_continue":{"type":"boolean"},"one_shot":{"type":"boolean"},"max_frames":{"type":"integer"},"name":{"type":"string"},"value":{"type":"integer"},"count":{"type":"integer"}},"required":["action"]})";
     const char* driver_schema =
         R"({"type":"object","properties":{"action":{"type":"string","enum":["status","backend","kernel_modules","dump_driver","kernel_read","kernel_write","kernel_search","call","v2p","ssdt","peb","resolve_export","windows","find_references","heap_walk","heap_blocks","defer_call","defer_list","defer_execute","defer_results","defer_cancel","symbols_load","symbols_lookup","symbols_nearest","anti_debug_spoof","sandbox_protect","sandbox_unprotect","log_config","read_teb","peb_modules","integrity_checks","sniff_buffers"]},"pref":{"type":"string","enum":["auto","kernel","user"]},"pid":{"type":"integer"},"addr":{"type":"integer"},"len":{"type":"integer"},"hex":{"type":"string"},"pattern":{"type":"string"},"begin":{"type":"integer"},"end":{"type":"integer"},"a1":{"type":"integer"},"a2":{"type":"integer"},"a3":{"type":"integer"},"a4":{"type":"integer"},"name":{"type":"string"},"path":{"type":"string"},"base":{"type":"integer"},"size":{"type":"integer"},"module_base":{"type":"integer"},"value":{"type":"integer"},"kind":{"type":"string"},"id":{"type":"integer"},"limit":{"type":"integer"},"flags":{"type":"integer"},"tid":{"type":"integer"},"order":{"type":"string"},"filter":{"type":"string"},"op":{"type":"string"},"timestamp":{"type":"integer"},"thread_id":{"type":"integer"},"buffer_register":{"type":"string"},"size_register":{"type":"string"},"max_captures":{"type":"integer"},"bp_index":{"type":"integer"},"level":{"type":"integer"},"cap_mb":{"type":"integer"}},"required":["action"]})";
     const char* xray_schema =
-        R"({"type":"object","properties":{"action":{"type":"string","enum":["cfg","complexity","cff","obfuscation","strings_recon","indirect_calls","anti_analysis","hooks","syscalls","apihash","entropy","pages","crypto_range","gadgets"]},"addr":{"type":"integer"},"size":{"type":"integer"},"path":{"type":"string"},"base":{"type":"integer"},"window_size":{"type":"integer"},"window_limit":{"type":"integer"},"page_size":{"type":"integer"},"max_functions":{"type":"integer"},"hash":{"type":"integer"},"hashes":{"type":"array"},"algorithm":{"type":"string"},"limit":{"type":"integer"}},"required":["action"]})";
+        R"({"type":"object","properties":{"action":{"type":"string","enum":["cfg","complexity","cff","obfuscation","strings_recon","indirect_calls","anti_analysis","hooks","syscalls","apihash","entropy","pages","crypto_range","gadgets"]},"addr":{"type":"integer"},"va":{"type":"integer"},"address":{"type":"integer"},"size":{"type":"integer"},"len":{"type":"integer"},"length":{"type":"integer"},"path":{"type":"string"},"base":{"type":"integer"},"window_size":{"type":"integer"},"window":{"type":"integer"},"window_limit":{"type":"integer"},"page_size":{"type":"integer"},"max_functions":{"type":"integer"},"hash":{},"hashes":{"type":"array"},"algorithm":{"type":"string"},"limit":{"type":"integer"}},"required":["action"]})";
     const char* patch_schema =
         R"({"type":"object","properties":{"action":{"type":"string","enum":["nop_junk","resolve_opaque","patch_antidebug","unpack_xor","decode_strings","write_bytes","revert_all","journal","full_pass","rebuild"]},"addr":{"type":"integer"},"size":{"type":"integer"},"hex":{"type":"string"},"aggressive":{"type":"boolean"},"nop_threshold":{"type":"integer"},"dry_run":{"type":"boolean"},"method":{"type":"string"},"key_hex":{"type":"string"},"patch_api_calls":{"type":"boolean"},"patch_int_traps":{"type":"boolean"},"patch_timing":{"type":"boolean"},"limit":{"type":"integer"}},"required":["action"]})";
     const char* devirt_schema =
-        R"({"type":"object","properties":{"action":{"type":"string","enum":["themida_status","themida_start","themida_job","themida_cancel","identify","handlers","opcode_map","trace","lift","pseudocode","recover_cfg","prove_predicates","invariants","iat_audit"]},"addr":{"type":"integer"},"path":{"type":"string"},"output_path":{"type":"string"},"timeout_ms":{"type":"integer","minimum":1000,"maximum":1800000},"overwrite":{"type":"boolean"},"load":{"type":"boolean"},"id":{"type":"integer","minimum":1},"runs":{"type":"integer"},"size":{"type":"integer"},"table":{"type":"integer"},"entry_size":{"type":"integer"},"max_handlers":{"type":"integer"},"dispatcher":{"type":"integer"},"handler_table":{"type":"integer"},"handlers":{"type":"array"},"max_ops":{"type":"integer"}},"required":["action"]})";
+        R"({"type":"object","properties":{"action":{"type":"string","enum":["themida_status","themida_start","themida_job","themida_cancel","identify","handlers","opcode_map","trace","lift","pseudocode","recover_cfg","prove_predicates","invariants","iat_audit"]},"addr":{"type":"integer"},"va":{"type":"integer"},"entry":{"type":"integer"},"start":{"type":"integer"},"address":{"type":"integer"},"path":{"type":"string"},"output_path":{"type":"string"},"timeout_ms":{"type":"integer","minimum":1000,"maximum":1800000},"overwrite":{"type":"boolean"},"load":{"type":"boolean"},"id":{"type":"integer","minimum":1},"runs":{"type":"integer"},"size":{"type":"integer"},"table":{"type":"integer"},"entry_size":{"type":"integer"},"stride":{"type":"integer"},"max_handlers":{"type":"integer"},"dispatcher":{"type":"integer"},"handler_table":{"type":"integer"},"handlers":{"type":"array"},"max_ops":{"type":"integer"}},"required":["action"]})";
     const char* types_schema =
         R"({"type":"object","properties":{"action":{"type":"string","enum":["declare","create_struct","get_struct","list_structs","add_member","remove_struct","create_enum","get_enum","list_enums","remove_enum","read_field","format_at"]},"name":{"type":"string"},"decl":{"type":"string"},"filter":{"type":"string"},"field":{"type":"string"},"type":{"type":"string"},"underlying":{"type":"string"},"values":{"type":"array"},"array_count":{"type":"integer"},"addr":{"type":"integer"},"live":{"type":"boolean"},"struct":{"type":"string"},"size":{"type":"integer"}},"required":["action"]})";
     const char* notes_schema =
@@ -7134,7 +7498,7 @@ void list_tools(json& out) {
     const char* emulate_schema =
         R"({"type":"object","properties":{"action":{"type":"string","enum":["run"]},"hex":{"type":"string"},"file_addr":{"type":"integer"},"target_addr":{"type":"integer"},"code_len":{"type":"integer"},"base":{"type":"integer"},"entry":{"type":"integer"},"stack_base":{"type":"integer"},"stack_size":{"type":"integer"},"sp":{"type":"integer"},"regs":{"type":"object"},"maps":{"type":"array"},"until":{"type":"integer"},"count":{"type":"integer"},"timeout_ms":{"type":"integer"},"trace":{"type":"boolean"},"trace_max":{"type":"integer"},"taint":{"type":"array"},"watch_addr":{"type":"integer"},"watch_len":{"type":"integer"}},"required":["action"]})";
     const char* analyze_schema =
-        R"({"type":"object","properties":{"action":{"type":"string","enum":["packer","signatures","diff"]},"path":{"type":"string"},"path_a":{"type":"string"},"path_b":{"type":"string"},"limit":{"type":"integer"}},"required":["action"]})";
+        R"({"type":"object","properties":{"action":{"type":"string","enum":["packer","signatures","diff"]},"path":{"type":"string"},"path_a":{"type":"string"},"path_b":{"type":"string"},"limit":{"type":"integer"},"timeout_ms":{"type":"integer"},"max_pairs":{"type":"integer"}},"required":["action"]})";
     const char* network_schema =
         R"({"type":"object","properties":{"action":{"type":"string","enum":["status","capture_start","capture_stop","packets","dns","rules_add","rules_remove","rules_clear","stats","export_pcap","streams","stream_data","inject","mod_rule_add","mod_rule_remove","mod_rules_list","redirect_add","redirect_remove","redirect_rules_list","dns_spoof_add","dns_spoof_remove","dns_spoof_list","kill_conn","intercept_start","intercept_stop","intercept_list","intercept_release","bw_start","bw_stop","bw_stats","bw_processes","fingerprint_run","fingerprint_results","reassemble_stream","connections","deep_inspect","wfp_callouts","socket_handles","tcpip_dump","interfaces","block_ip","block_port","block_process"]},"pid":{"type":"integer"},"port":{"type":"integer"},"protocol":{"type":"integer"},"from":{"type":"integer"},"filter":{"type":"string"},"limit":{"type":"integer"},"rule_id":{"type":"integer"},"direction":{"type":["integer","string"]},"path":{"type":"string"},"max_packets":{"type":"integer"},"id":{"type":"integer"},"offset":{"type":"integer"},"len":{"type":"integer"},"payload_hex":{"type":"string"},"pattern_hex":{"type":"string"},"replacement_hex":{"type":"string"},"src_ip":{"type":"string"},"dst_ip":{"type":"string"},"match_ip":{"type":"string"},"redirect_ip":{"type":"string"},"ip":{"type":"string"},"domain":{"type":"string"},"ttl":{"type":"integer"},"hold_id":{"type":"integer"},"exclude_pid":{"type":"integer"},"window_ms":{"type":"integer"},"src_port":{"type":"integer"},"dst_port":{"type":"integer"},"module":{"type":"string"}},"required":["action"]})";
     const char* proxy_schema =
@@ -7252,6 +7616,17 @@ nlohmann::json call_tool(const std::string& name, const nlohmann::json& args,
                 return out;
             }
         }
+        // analyze.diff runs two full Hyperion analyses + a quadratic compare:
+        // it must NOT hold g_tool_mu or every lightweight tool (target.status,
+        // disasm.loaded, analyze_stop, ...) queues behind it until the MCP
+        // timeout fires. It carries its own cancel token + deadline instead.
+        if (name == "analyze" && args.value("action", std::string{}) == "diff") {
+            json out = tool_analyze(args, cancel);
+            try {
+                enrich_payload(name, args, out);
+            } catch (...) {}
+            return out;
+        }
         std::lock_guard lk(g_tool_mu);
         json out;
         bool found = true;
@@ -7263,7 +7638,7 @@ nlohmann::json call_tool(const std::string& name, const nlohmann::json& args,
         else if (name == "driver")   out = tool_driver(args);
         else if (name == "inject")   out = tool_inject(args);
         else if (name == "emulate")  out = tool_emulate(args);
-        else if (name == "analyze")  out = tool_analyze(args);
+        else if (name == "analyze")  out = tool_analyze(args, cancel);
         else if (name == "network")  out = tool_network(args);
         else if (name == "proxy")    out = tool_proxy(args);
         else if (name == "persist")  out = tool_persist(args);
@@ -7310,6 +7685,7 @@ nlohmann::json call_tool(const std::string& name, const nlohmann::json& args,
 
 void shutdown_tools() {
     std::lock_guard lk(g_tool_mu);
+    std::lock_guard ilk(g_image_mu);
     if (g_dbg) {
         g_dbg->detach();
         g_dbg.reset();

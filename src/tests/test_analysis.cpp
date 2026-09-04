@@ -130,6 +130,47 @@ TEST_CASE(packer_high_entropy_exec_section_flagged) {
     REQUIRE(entropy_hit);
 }
 
+TEST_CASE(packer_noisy_data_sections_plus_tls_stays_clean) {
+    // Regression: clean Rust-style image (.rdata/.rsrc ~7.8 entropy + TLS
+    // directory) used to score 0.2+0.2+0.1=0.50 -> packed:Unknown. Weak
+    // signals alone must not tip the verdict without a strong indicator.
+    auto bytes = slop_target_bytes();
+    auto pe = disasm::pe_parse(bytes.data(), bytes.size());
+    REQUIRE(pe.ok);
+
+    // Fill from the end so the import table (.rdata, early) survives and no
+    // spurious "no imports" signal pollutes the score.
+    int filled = 0;
+    for (auto it = pe.sections.rbegin(); it != pe.sections.rend(); ++it) {
+        const auto& sec = *it;
+        if (sec.is_executable() || sec.raw_size < 4096) continue;
+        if (static_cast<size_t>(sec.raw_offset) + sec.raw_size > bytes.size())
+            continue;
+        std::mt19937 rng(0xC0FFEE + filled);
+        for (uint32_t i = 0; i < sec.raw_size; ++i)
+            bytes[sec.raw_offset + i] = static_cast<uint8_t>(rng());
+        if (++filled == 2) break;
+    }
+    REQUIRE_EQ(filled, 2);
+
+    // Set a TLS directory size (weak signal, normal in Rust/MSVC CRT)
+    {
+        const uint32_t e_lfanew =
+            *reinterpret_cast<const uint32_t*>(bytes.data() + 0x3C);
+        const size_t oh = e_lfanew + 4 + 20;
+        const size_t tls_size_off = oh + 112 + 9 * 8 + 4;
+        REQUIRE_LT(tls_size_off + 4, bytes.size());
+        const uint32_t tls_size = 0x18;
+        std::memcpy(bytes.data() + tls_size_off, &tls_size, 4);
+    }
+
+    auto reparsed = disasm::pe_parse(bytes.data(), bytes.size());
+    REQUIRE(reparsed.ok);
+    auto v = packer_analyze(reparsed, bytes);
+    REQUIRE(!v.packed);
+    REQUIRE(v.family.empty());
+}
+
 TEST_CASE(crypto_hunt_finds_planted_aes_sbox) {
     auto bytes = slop_target_bytes();
     auto pe = disasm::pe_parse(bytes.data(), bytes.size());

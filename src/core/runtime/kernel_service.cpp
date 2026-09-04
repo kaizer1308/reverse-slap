@@ -43,9 +43,15 @@ voyager::device_t* kernel_device_ready(std::string* error) {
 }
 
 std::string module_name_from_path(const std::wstring& path) {
+    // GetDeviceDriverBaseNameW already returns a bare name ("ntoskrnl.exe",
+    // no slashes); the old code returned "" for exactly that case.
     const size_t slash = path.find_last_of(L"\\/");
-    return slash == std::wstring::npos ? std::string()
-           : std::string(path.begin() + slash + 1, path.end());
+    std::wstring leaf = (slash == std::wstring::npos)
+        ? path : path.substr(slash + 1);
+    std::string out;
+    out.reserve(leaf.size());
+    for (wchar_t c : leaf) out.push_back(static_cast<char>(c));
+    return out;
 }
 
 } // namespace
