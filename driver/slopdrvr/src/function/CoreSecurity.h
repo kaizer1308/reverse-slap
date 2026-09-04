@@ -65,27 +65,45 @@ namespace service_identity {
 
 namespace caller_validation {
 
+    // Registered-client tracking is REFERENCE COUNTED per open device
+    // handle. The old single-slot registry let one handle's close wipe the
+    // client status of every other live handle from the same pid: open A,
+    // open B, close B, and A's subsequent IOCTLs lost the registered-client
+    // bypass (the sandbox gate then denied a client that was still
+    // attached). CREATE bumps the refcount, CLOSE drops it, the pid stays
+    // registered while any handle remains.
     inline volatile HANDLE g_registered_client_pid = nullptr;
+    inline volatile LONG g_client_handle_refs = 0;
 
     __forceinline BOOLEAN register_client() {
         HANDLE pid = PsGetCurrentProcessId();
         _InterlockedExchangePointer(
             reinterpret_cast<volatile PVOID*>(&g_registered_client_pid), pid);
-        SD_LOG("CLIENT_REGISTER pid=%llu",
-            static_cast<UINT64>(reinterpret_cast<ULONG_PTR>(pid)));
+        const LONG refs = _InterlockedIncrement(&g_client_handle_refs);
+        SD_LOG("CLIENT_REGISTER pid=%llu refs=%ld",
+            static_cast<UINT64>(reinterpret_cast<ULONG_PTR>(pid)), refs);
         return TRUE;
     }
 
     __forceinline void unregister_client() {
-        HANDLE prev = reinterpret_cast<HANDLE>(_InterlockedExchangePointer(
-            reinterpret_cast<volatile PVOID*>(&g_registered_client_pid), nullptr));
-        if (prev != nullptr) {
-            SD_LOG("CLIENT_UNREGISTER pid=%llu",
-                static_cast<UINT64>(reinterpret_cast<ULONG_PTR>(prev)));
+        const LONG refs = _InterlockedDecrement(&g_client_handle_refs);
+        if (refs <= 0) {
+            _InterlockedExchange(&g_client_handle_refs, 0);
+            HANDLE prev = reinterpret_cast<HANDLE>(_InterlockedExchangePointer(
+                reinterpret_cast<volatile PVOID*>(&g_registered_client_pid), nullptr));
+            if (prev != nullptr) {
+                SD_LOG("CLIENT_UNREGISTER pid=%llu refs=0",
+                    static_cast<UINT64>(reinterpret_cast<ULONG_PTR>(prev)));
+            }
+        } else {
+            SD_LOG("CLIENT_CLOSE_KEEP pid=%llu refs=%ld",
+                static_cast<UINT64>(reinterpret_cast<ULONG_PTR>(PsGetCurrentProcessId())),
+                refs);
         }
     }
 
     __forceinline BOOLEAN is_registered_client(HANDLE pid) {
-        return pid != nullptr && pid == g_registered_client_pid;
+        return pid != nullptr && pid == g_registered_client_pid &&
+               _InterlockedCompareExchange(&g_client_handle_refs, 0, 0) > 0;
     }
 }

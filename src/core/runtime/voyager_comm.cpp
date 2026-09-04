@@ -611,12 +611,18 @@ bool voyager::device_t::query_driver_identity(driver_identity& out) noexcept {
 
     out.driver_version = req.driver_version;
     out.unloading = req.unloading != 0;
-    // Length is in bytes including the NUL; clamp defensively
+    // Length is in bytes including the NUL. Zero means the driver never
+    // captured a service path (mapper/exploit loads carry no registry
+    // identity) — that is "no identity", NOT a 260-NUL fake success: the
+    // old defensive clamp produced a garbage path that request_driver_unload
+    // would feed to NtUnloadDriver.
+    if (req.service_path_len == 0) return false;
     std::size_t chars = req.service_path_len / sizeof(wchar_t);
-    if (chars == 0 || chars > 260) chars = 260;
-    if (chars > 0 && req.service_path[chars - 1] == L'\0') --chars;
+    if (chars == 0 || chars > 260) return false;
+    if (req.service_path[chars - 1] == L'\0') --chars;
+    if (chars == 0) return false;
     out.service_path.assign(req.service_path, chars);
-    return !out.service_path.empty();
+    return true;
 }
 
 bool voyager::device_t::arm_shutdown() noexcept {

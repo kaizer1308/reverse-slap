@@ -25,6 +25,8 @@ add_executable(slop_tests
     test_autoload.cpp
     test_xray.cpp
     test_magicmida.cpp
+    test_driver.cpp
+    test_driver_abi.cpp
 )
 
 # Real-world PE fixture: the built SlopTarget.exe itself
@@ -50,7 +52,7 @@ set_target_properties(slop_tests PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
 )
 
-foreach(filter IN ITEMS decomp hyperion mcp)
+foreach(filter IN ITEMS decomp hyperion mcp driver abi)
     add_test(NAME "slop_tests_${filter}" COMMAND slop_tests)
     set_tests_properties("slop_tests_${filter}" PROPERTIES
         ENVIRONMENT "SLOP_TEST_FILTER=${filter}"
