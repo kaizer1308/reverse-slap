@@ -154,6 +154,7 @@ jobs:
           ctest --test-dir build --output-on-failure
 
   # Compile the real frontend immediately, independently of native sidecars.
+  # Tests live in their own parallel ubuntu lane; this job only compiles.
   frontend-build:
     runs-on: windows-2022
     timeout-minutes: 30
@@ -190,9 +191,9 @@ jobs:
           path: app/node_modules
           key: node-v2-${{ runner.os }}-22-${{ hashFiles('app/package-lock.json') }}
 
-      - name: compile frontend (no sidecars, no installer)
+      - name: compile frontend (no sidecars, no installer, no tests)
         shell: pwsh
-        run: ./tools/build_frontend_binary.ps1
+        run: ./tools/build_frontend_binary.ps1 -SkipTests
 
       - name: sccache stats
         if: always()
@@ -206,6 +207,29 @@ jobs:
           compression-level: 0
           path: app/src-tauri/target/release/reverse-slop-ui.exe
           if-no-files-found: error
+
+  # Frontend unit tests on linux: pure node/vite, no windows toolchain needed,
+  # fully parallel with every compile lane.
+  frontend-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: setup node with npm cache
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - name: run frontend tests
+        working-directory: app
+        run: npm ci --prefer-offline --no-audit --no-fund && npm test
 
   # Only packaging waits: no Rust or C++ compilation on this job's critical path.
   frontend:
@@ -231,6 +255,12 @@ jobs:
         with:
           path: app/node_modules
           key: node-v2-${{ runner.os }}-22-${{ hashFiles('app/package-lock.json') }}
+
+      - name: cache tauri bundler tooling (NSIS)
+        uses: actions/cache@v4
+        with:
+          path: ~\AppData\Local\tauri\NSIS
+          key: tauri-nsis-v1
 
       - name: download frontend binary
         uses: actions/download-artifact@v4

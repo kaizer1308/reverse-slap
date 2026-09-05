@@ -1,5 +1,7 @@
 [CmdletBinding()]
-param()
+param(
+    [switch]$SkipTests
+)
 $ErrorActionPreference = 'Stop'
 $appDir = Join-Path (Split-Path -Parent $PSScriptRoot) 'app'
 Push-Location $appDir
@@ -14,8 +16,11 @@ try {
         & npm ci --prefer-offline --no-audit --no-fund
         if ($LASTEXITCODE -ne 0) { throw 'npm ci failed' }
     }
-    & npm test
-    if ($LASTEXITCODE -ne 0) { throw 'frontend tests failed' }
+    # CI: tests run in their own parallel lane, never on the compile path
+    if (-not $SkipTests) {
+        & npm test
+        if ($LASTEXITCODE -ne 0) { throw 'frontend tests failed' }
+    }
     & node node_modules/@tauri-apps/cli/tauri.js build --no-bundle --config $config -- --locked
     if ($LASTEXITCODE -ne 0) { throw 'frontend compilation failed' }
     if (-not (Test-Path 'src-tauri/target/release/reverse-slop-ui.exe')) {
