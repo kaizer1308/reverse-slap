@@ -6,13 +6,18 @@ param(
     [switch]$Test,
     [switch]$Full,
     [switch]$FrontendOnly,
+    [switch]$BundleOnly,
+    [switch]$FastBundle,
     [switch]$SkipDriver,
     [switch]$OnlineWebview,
     [string]$CmakeExtra = '',
-    [string]$Preset = 'ninja-msvc-release'
+    [string]$Preset = 'ninja-msvc-release',
+    [string]$Targets = ''
 )
 
 $ErrorActionPreference = 'Stop'
+if ($BundleOnly -and -not $FrontendOnly) { throw '-BundleOnly requires -FrontendOnly' }
+if ($BundleOnly -and $NoFrontend) { throw '-BundleOnly cannot be combined with -NoFrontend' }
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $logDir = Join-Path $env:TEMP "slop-build-$stamp"
@@ -92,7 +97,12 @@ $ErrorActionPreference = 'Continue'
 # `--build --preset` resolves CMakePresets.json from the *current* directory,
 # which breaks when the script runs from anywhere but the repo root, build by
 # binary dir instead (same dir the preset expands to, works from anywhere)
-& $vsCMake --build (Join-Path $repoRoot 'build') 2>&1 | ForEach-Object { "$_" } | Set-Content -LiteralPath (Join-Path $logDir 'build.log')
+$buildArgs = @('--build', (Join-Path $repoRoot 'build'))
+if ($Targets.Trim()) {
+    $buildArgs += '--target'
+    $buildArgs += $Targets.Split(',', [System.StringSplitOptions]::RemoveEmptyEntries).Trim()
+}
+& $vsCMake @buildArgs 2>&1 | ForEach-Object { "$_" } | Set-Content -LiteralPath (Join-Path $logDir 'build.log')
 Get-Content -LiteralPath (Join-Path $logDir 'build.log') | Write-Host
 $ErrorActionPreference = $prevEap
 if ($LASTEXITCODE -ne 0) { throw "build failed (exit $LASTEXITCODE), log: $(Join-Path $logDir 'build.log')" }
@@ -235,6 +245,10 @@ if (-not $NoFrontend) {
             # NSIS recompression (~1-2 min saved); local full builds keep offline.
             $bundleOverride['windows'] = @{ webviewInstallMode = @{ type = 'offlineInstaller' } }
         }
+        if ($FastBundle) {
+            if (-not $bundleOverride.ContainsKey('windows')) { $bundleOverride['windows'] = @{} }
+            $bundleOverride['windows']['nsis'] = @{ compression = 'zlib' }
+        }
         $override = @{ bundle = $bundleOverride }
         $overridePath = Join-Path $appDir 'src-tauri\tauri.build.conf.json'
         $override | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $overridePath
@@ -242,8 +256,29 @@ if (-not $NoFrontend) {
         # ErrorActionPreference=Stop kills PowerShell 5.1 as a NativeCommandError  
         # same flattening as the cmake/npm calls
         $prevEap = $ErrorActionPreference
+        $tauriCommand = 'build'
+        if ($BundleOnly) {
+            $tauriCommand = 'bundle'
+            $releaseDir = Join-Path $appDir 'src-tauri\target\release'
+            if (-not (Test-Path -LiteralPath (Join-Path $releaseDir 'reverse-slop-ui.exe'))) {
+                throw 'compiled frontend missing: download frontend-binary before -BundleOnly'
+            }
+            # Compilation deliberately has no sidecar resources. Stage the real
+            # same-run artifacts for the portable layout as well as the installer.
+            foreach ($entry in $resources.GetEnumerator()) {
+                $src = Join-Path $repoRoot ($entry.Key -replace '^(\.\./)+', '')
+                $dst = Join-Path $releaseDir $entry.Value
+                New-Item -ItemType Directory -Force -Path (Split-Path -Parent $dst) | Out-Null
+                if (Test-Path -LiteralPath $src -PathType Container) {
+                    New-Item -ItemType Directory -Force -Path $dst | Out-Null
+                    Get-ChildItem -LiteralPath $src | Copy-Item -Destination $dst -Recurse -Force
+                } else {
+                    Copy-Item -LiteralPath $src -Destination $dst -Force
+                }
+            }
+        }
         $ErrorActionPreference = 'Continue'
-        & node $tauriCli build --config $overridePath 2>&1 | ForEach-Object { "$_" } | Tee-Object -FilePath (Join-Path $logDir 'tauri.log')
+        & node $tauriCli $tauriCommand --config $overridePath 2>&1 | ForEach-Object { "$_" } | Tee-Object -FilePath (Join-Path $logDir 'tauri.log')
         $tauriExit = $LASTEXITCODE
         $ErrorActionPreference = $prevEap
         if ($tauriExit -ne 0) { throw "tauri build failed (exit $tauriExit), log: $(Join-Path $logDir 'tauri.log')" }
@@ -259,11 +294,15 @@ if (-not $NoFrontend) {
             Write-Host "==> full setup exe: $($setup.Name) ($('{0:N1}' -f ($setup.Length / 1MB)) MB)" -ForegroundColor Cyan
         }
         Write-Host '==> full installer contents:'
-        Write-Host '    app + webview (offline runtime embedded, no download at install)'
+        if ($OnlineWebview) {
+            Write-Host '    app + webview bootstrapper (downloads runtime if missing)'
+        } else {
+            Write-Host '    app + webview (offline runtime embedded, no download at install)'
+        }
         Write-Host '    engine/reverse-slop-engine.exe, slop_frida.dll, slop_mapper.exe'
         Write-Host '    engine/slopdrvr.sys (kernel driver)'
         Write-Host '    engine/tools/magicmida (themida unpacker)'
-        Write-Host '    target machine needs: nothing but windows'
+        Write-Host '    target machine needs: windows (internet if webview bootstrapper needs the runtime)'
     }
 
     # Portable layout: the exe plus the engine\ resource dir it looks for next to

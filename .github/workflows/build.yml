@@ -12,9 +12,8 @@ concurrency:
 env:
   # CI-fast Rust: local Cargo.toml keeps lto=true + codegen-units=1 for max
   # runtime perf, CI overrides for link speed (~2-4 min saved).
-  # NOTE: CARGO_INCREMENTAL lives only on the frontend job — sccache rejects
-  # it even when wrapping MSVC cl.exe (cxx/tests configure fails with
-  # "Incremental compilation is prohibited").
+  # sccache requires incremental compilation disabled in every job.
+  CARGO_INCREMENTAL: 0
   CARGO_PROFILE_RELEASE_CODEGEN_UNITS: 16
   CARGO_PROFILE_RELEASE_LTO: false
   CARGO_PROFILE_RELEASE_STRIP: true
@@ -45,14 +44,16 @@ jobs:
       - name: cache _ext (cmake deps sources)
         uses: actions/cache@v4
         with:
-          path: _ext
-          key: ext-${{ runner.os }}-${{ hashFiles('cmake/deps.cmake') }}
+          path: |
+            _ext/*-src
+            _ext/frida-devkit
+          key: ext-sources-v2-${{ runner.os }}-${{ hashFiles('cmake/deps.cmake') }}
           restore-keys: |
-            ext-${{ runner.os }}-
+            ext-sources-v2-${{ runner.os }}-
 
       - name: build cxx (no tests, no frontend)
         shell: pwsh
-        run: powershell -NoProfile -File tools\build.ps1 -NoFrontend -CmakeExtra "-DSLOP_BUILD_TESTS=OFF -DSLOP_BUILD_TEST_TARGET=OFF"
+        run: powershell -NoProfile -File tools\build.ps1 -NoFrontend -Targets "reverse-slop-engine,slop_mapper" -CmakeExtra "-DSLOP_BUILD_TESTS=OFF -DSLOP_BUILD_TEST_TARGET=OFF"
 
       - name: sccache stats
         shell: pwsh
@@ -62,6 +63,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: cxx-artifacts
+          compression-level: 0
           path: |
             build/src/engine/reverse-slop-engine.exe
             build/src/engine/slop_frida.dll
@@ -94,16 +96,16 @@ jobs:
         shell: pwsh
         run: |
           curl.exe -L -o sdksetup.exe "https://go.microsoft.com/fwlink/?linkid=2338977"
-          $p = Start-Process -FilePath ".\sdksetup.exe" -ArgumentList "/q","/norestart","/ceip","off" -Wait -PassThru
-          Write-Host "sdksetup exit code: $($p.ExitCode)"
+          $p = Start-Process -FilePath ".\sdksetup.exe" -ArgumentList "/q","/norestart","/ceip","off" -WindowStyle Hidden -Wait -PassThru
+          if ($p.ExitCode -notin @(0, 3010)) { throw "sdksetup failed: $($p.ExitCode)" }
 
       - name: install wdk 26100
         if: steps.kits-cache.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
           curl.exe -L -o wdksetup.exe "https://go.microsoft.com/fwlink/?linkid=2335869"
-          $p = Start-Process -FilePath ".\wdksetup.exe" -ArgumentList "/q","/norestart","/ceip","off" -Wait -PassThru
-          Write-Host "wdksetup exit code: $($p.ExitCode)"
+          $p = Start-Process -FilePath ".\wdksetup.exe" -ArgumentList "/q","/norestart","/ceip","off" -WindowStyle Hidden -Wait -PassThru
+          if ($p.ExitCode -notin @(0, 3010)) { throw "wdksetup failed: $($p.ExitCode)" }
 
       - name: build driver
         shell: pwsh
@@ -136,28 +138,27 @@ jobs:
       - name: cache _ext (cmake deps sources)
         uses: actions/cache@v4
         with:
-          path: _ext
-          key: ext-${{ runner.os }}-${{ hashFiles('cmake/deps.cmake') }}
+          path: |
+            _ext/*-src
+            _ext/frida-devkit
+          key: ext-sources-v2-${{ runner.os }}-${{ hashFiles('cmake/deps.cmake') }}
           restore-keys: |
-            ext-${{ runner.os }}-
+            ext-sources-v2-${{ runner.os }}-
 
       - name: build + run tests (no frontend)
         shell: pwsh
         run: |
-          powershell -NoProfile -File tools\build.ps1 -NoFrontend -CmakeExtra "-DSLOP_BUILD_TESTS=ON -DSLOP_BUILD_TEST_TARGET=ON"
+          powershell -NoProfile -File tools\build.ps1 -NoFrontend -Targets "slop_tests,slop_decomp_target_o0,slop_decomp_target_o2" -CmakeExtra "-DSLOP_BUILD_TESTS=ON -DSLOP_BUILD_TEST_TARGET=ON"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           ctest --test-dir build --output-on-failure
 
-  # Tauri bundle. Waits for cxx+driver (~3-4 min), no C++ rebuild.
-  frontend:
+  # Compile the real frontend immediately, independently of native sidecars.
+  frontend-build:
     runs-on: windows-2022
     timeout-minutes: 30
-    needs: [cxx, driver]
     permissions:
       contents: read
     env:
-      # incremental + sccache-composed: rust-cache handles target/, sccache
-      # wraps rustc for cold hits. DEBUG=0 keeps link fast (strip stays on).
-      CARGO_INCREMENTAL: 1
       RUSTC_WRAPPER: sccache
       CARGO_PROFILE_RELEASE_DEBUG: 0
     steps:
@@ -171,7 +172,7 @@ jobs:
       - name: setup node with npm cache
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
           cache-dependency-path: app/package-lock.json
 
@@ -180,14 +181,61 @@ jobs:
         with:
           workspaces: app/src-tauri -> target
           cache-on-failure: true
+          shared-key: frontend-release-v2
 
       - name: cache node_modules
         uses: actions/cache@v4
         with:
           path: app/node_modules
-          key: node-${{ runner.os }}-${{ hashFiles('app/package-lock.json') }}
-          restore-keys: |
-            node-${{ runner.os }}-
+          key: node-v2-${{ runner.os }}-22-${{ hashFiles('app/package-lock.json') }}
+
+      - name: compile frontend (no sidecars, no installer)
+        shell: pwsh
+        run: ./tools/build_frontend_binary.ps1
+
+      - name: sccache stats
+        if: always()
+        shell: pwsh
+        run: sccache --show-stats
+
+      - name: upload frontend binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-binary
+          compression-level: 0
+          path: app/src-tauri/target/release/reverse-slop-ui.exe
+          if-no-files-found: error
+
+  # Only packaging waits: no Rust or C++ compilation on this job's critical path.
+  frontend:
+    runs-on: windows-2022
+    timeout-minutes: 30
+    needs: [cxx, driver, frontend-build]
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: setup node with npm cache
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - name: cache node_modules (exact lockfile only)
+        uses: actions/cache@v4
+        with:
+          path: app/node_modules
+          key: node-v2-${{ runner.os }}-22-${{ hashFiles('app/package-lock.json') }}
+
+      - name: download frontend binary
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-binary
+          path: app/src-tauri/target/release
 
       - name: cache magicmida (unpacker zips)
         uses: actions/cache@v4
@@ -226,9 +274,9 @@ jobs:
           Copy-Item -LiteralPath (Find-Staged _staging/driver 'slopdrvr.sys') -Destination build/driver/slopdrvr.sys -Force
           Get-ChildItem build/src/engine, build/mapper, build/driver
 
-      - name: build frontend bundle (no C++ rebuild, driver pre-staged)
+      - name: bundle precompiled frontend and native artifacts
         shell: pwsh
-        run: powershell -NoProfile -File tools\build.ps1 -FrontendOnly -SkipDriver -Full -OnlineWebview
+        run: powershell -NoProfile -File tools\build.ps1 -FrontendOnly -BundleOnly -FastBundle -SkipDriver -Full -OnlineWebview
 
       - name: upload the portable app
         uses: actions/upload-artifact@v4
