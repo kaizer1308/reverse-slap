@@ -5,6 +5,7 @@
 #include "core/infra/clock.hpp"
 
 #include <atomic>
+#include <algorithm>
 #include <chrono>
 #include <condition_variable>
 #include <deque>
@@ -69,13 +70,13 @@ std::mutex                                          g_sub_mu;
 std::vector<std::weak_ptr<subscriber_t::impl_t>>    g_subs;
 
 // one sse frame, bytes can be junk so bad utf8 gets swapped not thrown
-frame_t make_frame(std::string_view type, const json& data) {
+frame_t make_frame(std::string_view type, std::string_view encoded) {
     std::string s;
-    s.reserve(64 + type.size());
+    s.reserve(16 + type.size() + encoded.size());
     s += "event: ";
     s.append(type.data(), type.size());
     s += "\ndata: ";
-    s += data.dump(-1, ' ', false, json::error_handler_t::replace);
+    s += encoded;
     s += "\n\n";
     return std::make_shared<const std::string>(std::move(s));
 }
@@ -118,9 +119,9 @@ void output(std::string_view line) {
 std::vector<output_line_t> output_since(uint64_t since) {
     std::vector<output_line_t> out;
     std::lock_guard lk(g_out_mu);
-    out.reserve(g_out.size());
-    for (const auto& l : g_out)
-        if (l.seq > since) out.push_back(l);
+    const auto first = std::upper_bound(g_out.begin(), g_out.end(), since,
+        [](uint64_t seq, const output_line_t& line) { return seq < line.seq; });
+    out.assign(first, g_out.end());
     return out;
 }
 
@@ -152,7 +153,7 @@ void publish(std::string_view type, const json& data) {
         if (g_subs.empty()) return;    // nobody listening: skip serialization
     }
     try {
-        fan_out(make_frame(type, data));
+        fan_out(make_frame(type, data.dump(-1, ' ', false, json::error_handler_t::replace)));
     } catch (...) {
         // a publish must never take down whoever called it
     }
@@ -174,7 +175,12 @@ void publish_changed(std::string_view type, const json& data) {
             it->second = encoded;
         }
     }
-    publish(type, data);
+    try {
+        // Reuse the serialization used for change detection.
+        std::lock_guard lk(g_sub_mu);
+        if (g_subs.empty()) return;
+    } catch (...) { return; }
+    try { fan_out(make_frame(type, encoded)); } catch (...) {}
 }
 
 // subscriber

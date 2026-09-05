@@ -844,6 +844,20 @@ const char* hint_for_tool_action(const std::string& tool, const std::string& act
     return nullptr;
 }
 
+bool needs_enrich_symbols(const json& value, int depth = 0) {
+    if (depth > 14) return false;
+    if (value.is_object()) {
+        for (auto it = value.begin(); it != value.end(); ++it) {
+            if (is_addr_key(it.key()) && it->is_number_integer()) return true;
+            if (needs_enrich_symbols(*it, depth + 1)) return true;
+        }
+    } else if (value.is_array() && value.size() <= 20000) {
+        for (const auto& item : value)
+            if (needs_enrich_symbols(item, depth + 1)) return true;
+    }
+    return false;
+}
+
 void enrich_payload(const std::string& tool, const json& args, json& payload) {
     try {
         if (!payload.is_object() || payload.contains("error")) return;
@@ -851,7 +865,12 @@ void enrich_payload(const std::string& tool, const json& args, json& payload) {
             (args.contains("action") && args.at("action").is_string())
                 ? args.at("action").get<std::string>()
                 : std::string{};
-        enrich_ctx_t ctx = snapshot_enrich_ctx();
+        // Log/status/control responses usually have no addresses. Avoid copying
+        // the entire loaded symbol database for those high-frequency requests.
+        const bool query_context = (tool == "xray" || tool == "decomp" || tool == "devirt") &&
+                                   args.contains("addr");
+        enrich_ctx_t ctx = (query_context || needs_enrich_symbols(payload))
+                            ? snapshot_enrich_ctx() : enrich_ctx_t{};
         enrich_json_value(payload, ctx, 0);
         // per-function context: echo queried addr + owning function + names
         try {
@@ -7818,7 +7837,7 @@ json tool_app(const json& args) {
     if (action == "diag") {
         const uint64_t since = args.value("since_revision", uint64_t{0});
         const size_t   limit = std::min<size_t>(args.value("limit", size_t{2000}), 8192);
-        auto snap = infra::diag::snapshot(since);
+        auto snap = infra::diag::snapshot(since, limit);
         json arr = json::array();
         const size_t begin = snap.entries.size() > limit ? snap.entries.size() - limit : 0;
         for (size_t i = begin; i < snap.entries.size(); ++i) {

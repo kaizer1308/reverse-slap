@@ -1,0 +1,16 @@
+{
+  "workload": "output_4096_rows_ssr",
+  "median_ms": 450.9996000000001,
+  "samples_ms": [
+    501.02030000000013,
+    450.9996000000001,
+    413.674,
+    457.7721999999999,
+    487.2899000000002,
+    441.8602000000001,
+    341.1819999999998
+  ],
+  "html_bytes": 688658,
+  "rendered_rows": 4096,
+  "note": "SSR component work only, not browser frame time or RSS"
+}

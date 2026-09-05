@@ -46,6 +46,7 @@ const kInitialHype: HypeState = {
   progress: 0,
   error: "",
 };
+let starting: Promise<void> | undefined;
 
 export const useEngine = create<EngineStore>((set) => ({
   connected: false,
@@ -55,7 +56,7 @@ export const useEngine = create<EngineStore>((set) => ({
   hype: kInitialHype,
   quitting: null,
 
-  start: async () => {
+  start: () => starting ??= (async () => {
     await resolveEndpoint();
 
     events.onConnectionChange((connected) => set({ connected }));
@@ -82,5 +83,5 @@ export const useEngine = create<EngineStore>((set) => ({
     } catch {
       // Engine not up yet; the SSE retry loop and boot.stage events cover it
     }
-  },
+  })().catch((error: unknown) => { starting = undefined; throw error; }),
 }));

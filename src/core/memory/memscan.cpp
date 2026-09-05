@@ -506,6 +506,8 @@ void scan_run(const scan_config_t& cfg, const fastscan_t& fs,
               const uint8_t* old, worker_out_t& out, scan_progress_t& prog) {
     const size_t slot = value_size(cfg.width);
     if (slot == 0) return;
+    const size_t cap = cfg.max_results ? cfg.max_results : infra::limits::max_scan_hits;
+    if (out.results.size() >= cap) { out.truncated = true; return; }
 
     const bool all = cfg.scan_all_types;
     if (len < (all ? 1 : slot)) return;
@@ -526,6 +528,7 @@ void scan_run(const scan_config_t& cfg, const fastscan_t& fs,
                 if (check_value(cfg, w, curr, prev)) {
                     out.results.push_back({addr, curr, w});
                     ++prog.found;
+                    if (out.results.size() >= cap) { out.truncated = true; return; }
                 }
             }
             ++out.slots_scanned;
@@ -537,6 +540,7 @@ void scan_run(const scan_config_t& cfg, const fastscan_t& fs,
             if (check_value(cfg, cfg.width, curr, prev)) {
                 out.results.push_back({addr, curr, cfg.width});
                 ++prog.found;
+                if (out.results.size() >= cap) { out.truncated = true; return; }
             }
         }
     }

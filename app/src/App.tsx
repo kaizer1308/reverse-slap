@@ -37,9 +37,10 @@ export default function App() {
   useEffect(() => {
     // Event handlers must be registered before connect() so the first frames
     // after the stream opens are not dropped
-    attachOutput();
-    attachWatch();
+    const detachOutput = attachOutput();
+    const detachWatch = attachWatch();
     void start();
+    return () => { detachOutput(); detachWatch(); };
   }, [start, attachOutput, attachWatch]);
 
   const leftPanel = () => {

@@ -6,6 +6,7 @@ endif()
 
 add_executable(slop_tests
     test_main.cpp
+    test_app_performance.cpp
     test_infra.cpp
     test_memory.cpp
     test_disasm.cpp
@@ -73,7 +74,7 @@ set_target_properties(slop_tests PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
 )
 
-foreach(filter IN ITEMS decomp hyperion disasm_accuracy mcp driver abi inject)
+foreach(filter IN ITEMS decomp hyperion disasm_accuracy mcp driver abi inject app_perf)
     add_test(NAME "slop_tests_${filter}" COMMAND slop_tests)
     set_tests_properties("slop_tests_${filter}" PROPERTIES
         ENVIRONMENT "SLOP_TEST_FILTER=${filter}"
@@ -96,3 +97,11 @@ if(TARGET slop_decomp_target_o0 AND TARGET slop_decomp_target_o2)
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
     )
 endif()
+
+add_executable(slop_app_bench bench_app.cpp)
+target_include_directories(slop_app_bench PRIVATE "${CMAKE_SOURCE_DIR}/src")
+target_link_libraries(slop_app_bench PRIVATE slop_core nlohmann_json::nlohmann_json)
+if(MSVC)
+    target_compile_options(slop_app_bench PRIVATE /W4 /EHsc)
+endif()
+set_target_properties(slop_app_bench PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests")

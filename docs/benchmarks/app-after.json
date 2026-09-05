@@ -1,0 +1,134 @@
+{
+  "compiler_msvc": 1942,
+  "memory_metric": "ordinary C++ requested allocation volume in separate pass; not peak RSS; excludes malloc/aligned allocations",
+  "runs": 7,
+  "schema": 1,
+  "workloads": [
+    {
+      "allocated_bytes": 1150065,
+      "allocations": 27,
+      "iterations": 1,
+      "largest_allocation_bytes": 1048615,
+      "median_ms": 0.51,
+      "name": "scan_dense_4m_cap1000",
+      "result": 66077500,
+      "samples_ms": [
+        0.7343,
+        0.5058,
+        0.5116,
+        0.6976,
+        0.5089,
+        0.4868,
+        0.51
+      ]
+    },
+    {
+      "allocated_bytes": 4195092,
+      "allocations": 19,
+      "iterations": 2,
+      "largest_allocation_bytes": 1048615,
+      "median_ms": 53.23215,
+      "name": "scan_sparse_4m",
+      "result": 4259881,
+      "samples_ms": [
+        53.23215,
+        50.932,
+        54.31255,
+        50.49395,
+        53.9014,
+        55.4309,
+        51.02055
+      ]
+    },
+    {
+      "allocated_bytes": 4135,
+      "allocations": 1,
+      "iterations": 200,
+      "largest_allocation_bytes": 4135,
+      "median_ms": 0.002484,
+      "name": "traffic_slice_4k_from_2m",
+      "result": 266240,
+      "samples_ms": [
+        0.002476,
+        0.0059775,
+        0.0025655,
+        0.0022389999999999997,
+        0.002484,
+        0.0024535,
+        0.002487
+      ]
+    },
+    {
+      "allocated_bytes": 0,
+      "allocations": 0,
+      "iterations": 1000,
+      "largest_allocation_bytes": 0,
+      "median_ms": 0.00014680000000000002,
+      "name": "output_idle_4096",
+      "result": 0,
+      "samples_ms": [
+        0.0001517,
+        0.0001529,
+        0.0001471,
+        0.0001431,
+        0.0001435,
+        0.00014680000000000002,
+        0.0001431
+      ]
+    },
+    {
+      "allocated_bytes": 66132,
+      "allocations": 25,
+      "iterations": 50,
+      "largest_allocation_bytes": 13568,
+      "median_ms": 0.076524,
+      "name": "event_changed_16k",
+      "result": 1,
+      "samples_ms": [
+        0.082204,
+        0.064132,
+        0.08942800000000001,
+        0.06961400000000001,
+        0.080034,
+        0.07538,
+        0.076524
+      ]
+    },
+    {
+      "allocated_bytes": 3016,
+      "allocations": 51,
+      "iterations": 10,
+      "largest_allocation_bytes": 528,
+      "median_ms": 0.009859999999999999,
+      "name": "output",
+      "result": 38,
+      "samples_ms": [
+        0.01086,
+        0.01012,
+        0.009859999999999999,
+        0.00978,
+        0.010190000000000001,
+        0.0097,
+        0.00944
+      ]
+    },
+    {
+      "allocated_bytes": 76897,
+      "allocations": 980,
+      "iterations": 10,
+      "largest_allocation_bytes": 7358,
+      "median_ms": 0.21178,
+      "name": "diag",
+      "result": 6089,
+      "samples_ms": [
+        0.21178,
+        0.15723,
+        0.19146000000000002,
+        0.17702,
+        0.24676,
+        0.24230999999999997,
+        0.23965
+      ]
+    }
+  ]
+}

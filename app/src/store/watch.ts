@@ -11,7 +11,7 @@ type WatchStore = {
   entries: WatchEntry[];
   values: Map<number, WatchValue>;
   attached: boolean;
-  attach: () => void;
+  attach: () => () => void;
   load: () => Promise<void>;
   add: (addr: number, width: string, label?: string) => Promise<void>;
   remove: (id: number) => Promise<void>;
@@ -26,10 +26,11 @@ export const useWatch = create<WatchStore>((set) => ({
   attached: false,
 
   attach: () => {
-    events.on("watch.list", ({ entries }) => set({ entries }));
-    events.on("watch.values", ({ attached, values }) =>
+    const offList = events.on("watch.list", ({ entries }) => set({ entries }));
+    const offValues = events.on("watch.values", ({ attached, values }) =>
       set({ attached, values: new Map(values.map((v) => [v.id, v])) }),
     );
+    return () => { offList(); offValues(); };
   },
 
   load: async () => {

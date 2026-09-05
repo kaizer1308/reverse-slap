@@ -218,14 +218,21 @@ std::optional<std::vector<uint8_t>> traffic_store_t::stream_bytes(
     std::lock_guard lk(mu_);
     for (const auto& [key, s] : streams_) {
         if (s.id != id) continue;
-        std::vector<uint8_t> merged;
-        merged.reserve(s.c2s.size() + s.s2c.size());
-        merged.insert(merged.end(), s.c2s.begin(), s.c2s.end());
-        merged.insert(merged.end(), s.s2c.begin(), s.s2c.end());
-        if (offset >= merged.size()) return std::vector<uint8_t>{};
-        const size_t take = std::min(len, merged.size() - offset);
-        return std::vector<uint8_t>(merged.begin() + offset,
-                                    merged.begin() + offset + take);
+        const size_t total = s.c2s.size() + s.s2c.size();
+        if (offset >= total) return std::vector<uint8_t>{};
+        const size_t take = std::min(len, total - offset);
+        std::vector<uint8_t> out;
+        out.reserve(take);
+        if (offset < s.c2s.size()) {
+            const size_t first = std::min(take, s.c2s.size() - offset);
+            out.insert(out.end(), s.c2s.begin() + offset, s.c2s.begin() + offset + first);
+            offset = 0;
+        } else {
+            offset -= s.c2s.size();
+        }
+        const size_t remaining = take - out.size();
+        out.insert(out.end(), s.s2c.begin() + offset, s.s2c.begin() + offset + remaining);
+        return out;
     }
     return std::nullopt;
 }

@@ -4,6 +4,8 @@
 // little tagged log ring the engines push into
 
 #include <cstdint>
+#include <cstddef>
+#include <limits>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -34,7 +36,9 @@ struct snapshot_t {
     std::vector<entry_t> entries;
     uint64_t             revision = 0;
 };
-snapshot_t snapshot(uint64_t since_revision = 0);
+// Limit selects the newest entries, without copying older discarded messages.
+snapshot_t snapshot(uint64_t since_revision = 0,
+                    size_t limit = std::numeric_limits<size_t>::max());
 
 uint64_t revision() noexcept;
 

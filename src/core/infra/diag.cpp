@@ -3,6 +3,7 @@
 #include "core/infra/limits.hpp"
 
 #include <deque>
+#include <algorithm>
 #include <mutex>
 
 namespace slop::core::infra::diag {
@@ -40,7 +41,7 @@ void log(level_t level, std::string_view tag, std::string_view message) {
     ++g_revision;
 }
 
-snapshot_t snapshot(uint64_t since_revision) {
+snapshot_t snapshot(uint64_t since_revision, size_t limit) {
     snapshot_t out;
     std::lock_guard lk(g_mu);
     out.revision = g_revision;
@@ -50,7 +51,8 @@ snapshot_t snapshot(uint64_t since_revision) {
     // count entries newer than the given revision
     const uint64_t oldest_rev = g_revision - g_ring.size();
     const uint64_t start_rev  = (since_revision > oldest_rev) ? since_revision : oldest_rev;
-    const size_t   skip       = static_cast<size_t>(start_rev - oldest_rev);
+    const size_t   skip       = std::max(static_cast<size_t>(start_rev - oldest_rev),
+                                        g_ring.size() - std::min(limit, g_ring.size()));
 
     out.entries.reserve(g_ring.size() - skip);
     for (size_t i = skip; i < g_ring.size(); ++i) {

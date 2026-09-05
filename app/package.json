@@ -8,6 +8,8 @@
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
+    "bench": "node scripts/bench-ui.mjs",
+    "test": "node scripts/test-app.mjs",
     "check:api": "node scripts/check-api.mjs",
     "icons": "node scripts/gen-icons.mjs",
     "tauri": "tauri"

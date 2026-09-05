@@ -14,7 +14,7 @@ type OutputStore = {
   lines: OutputLine[];
   revision: number;
   clear: () => Promise<void>;
-  attach: () => void;
+  attach: () => () => void;
   replayFrom: (revision: number) => Promise<void>;
 };
 
@@ -23,25 +23,27 @@ export const useOutput = create<OutputStore>((set, get) => ({
   revision: 0,
 
   attach: () => {
-    events.on("output", (line) =>
+    const offOutput = events.on("output", (line) =>
       set((s) => {
         // Out-of-order or duplicate frames (reconnect overlap) are dropped by
         // sequence rather than deduplicated by text
         if (line.seq <= s.revision) return s;
-        const lines = [...s.lines, line];
+        const lines = [...s.lines.slice(-(kMaxLines - 1)), line];
         return {
-          lines: lines.length > kMaxLines ? lines.slice(-kMaxLines) : lines,
+          lines,
           revision: line.seq,
         };
       }),
     );
 
-    events.on("output.cleared", () => set({ lines: [], revision: 0 }));
+    const offClear = events.on("output.cleared", () => set({ lines: [], revision: 0 }));
 
     // On (re)connect the engine tells us where its ring is; pull the gap
-    events.on("hello", ({ output_revision }) => {
+    const offHello = events.on("hello", ({ output_revision }) => {
+      if (output_revision < get().revision) set({ lines: [], revision: 0 });
       void get().replayFrom(get().revision > 0 ? get().revision : Math.max(0, output_revision - kMaxLines));
     });
+    return () => { offOutput(); offClear(); offHello(); };
   },
 
   replayFrom: async (revision) => {
