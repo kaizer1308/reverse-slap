@@ -148,7 +148,8 @@ jobs:
       - name: build + run tests (no frontend)
         shell: pwsh
         run: |
-          powershell -NoProfile -File tools\build.ps1 -NoFrontend -Targets "slop_tests,slop_decomp_target_o0,slop_decomp_target_o2" -CmakeExtra "-DSLOP_BUILD_TESTS=ON -DSLOP_BUILD_TEST_TARGET=ON"
+          # zlib registers its example with CTest; keep that dependency too.
+          powershell -NoProfile -File tools\build.ps1 -NoFrontend -Targets "slop_tests,slop_decomp_target_o0,slop_decomp_target_o2,example" -CmakeExtra "-DSLOP_BUILD_TESTS=ON -DSLOP_BUILD_TEST_TARGET=ON"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           ctest --test-dir build --output-on-failure
 
