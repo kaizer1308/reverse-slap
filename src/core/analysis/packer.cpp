@@ -233,10 +233,13 @@ packer_verdict_t packer_analyze(const disasm::pe_image_t& pe,
     if (entry_sec && first_exec_idx >= 0 && entry_sec_idx > first_exec_idx) {
         const bool bloated = entry_sec->virtual_size >
                              entry_sec->raw_size * 4 && entry_sec->raw_size > 0;
-        if (bloated || entropy_sampled(
-               file.data() + entry_sec->raw_offset,
-               std::min<size_t>(entry_sec->raw_size, kEntropySampleBytes)) > 6.8 ||
-           family_for_section(entry_sec->name)) {
+        const bool valid_raw = entry_sec->raw_size > 0 &&
+                               static_cast<size_t>(entry_sec->raw_offset) + entry_sec->raw_size <= file.size();
+        const double ep_ent = valid_raw
+            ? entropy_sampled(file.data() + entry_sec->raw_offset,
+                              std::min<size_t>(entry_sec->raw_size, kEntropySampleBytes))
+            : 0.0;
+        if (bloated || ep_ent > 6.8 || family_for_section(entry_sec->name)) {
             packer_detection_t d;
             d.type   = "layout";
             d.detail = "entry point inside '" + std::string(entry_sec->name) +

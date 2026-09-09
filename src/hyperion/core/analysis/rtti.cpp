@@ -17,7 +17,8 @@ namespace {
 [[maybe_unused]] const u8* va_to_ptr(PEImage& img, va_t addr, size_t* max_len = nullptr) {
     for (auto& seg : img.segments) {
         if (seg.contains(addr)) {
-            size_t off = static_cast<size_t>(addr - seg.va);
+            const size_t off = static_cast<size_t>(addr - seg.va);
+            if (off >= seg.data.size()) return nullptr;
             if (max_len) *max_len = seg.data.size() - off;
             return seg.data.data() + off;
         }

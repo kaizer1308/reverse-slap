@@ -4,9 +4,11 @@
 
 #include "harness.hpp"
 
+#include "core/analysis/packer.hpp"
 #include "core/disasm/binary_state.hpp"
 #include "core/disasm/engine.hpp"
 #include "core/disasm/function_index.hpp"
+#include "core/disasm/hyperion_session.hpp"
 #include "core/disasm/pe_parser.hpp"
 #include "core/disasm/strings.hpp"
 #include "core/disasm/xrefs.hpp"
@@ -347,4 +349,26 @@ TEST_CASE(binary_state_parallel_load_deterministic) {
         prev_last = bin.fns.functions().back().va;
         bs::unload();
     }
+}
+
+TEST_CASE(load_packed_filerecoverysrv) {
+    const char* path = R"(C:\Users\kozydot\Downloads\Compressed\FileRecoverySrvE\FileRecoverySrv.exe)";
+    std::ifstream probe(path, std::ios::binary);
+    if (!probe) return; // Skip if local fixture not present
+    probe.close();
+
+    namespace bs = slop::core::disasm::binary_state;
+    REQUIRE(bs::load_file(path));
+    const auto& bin = bs::get();
+    REQUIRE(bin.ready);
+    if (bin.hype) {
+        while (bin.hype->running()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        REQUIRE(bin.hype->ready());
+        REQUIRE(bin.hype->error().empty());
+    }
+    auto pack = slop::core::analysis::packer_analyze(bin.pe, bin.file);
+    REQUIRE(pack.packed);
+    bs::unload();
 }

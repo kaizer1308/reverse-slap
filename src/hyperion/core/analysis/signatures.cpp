@@ -428,7 +428,8 @@ bool SignatureMatcher::match_one(const u8* data, size_t len, const Signature& si
 const u8* SignatureMatcher::func_bytes(va_t addr, const PEImage& img, size_t* out_len) const {
     for (auto& seg : img.segments) {
         if (seg.contains(addr)) {
-            size_t off = static_cast<size_t>(addr - seg.va);
+            const size_t off = static_cast<size_t>(addr - seg.va);
+            if (off >= seg.data.size()) return nullptr;
             if (out_len) *out_len = seg.data.size() - off;
             return seg.data.data() + off;
         }
