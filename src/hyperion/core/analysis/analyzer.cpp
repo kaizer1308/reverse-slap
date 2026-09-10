@@ -225,6 +225,17 @@ void Analyzer::run() {
     rtti_.parse(img_, db_);
     phase("rtti_parse2");
     if (bail()) return;
+
+    // Managed (.NET/CLI) images: decode the metadata + IL and fold the methods
+    // into the DB as Functions/Insns. Cheap detect() gates this to CLI images,
+    // so native binaries pay only a data-directory probe. Runs last so the
+    // native passes never process IL as machine code.
+    if (dotnet_.detect(img_)) {
+        dotnet_.load(img_);
+        dotnet_.populate_db(db_);
+        phase("dotnet");
+    }
+    if (bail()) return;
     progress_ = 1.0f;
 
     spdlog::info("analysis: total {:.1f} ms",

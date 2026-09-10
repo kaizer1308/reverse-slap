@@ -23,6 +23,7 @@ add_executable(slop_tests
     test_module_dump.cpp
     test_decomp.cpp
     test_hyperion.cpp
+    test_dotnet.cpp
     test_detect_fs.cpp
     test_autoload.cpp
     test_xray.cpp
@@ -74,7 +75,7 @@ set_target_properties(slop_tests PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
 )
 
-foreach(filter IN ITEMS decomp hyperion disasm_accuracy mcp driver abi inject app_perf)
+foreach(filter IN ITEMS decomp hyperion dotnet disasm_accuracy mcp driver abi inject app_perf)
     add_test(NAME "slop_tests_${filter}" COMMAND slop_tests)
     set_tests_properties("slop_tests_${filter}" PROPERTIES
         ENVIRONMENT "SLOP_TEST_FILTER=${filter}"

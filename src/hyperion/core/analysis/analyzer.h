@@ -5,6 +5,7 @@
 #include "analysis_db.h"
 #include "signatures.h"
 #include "rtti.h"
+#include "core/dotnet/dotnet_disasm.h"
 #include "threading/worker_pool.h"
 #include "threading/task_scheduler.h"
 #include "threading/parallel.h"
@@ -48,6 +49,10 @@ public:
     const SignatureMatcher& sig_matcher() const { return sigmatch_; }
     RTTIParser& rtti_parser() { return rtti_; }
     const RTTIParser& rtti_parser() const { return rtti_; }
+    // Managed-code view. valid() only after run() on a CLI image; the IL
+    // methods it recovers are also folded into db() as Functions/Insns.
+    const DotNetDisassembler& dotnet() const { return dotnet_; }
+    bool is_dotnet() const { return dotnet_.valid(); }
 
 private:
     void recursive_descent();
@@ -119,6 +124,7 @@ private:
     TaskScheduler      sched_;
     SignatureMatcher   sigmatch_;
     RTTIParser         rtti_;
+    DotNetDisassembler dotnet_;
     std::atomic<float> progress_{0.f};
     std::atomic<bool>  cancel_{false};
     std::atomic<bool>  cancelled_{false};
