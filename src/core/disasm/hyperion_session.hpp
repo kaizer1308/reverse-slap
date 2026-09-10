@@ -62,6 +62,11 @@ struct session_t {
     const hype::PEImage&     image() const { return img_; }
     const hype::SignatureMatcher& signatures() const;
 
+    // Managed (.NET/CLI) view. is_dotnet() is only true after ready() on a CLI
+    // image; dotnet().image() then carries the full type/member/IL model.
+    const hype::DotNetDisassembler& dotnet() const;
+    bool                            is_dotnet() const;
+
     // Containing function (any block spans va), or exact-entry lookup
     // function_at uses an interval index built once when analysis completes
     const hype::Function* function_at(uint64_t va) const;

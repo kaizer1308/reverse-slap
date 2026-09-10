@@ -354,6 +354,9 @@ const hype::SignatureMatcher& session_t::signatures() const {
     return analyzer_->sig_matcher();
 }
 
+const hype::DotNetDisassembler& session_t::dotnet() const { return analyzer_->dotnet(); }
+bool session_t::is_dotnet() const { return analyzer_->is_dotnet(); }
+
 const hype::Function* session_t::function_entry(uint64_t va) const {
     if (!ready()) return nullptr;
     const auto& funcs = db().funcs;

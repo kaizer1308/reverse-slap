@@ -3,6 +3,7 @@
 #include <string>
 #include <vector>
 #include <array>
+#include <unordered_map>
 
 // ECMA-335 (CLI) metadata reader. Given the metadata root (the "BSJB" region a
 // managed PE points to from its CLI header) this parses the stream directory,
@@ -80,15 +81,52 @@ public:
     struct MethodDefRow{ u32 rva; u16 impl_flags; u16 flags; u32 name; u32 sig; u32 param_list; };
     struct FieldRow    { u16 flags; u32 name; u32 sig; };
     struct ParamRow    { u16 flags; u16 seq; u32 name; };
+    struct PropertyRow { u16 flags; u32 name; u32 sig; };
+    struct EventRow    { u16 flags; u32 name; u32 event_type; };  // event_type = TypeDefOrRef coded
+    struct SemanticsRow{ u16 flags; u32 method; u32 assoc; };     // assoc = HasSemantics coded
+    struct IfaceImplRow{ u32 cls; u32 iface; };                   // iface = TypeDefOrRef coded
+    struct NestedRow   { u32 nested; u32 enclosing; };            // both TypeDef rids
+    struct CustomAttrRow{ u32 parent; u32 type; };                // HasCustomAttribute / CustomAttributeType coded
 
     TypeDefRow   type_def(u32 rid) const;
     MethodDefRow method_def(u32 rid) const;
     FieldRow     field(u32 rid) const;
     ParamRow     param(u32 rid) const;
+    PropertyRow  property(u32 rid) const;
+    EventRow     event_row(u32 rid) const;
+    SemanticsRow method_semantics(u32 rid) const;
+    IfaceImplRow iface_impl(u32 rid) const;
+    NestedRow    nested_class(u32 rid) const;
+    CustomAttrRow custom_attribute(u32 rid) const;
 
-    // Declaring TypeDef rid that owns a given MethodDef / Field rid (0 if none).
+    // Declaring TypeDef rid that owns a given MethodDef / Field / Property /
+    // Event rid (0 if none). Property/Event owners come from the Property/Event
+    // Map tables, built once in compute_layout().
     u32 method_decl_type(u32 method_rid) const;
     u32 field_decl_type(u32 field_rid) const;
+    u32 property_decl_type(u32 property_rid) const;
+    u32 event_decl_type(u32 event_rid) const;
+
+    // Enclosing TypeDef rid of a nested type (0 if top-level).
+    u32 nested_enclosing(u32 type_rid) const;
+
+    // Property type (return type of a PROPERTY signature blob).
+    std::string property_type(u32 blob_off) const;
+
+    // Rendered constant literal (Constant table) for a Field/Property/Param rid,
+    // or "" when the member carries no default. `table` is mdt::Field etc.
+    std::string constant_for(u32 parent_table, u32 parent_rid) const;
+
+    // Resolved signature facts about a call/newobj target, for the C# body
+    // decompiler. Handles MethodDef / MemberRef / MethodSpec tokens.
+    struct CallInfo {
+        u32         arg_count = 0;      // signature parameter count (no `this`)
+        bool        has_this = false;
+        bool        returns_void = true;
+        std::string simple_name;        // method name only (".ctor", "WriteLine", ...)
+        std::string decl_type;          // declaring type full name
+    };
+    CallInfo call_info(u32 token) const;
 
     // ---- Name resolution -------------------------------------------------
     // token is a full 4-byte metadata token (high byte = table). These never
@@ -153,9 +191,15 @@ private:
 
     std::array<TableInfo, mdt::kCount> tables_{};
 
-    // method_rid -> owning TypeDef rid, built once in compute_layout().
+    // member_rid -> owning TypeDef rid, all built once in compute_layout().
     std::vector<u32> method_owner_;
     std::vector<u32> field_owner_;
+    std::vector<u32> property_owner_;
+    std::vector<u32> event_owner_;
+    std::vector<u32> nested_enclosing_;   // type_rid -> enclosing type rid
+
+    // (parent_table<<24 | parent_rid) -> Constant table rid, for default values.
+    std::unordered_map<u32, u32> constant_index_;
 };
 
 }

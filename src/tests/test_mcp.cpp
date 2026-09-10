@@ -150,11 +150,11 @@ TEST_CASE(mcp_ping_and_health) {
     REQUIRE_EQ(h.value("ok", false), true);
 }
 
-TEST_CASE(mcp_tools_list_twenty_three_consolidated) {
+TEST_CASE(mcp_tools_list_consolidated) {
     server_fixture_t fx;
     json res = fx.rpc("tools/list");
     const auto& tools = res.at("result").at("tools");
-    REQUIRE_EQ(tools.size(), 23u);
+    REQUIRE_EQ(tools.size(), 24u);
 
     bool seen_target = false, seen_memory = false, seen_disasm = false,
          seen_debugger = false, seen_driver = false, seen_inject = false,
@@ -163,7 +163,8 @@ TEST_CASE(mcp_tools_list_twenty_three_consolidated) {
          seen_persist = false, seen_re = false, seen_script = false,
          seen_frida = false, seen_decomp = false, seen_xray = false,
          seen_patch = false,
-         seen_types = false, seen_notes = false, seen_devirt = false;
+         seen_types = false, seen_notes = false, seen_devirt = false,
+         seen_dotnet = false;
     for (const auto& t : tools) {
         const std::string n = t.at("name").get<std::string>();
         if (n == "target")   seen_target = true;
@@ -186,6 +187,7 @@ TEST_CASE(mcp_tools_list_twenty_three_consolidated) {
         if (n == "types")    seen_types = true;
         if (n == "notes")    seen_notes = true;
         if (n == "devirt")   seen_devirt = true;
+        if (n == "dotnet")   seen_dotnet = true;
         REQUIRE(t.contains("inputSchema"));
         REQUIRE(t.contains("description"));
         REQUIRE(t.at("description").is_string());
@@ -218,6 +220,25 @@ TEST_CASE(mcp_tools_list_twenty_three_consolidated) {
     REQUIRE(seen_types);
     REQUIRE(seen_notes);
     REQUIRE(seen_devirt);
+    REQUIRE(seen_dotnet);
+}
+
+TEST_CASE(mcp_dotnet_actions_and_no_image) {
+    server_fixture_t fx;
+    bool is_error = false;
+
+    // A mistyped action enumerates the valid set for one-round-trip recovery.
+    json payload = fx.call("dotnet", {{"action", "treee"}}, is_error);
+    REQUIRE(is_error);
+    const std::string err = payload.at("error").get<std::string>();
+    REQUIRE(err.find("tree") != std::string::npos);
+    REQUIRE(err.find("method") != std::string::npos);
+
+    // With no image loaded, the guarded actions fail fast pointing at the flow.
+    is_error = false;
+    payload = fx.call("dotnet", {{"action", "status"}}, is_error);
+    REQUIRE(is_error);
+    REQUIRE(payload.at("error").get<std::string>().find("image") != std::string::npos);
 }
 
 TEST_CASE(mcp_devirt_exposes_themida_sidecars) {
@@ -1773,4 +1794,93 @@ TEST_CASE(mcp_disasm_load_unload_shared_session) {
     payload = fx.call("disasm", {{"action", "unload"}}, is_error);
     REQUIRE(!is_error);
     REQUIRE_FALSE(ds::has_binary());
+}
+
+// End-to-end over the wire: load a real managed assembly, wait for analysis,
+// then drive every dotnet action and assert the shapes an agent / the UI relies
+// on. Skips cleanly when no .NET Framework assembly is present on the machine.
+TEST_CASE(mcp_dotnet_over_loaded_managed_image) {
+    namespace ds = slop::core::disasm::binary_state;
+    const char* cands[] = {
+        R"(C:\Windows\Microsoft.NET\Framework64\v4.0.30319\sysglobl.dll)",
+        R"(C:\Windows\Microsoft.NET\Framework64\v4.0.30319\System.Configuration.dll)",
+        R"(C:\Windows\Microsoft.NET\Framework\v4.0.30319\System.Configuration.dll)",
+        R"(C:\Windows\Microsoft.NET\Framework64\v4.0.30319\mscorlib.dll)",
+    };
+    std::string path;
+    for (const char* c : cands) {
+        std::ifstream probe(c, std::ios::binary);
+        if (probe.good()) { path = c; break; }
+    }
+    if (path.empty()) return;   // no managed assembly on this box: skip
+
+    REQUIRE(ds::load_file(path));
+    REQUIRE(wait_hype_ready_mcp());
+
+    server_fixture_t fx;
+    bool is_error = false;
+
+    // status: the loaded image is recognized as managed with a populated model.
+    json st = fx.call("dotnet", {{"action", "status"}}, is_error);
+    REQUIRE(!is_error);
+    REQUIRE_EQ(st.value("managed", false), true);
+    REQUIRE_GT(st.value("types", 0u), 0u);
+    REQUIRE_GT(st.value("methods", 0u), 0u);
+    REQUIRE_GT(st.value("fields", 0u), 0u);
+
+    // tree: namespaces -> types, each carrying a resolved kind + counts.
+    json tree = fx.call("dotnet", {{"action", "tree"}}, is_error);
+    REQUIRE(!is_error);
+    REQUIRE(tree.contains("namespaces"));
+    REQUIRE_GT(tree.at("namespaces").size(), 0u);
+
+    // Walk types until one exposes a method with an IL body; exercise type,
+    // source, method and il against it.
+    uint32_t any_type = 0, body_method = 0, body_type = 0;
+    for (const auto& ns : tree.at("namespaces")) {
+        for (const auto& tnode : ns.at("types")) {
+            uint32_t tok = tnode.at("token").get<uint32_t>();
+            if (!any_type) any_type = tok;
+            json ty = fx.call("dotnet", {{"action", "type"}, {"token", tok}}, is_error);
+            REQUIRE(!is_error);
+            REQUIRE(ty.at("kind").is_string());
+            REQUIRE(ty.contains("fields"));
+            REQUIRE(ty.contains("methods"));
+            for (const auto& mm : ty.at("methods")) {
+                if (mm.value("has_body", false)) {
+                    body_method = mm.at("token").get<uint32_t>();
+                    body_type = tok;
+                    break;
+                }
+            }
+            if (body_method) break;
+        }
+        if (body_method) break;
+    }
+    REQUIRE(any_type != 0);
+
+    // source: dnSpy-style C# for a type opens a brace block.
+    json src = fx.call("dotnet",
+                       {{"action", "source"}, {"token", body_type ? body_type : any_type}},
+                       is_error);
+    REQUIRE(!is_error);
+    REQUIRE_GT(src.value("csharp", std::string{}).size(), 0u);
+    REQUIRE(src.at("csharp").get<std::string>().find('{') != std::string::npos);
+
+    // method: signature + resolved IL listing + a C# body.
+    REQUIRE(body_method != 0);
+    json m = fx.call("dotnet", {{"action", "method"}, {"token", body_method}}, is_error);
+    REQUIRE(!is_error);
+    REQUIRE(m.contains("il"));
+    REQUIRE_GT(m.at("il").size(), 0u);
+    REQUIRE_GT(m.value("signature", std::string{}).size(), 0u);
+    REQUIRE(m.at("il_text").get<std::string>().find("IL_") != std::string::npos);
+    REQUIRE(m.contains("csharp"));
+
+    // il: the whole-assembly ILDASM listing is non-empty.
+    json il = fx.call("dotnet", {{"action", "il"}}, is_error);
+    REQUIRE(!is_error);
+    REQUIRE(il.at("il_text").get<std::string>().find(".method") != std::string::npos);
+
+    ds::unload();
 }

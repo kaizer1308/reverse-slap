@@ -27,6 +27,7 @@
 #include "core/analysis/devirt.hpp"
 #include "core/analysis/magicmida.hpp"
 #include "core/disasm/hyperion_session.hpp"
+#include "core/dotnet/dotnet_decompiler.h"
 #include "core/re/type_catalog.hpp"
 
 #include "core/analysis/bindiff.h"
@@ -5653,6 +5654,346 @@ std::string assemble_one(const std::string& text, uint64_t addr,
     return "";
 }
 
+// ---- tool: dotnet ------------------------------------------------------
+// Structured view over the managed (.NET/CLI) model the analyzer builds:
+// the namespace/type/member tree, per-type and per-method detail, the IL
+// listing and the dnSpy-style C# rendering. All actions are read-only and
+// operate on the shared image; they require a managed image with completed
+// Hyperion analysis (disasm.loaded -> image.hype.ready=true).
+
+namespace {
+
+// A metadata token as both a decimal int and the conventional 8-hex-digit form.
+json token_json(uint32_t tok) {
+    return {{"token", tok}, {"token_hex", fmt::format("{:08X}", tok)}};
+}
+
+// Accept a token as an integer or a hex/decimal string ("0x06000001", "06000001", 100663297).
+uint32_t parse_token(const json& args) {
+    if (!args.contains("token")) fail("missing 'token' (a metadata token; see dotnet.tree / dotnet.type)");
+    const auto& t = args.at("token");
+    if (t.is_number_unsigned()) return t.get<uint32_t>();
+    if (t.is_number_integer())  return static_cast<uint32_t>(t.get<int64_t>());
+    if (t.is_string()) {
+        const std::string s = t.get<std::string>();
+        const bool hexish = s.rfind("0x", 0) == 0 || s.rfind("0X", 0) == 0 ||
+                            s.find_first_of("abcdefABCDEF") != std::string::npos;
+        return static_cast<uint32_t>(std::strtoul(s.c_str(), nullptr, hexish ? 16 : 10));
+    }
+    fail("'token' must be an integer or hex string");
+}
+
+const char* il_flow_name(hype::ILFlow f) {
+    switch (f) {
+    case hype::ILFlow::Branch: return "branch";
+    case hype::ILFlow::Cond:   return "cond";
+    case hype::ILFlow::Call:   return "call";
+    case hype::ILFlow::Return: return "return";
+    case hype::ILFlow::Throw:  return "throw";
+    case hype::ILFlow::Meta:   return "meta";
+    default:                   return "next";
+    }
+}
+
+// Compact member counts for a type (used by the tree without expanding it).
+json type_counts(const hype::DnType& t) {
+    return {{"fields", t.field_tokens.size()},
+            {"properties", t.property_tokens.size()},
+            {"events", t.event_tokens.size()},
+            {"methods", t.method_tokens.size()},
+            {"nested", t.nested_tokens.size()}};
+}
+
+// One node in the tree: identity + kind + counts + its nested types, recursively.
+json type_node(const hype::DnImage& im, const hype::DnType& t) {
+    json node = token_json(t.token);
+    node["name"]       = t.name;
+    node["full_name"]  = t.full_name;
+    node["kind"]       = t.kind;
+    node["visibility"] = t.visibility;
+    if (!t.base_type.empty()) node["base"] = t.base_type;
+    if (!t.interfaces.empty()) node["interfaces"] = t.interfaces;
+    node["counts"] = type_counts(t);
+    json nested = json::array();
+    for (uint32_t ntok : t.nested_tokens)
+        if (const hype::DnType* nt = im.type_by_token(ntok))
+            nested.push_back(type_node(im, *nt));
+    if (!nested.empty()) node["nested"] = std::move(nested);
+    return node;
+}
+
+// Wait (bounded, lock-free between checks) for analysis to land, then return the
+// locked binary. Fails soft so an agent can poll. Mirrors tool_decomp's guard.
+void dotnet_wait_ready() {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    for (;;) {
+        {
+            std::lock_guard lk(ds::state_mutex());
+            auto& bin0 = ds::get();
+            if (!bin0.ready) fail("no image loaded in reverse-slop (see disasm.loaded)");
+            if (!bin0.hype)  fail("hyperion engine unavailable for this image");
+            if (bin0.hype->ready()) break;
+            const std::string herr = bin0.hype->error();
+            if (!herr.empty())
+                fail("hyperion analysis not running, " + herr + " (re-run disasm.load)");
+        }
+        if (std::chrono::steady_clock::now() >= deadline)
+            fail("hyperion analysis still in progress, retry shortly (see disasm.loaded)");
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+}
+
+json method_summary(const hype::DnMethod& m) {
+    json o = token_json(m.token);
+    o["name"]       = m.name;
+    o["signature"]  = m.signature;
+    o["visibility"] = m.visibility;
+    o["ret"]        = m.ret_type;
+    o["static"]     = m.is_static;
+    if (m.is_abstract) o["abstract"] = true;
+    if (m.is_virtual)  o["virtual"]  = true;
+    if (m.is_ctor)     o["ctor"]     = true;
+    if (m.is_pinvoke)  o["pinvoke"]  = true;
+    const bool special = (m.flags & 0x0800) != 0;
+    if (special) o["special"] = true;
+    o["has_body"] = (m.rva != 0 && !m.il.empty());
+    o["il_count"] = m.il.size();
+    if (m.entry) { o["entry"] = m.entry; o["entry_hex"] = hex64(m.entry); }
+    return o;
+}
+
+} // anon
+
+json tool_dotnet(const json& args) {
+    const std::string action = require_action(args);
+    {
+        static const char* kKnown[] = {"status", "tree", "type", "method", "source", "il"};
+        const bool known = std::any_of(std::begin(kKnown), std::end(kKnown),
+                                        [&](const char* k) { return action == k; });
+        if (!known) fail("dotnet: unknown action (status|tree|type|method|source|il)");
+    }
+
+    dotnet_wait_ready();
+
+    std::lock_guard lk(ds::state_mutex());
+    auto& bin = ds::get();
+    if (!bin.ready) fail("no image loaded in reverse-slop (see disasm.loaded)");
+    if (!bin.hype)  fail("hyperion engine unavailable for this image");
+
+    if (!bin.hype->is_dotnet()) {
+        if (action == "status")
+            return {{"managed", false},
+                    {"note", "the loaded image is not a managed (.NET/CLI) assembly"}};
+        fail("the loaded image is not a managed (.NET/CLI) assembly (see dotnet.status)");
+    }
+
+    const hype::DotNetDisassembler& dn = bin.hype->dotnet();
+    const hype::DnImage& im = dn.image();
+
+    if (action == "status") {
+        return {{"managed", true},
+                {"assembly", im.assembly_name},
+                {"runtime", im.runtime_version},
+                {"cor_flags", im.cor_flags},
+                {"il_only", im.il_only},
+                {"entry_point_token", im.entry_point_token},
+                {"entry_point_token_hex", fmt::format("{:08X}", im.entry_point_token)},
+                {"types", im.types.size()},
+                {"methods", im.methods.size()},
+                {"fields", im.fields.size()},
+                {"properties", im.properties.size()},
+                {"events", im.events.size()}};
+    }
+
+    if (action == "tree") {
+        const std::string filter = args.value("filter", std::string{});
+        std::string needle = filter;
+        std::transform(needle.begin(), needle.end(), needle.begin(),
+                       [](unsigned char c) { return std::tolower(c); });
+        const size_t limit = std::min<size_t>(args.value("limit", 5000u), 50000u);
+
+        // Group top-level types by namespace; nested types nest under their parent.
+        std::map<std::string, json> by_ns;
+        size_t emitted = 0;
+        bool truncated = false;
+        for (const auto& t : im.types) {
+            if (t.enclosing != 0) continue;       // nested types render under parents
+            if (!needle.empty()) {
+                std::string hay = t.full_name;
+                std::transform(hay.begin(), hay.end(), hay.begin(),
+                               [](unsigned char c) { return std::tolower(c); });
+                if (hay.find(needle) == std::string::npos) continue;
+            }
+            if (emitted >= limit) { truncated = true; break; }
+            const std::string ns = t.ns.empty() ? "-" : t.ns;
+            if (!by_ns.count(ns)) by_ns[ns] = json::array();
+            by_ns[ns].push_back(type_node(im, t));
+            ++emitted;
+        }
+        json namespaces = json::array();
+        for (auto& [ns, types] : by_ns)
+            namespaces.push_back({{"name", ns}, {"types", std::move(types)}});
+
+        json out = {{"managed", true},
+                    {"assembly", im.assembly_name},
+                    {"runtime", im.runtime_version},
+                    {"namespaces", std::move(namespaces)},
+                    {"type_count", emitted}};
+        if (truncated) out["truncated"] = true;
+        return out;
+    }
+
+    if (action == "type") {
+        const uint32_t tok = parse_token(args);
+        const hype::DnType* tp = im.type_by_token(tok);
+        if (!tp) fail("no TypeDef for token 0x" + fmt::format("{:08X}", tok) +
+                      " (pass a 0x02xxxxxx token from dotnet.tree)");
+        const hype::DnType& t = *tp;
+
+        json fields = json::array();
+        for (uint32_t ft : t.field_tokens) {
+            const hype::DnField* f = im.field_by_token(ft);
+            if (!f) continue;
+            json o = token_json(f->token);
+            o["name"] = f->name; o["type"] = f->type;
+            o["visibility"] = f->visibility; o["static"] = f->is_static;
+            if (f->is_literal)  o["const"]    = true;
+            if (f->is_readonly) o["readonly"] = true;
+            if (!f->const_value.empty()) o["value"] = f->const_value;
+            fields.push_back(std::move(o));
+        }
+        json props = json::array();
+        for (uint32_t pt : t.property_tokens) {
+            const hype::DnProperty* p = im.property_by_token(pt);
+            if (!p) continue;
+            json o = token_json(p->token);
+            o["name"] = p->name; o["type"] = p->type;
+            o["get"] = p->getter != 0; o["set"] = p->setter != 0;
+            props.push_back(std::move(o));
+        }
+        json events = json::array();
+        for (uint32_t et : t.event_tokens) {
+            const hype::DnEvent* e = im.event_by_token(et);
+            if (!e) continue;
+            json o = token_json(e->token);
+            o["name"] = e->name; o["type"] = e->type;
+            events.push_back(std::move(o));
+        }
+        json methods = json::array();
+        for (uint32_t mt : t.method_tokens)
+            if (const hype::DnMethod* m = im.method_by_token(mt))
+                methods.push_back(method_summary(*m));
+        json nested = json::array();
+        for (uint32_t nt : t.nested_tokens)
+            if (const hype::DnType* n = im.type_by_token(nt)) {
+                json o = token_json(n->token);
+                o["name"] = n->name; o["kind"] = n->kind;
+                nested.push_back(std::move(o));
+            }
+
+        json out = token_json(t.token);
+        out["name"]       = t.name;
+        out["namespace"]  = t.ns;
+        out["full_name"]  = t.full_name;
+        out["kind"]       = t.kind;
+        out["visibility"] = t.visibility;
+        out["abstract"]   = t.is_abstract;
+        out["sealed"]     = t.is_sealed;
+        out["static"]     = t.is_static;
+        if (!t.base_type.empty())  out["base"] = t.base_type;
+        if (!t.interfaces.empty()) out["interfaces"] = t.interfaces;
+        if (!t.attributes.empty()) out["attributes"] = t.attributes;
+        out["fields"] = std::move(fields);
+        out["properties"] = std::move(props);
+        out["events"] = std::move(events);
+        out["methods"] = std::move(methods);
+        if (!nested.empty()) out["nested"] = std::move(nested);
+        return out;
+    }
+
+    if (action == "method") {
+        const uint32_t tok = parse_token(args);
+        const hype::DnMethod* mp = im.method_by_token(tok);
+        if (!mp) fail("no MethodDef for token 0x" + fmt::format("{:08X}", tok) +
+                      " (pass a 0x06xxxxxx token from dotnet.type)");
+        const hype::DnMethod& m = *mp;
+
+        json params = json::array();
+        for (const auto& p : m.params)
+            params.push_back({{"type", p.type}, {"name", p.name}});
+        json locals = json::array();
+        for (const auto& l : m.locals)
+            locals.push_back({{"index", l.index}, {"type", l.type}});
+        json handlers = json::array();
+        for (const auto& h : m.handlers)
+            handlers.push_back({{"kind", h.kind},
+                                {"try_offset", h.try_offset}, {"try_length", h.try_length},
+                                {"handler_offset", h.handler_offset},
+                                {"handler_length", h.handler_length},
+                                {"catch_type", h.catch_type}});
+        json il = json::array();
+        for (const auto& in : m.il) {
+            json o = {{"offset", in.offset},
+                      {"offset_label", fmt::format("IL_{:04X}", in.offset)},
+                      {"va", in.addr}, {"size", in.size},
+                      {"mnemonic", in.mnemonic}, {"flow", il_flow_name(in.flow)}};
+            if (!in.operand.empty()) o["operand"] = in.operand;
+            if (in.target) o["target"] = in.target;
+            if (in.token)  o["op_token_hex"] = fmt::format("{:08X}", in.token);
+            il.push_back(std::move(o));
+        }
+
+        hype::CSharpBody body = decompile_body(m, im, dn.metadata(), std::string{});
+
+        json out = token_json(m.token);
+        out["name"]        = m.name;
+        out["decl_type"]   = m.decl_type;
+        out["full_name"]   = m.full_name;
+        out["signature"]   = m.signature;
+        out["visibility"]  = m.visibility;
+        out["ret"]         = m.ret_type;
+        out["static"]      = m.is_static;
+        out["abstract"]    = m.is_abstract;
+        out["virtual"]     = m.is_virtual;
+        out["max_stack"]   = m.max_stack;
+        out["code_size"]   = m.code_size;
+        if (m.entry) { out["entry"] = m.entry; out["entry_hex"] = hex64(m.entry); }
+        out["params"]   = std::move(params);
+        out["locals"]   = std::move(locals);
+        out["handlers"] = std::move(handlers);
+        out["il"]       = std::move(il);
+        out["il_text"]  = dn.render_method(m);
+        out["csharp"]   = body.code;
+        out["csharp_structured"] = body.structured;
+        return out;
+    }
+
+    if (action == "source") {
+        const uint32_t tok = parse_token(args);
+        const hype::DnType* tp = im.type_by_token(tok);
+        if (!tp) fail("no TypeDef for token 0x" + fmt::format("{:08X}", tok) +
+                      " (pass a 0x02xxxxxx token from dotnet.tree)");
+        json out = token_json(tp->token);
+        out["full_name"] = tp->full_name;
+        out["csharp"] = dn.render_type_csharp(*tp);
+        return out;
+    }
+
+    // action == "il"
+    if (args.contains("token")) {
+        const uint32_t tok = parse_token(args);
+        const hype::DnMethod* mp = im.method_by_token(tok);
+        if (!mp) fail("no MethodDef for token 0x" + fmt::format("{:08X}", tok));
+        return {{"il_text", dn.render_method(*mp)}, token_json(mp->token)};
+    }
+    std::string all = dn.render_all();
+    bool trunc = false;
+    if (all.size() > 512 * 1024) { all.resize(512 * 1024); trunc = true; }
+    json out = {{"il_text", all}};
+    if (trunc) out["truncated"] = true;
+    return out;
+}
+
 json tool_decomp(const json& args) {
     const std::string action = require_action(args);
     if (action != "function") fail("decomp: unknown action");
@@ -7903,6 +8244,8 @@ void list_tools(json& out) {
         R"({"type":"object","properties":{"action":{"type":"string","enum":["status","devices","remote_add","remote_remove","ps","find_process","applications","frontmost","spawn","spawn_output","resume","kill","input","spawn_gating","pending_spawn","pending_children","attach","detach","session_resume","child_gating","script_create","script_load","script_unload","script_destroy","script_post","script_debugger","messages","rpc","compile","compile_script","snapshot_script"]},"device":{"type":"string"},"address":{"type":"string"},"certificate_path":{"type":"string"},"certificate_pem":{"type":"string"},"origin":{"type":"string"},"token":{"type":"string"},"keepalive_interval":{"type":"integer","minimum":-1},"scope":{"type":"string","enum":["minimal","metadata","full"]},"limit":{"type":"integer","minimum":1},"name":{"type":"string"},"program":{"type":"string"},"argv":{"type":"array","items":{"type":"string"}},"env":{"type":"array","items":{"type":"string"}},"cwd":{"type":"string"},"stdio":{"type":"string","enum":["inherit","pipe"]},"pid":{"type":"integer","minimum":1,"maximum":4294967295},"hex":{"type":"string"},"text":{"type":"string"},"enable":{"type":"boolean"},"realm":{"type":"string","enum":["native","emulated"]},"session":{"type":"string"},"source":{"type":"string"},"bytecode_b64":{"type":"string"},"snapshot_b64":{"type":"string"},"runtime":{"type":"string","enum":["default","qjs","v8"]},"load":{"type":"boolean"},"script":{"type":"string"},"message":{"type":"string"},"port":{"type":"integer","minimum":1,"maximum":65535},"method":{"type":"string"},"args":{"type":"array"},"timeout_ms":{"type":"integer","minimum":1,"maximum":25000},"entrypoint":{"type":"string"},"project_root":{"type":"string"},"include":{"type":"boolean"}},"required":["action"],"allOf":[{"if":{"properties":{"action":{"const":"remote_add"}}},"then":{"required":["address"]}},{"if":{"properties":{"action":{"const":"remote_remove"}}},"then":{"required":["address"]}},{"if":{"properties":{"action":{"const":"find_process"}}},"then":{"required":["name"]}},{"if":{"properties":{"action":{"const":"spawn"}}},"then":{"required":["program"]}},{"if":{"properties":{"action":{"enum":["spawn_output","resume","kill","input","attach"]}}},"then":{"required":["pid"]}},{"if":{"properties":{"action":{"enum":["detach","session_resume","child_gating","script_create","compile_script","snapshot_script"]}}},"then":{"required":["session"]}},{"if":{"properties":{"action":{"enum":["script_load","script_unload","script_destroy","script_post","script_debugger","messages","rpc"]}}},"then":{"required":["script"]}},{"if":{"properties":{"action":{"const":"rpc"}}},"then":{"required":["method"]}},{"if":{"properties":{"action":{"const":"compile"}}},"then":{"required":["entrypoint"]}},{"if":{"properties":{"action":{"enum":["compile_script","snapshot_script"]}}},"then":{"required":["source"]}}]})";
     const char* decomp_schema =
         R"({"type":"object","properties":{"action":{"type":"string","enum":["function"]},"addr":{"type":"integer"},"annotate_bytes":{"type":"boolean"}},"required":["action"]})";
+    const char* dotnet_schema =
+        R"({"type":"object","properties":{"action":{"type":"string","enum":["status","tree","type","method","source","il"]},"token":{"type":["integer","string"]},"filter":{"type":"string"},"limit":{"type":"integer"}},"required":["action"]})";
     const char* detect_schema =
         R"({"type":"object","properties":{"action":{"type":"string","enum":["hidden_modules","minifilters","etw_sessions","kernel_callbacks"]}},"required":["action"]})";
     const char* fs_schema =
@@ -7966,6 +8309,9 @@ void list_tools(json& out) {
     out.push_back({{"name", "decomp"},
                    {"description", "Decompile one function from the shared image. Prerequisite: call disasm.loaded and wait for image.hype.ready=true, then obtain a function-start addr from disasm.functions. action='function' returns structured C, per-line VA mappings, reconstructed stack variables, and a recovered signature after p-code lifting, SSA, optimization, type inference, and control-flow structuring. Naming priority is user symbol, Hyperion name, then sub_<rva>; RTTI and recognized STL types may appear in output. Set annotate_bytes=true to prefix emitted lines with source VAs. This tool does not accept an explicit path; load the binary first."},
                    {"inputSchema", json::parse(decomp_schema)}, {"read_only", true}});
+    out.push_back({{"name", "dotnet"},
+                   {"description", "Browse a managed (.NET/CLI) assembly the way dnSpy does, over the shared image. Prerequisite: disasm.loaded with image.hype.ready=true on a managed binary (dotnet.status reports managed=false otherwise). status returns assembly/runtime/COR flags and member counts. tree returns the namespace -> type -> nested-type hierarchy with per-type kind (class/struct/interface/enum/delegate), visibility, base, interfaces and member counts; filter is a case-insensitive substring over full type names, limit caps types. type(token) expands one TypeDef (0x02xxxxxx token) into its fields (with const values), properties (get/set), events, methods (signatures, tokens, has_body) and nested types. method(token) returns one MethodDef (0x06xxxxxx) with its C# signature, locals, exception handlers, the resolved CIL listing (il[] plus il_text), and a best-effort C# decompilation (csharp; csharp_structured flags confidence). source(token) renders a whole type as dnSpy-style C#. il returns the ILDASM-style listing for one method (token) or, with no token, the whole assembly (capped). Methods that have IL bodies also carry an entry VA that cross-links to disasm/decomp."},
+                   {"inputSchema", json::parse(dotnet_schema)}, {"read_only", true}});
     out.push_back({{"name", "detect"},
                    {"description", "Inspect local Windows security and kernel artifacts without changing them. hidden_modules cross-checks EnumDeviceDrivers against SystemModuleInformation; minifilters enumerates filesystem filters through fltlib; etw_sessions lists active trace sessions; kernel_callbacks walks notify routines through slopdrvr using build-specific anchors. The first three actions can operate without an attached target; kernel_callbacks requires a working driver and returns a structured error when unavailable."},
                    {"inputSchema", json::parse(detect_schema)}, {"read_only", true}});
@@ -8046,6 +8392,7 @@ nlohmann::json call_tool(const std::string& name, const nlohmann::json& args,
         else if (name == "re")       out = tool_re(args);
         else if (name == "script")   out = tool_script(args);
         else if (name == "decomp")   out = tool_decomp(args);
+        else if (name == "dotnet")   out = tool_dotnet(args);
         else if (name == "detect")   out = tool_detect(args);
         else if (name == "fs")       out = tool_fs(args);
         else if (name == "web")      out = tool_web(args);

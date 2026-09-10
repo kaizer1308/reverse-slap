@@ -349,6 +349,47 @@ void MetadataReader::compute_layout() {
         for (u32 m = cur.method_list; m < m_end && m <= meth_rows; ++m) method_owner_[m] = t;
         for (u32 f = cur.field_list;  f < f_end && f <= fld_rows;  ++f) field_owner_[f] = t;
     }
+
+    // property_rid / event_rid -> owning TypeDef, via the PropertyMap / EventMap
+    // ranges (each map row names a TypeDef and the first property/event it owns;
+    // the run ends where the next map row begins).
+    u32 prop_rows  = table_rows(mdt::Property);
+    u32 event_rows = table_rows(mdt::Event);
+    property_owner_.assign(prop_rows + 2, 0);
+    event_owner_.assign(event_rows + 2, 0);
+    u32 pmap_rows = table_rows(mdt::PropertyMap);
+    for (u32 i = 1; i <= pmap_rows; ++i) {
+        u32 parent = read_col(mdt::PropertyMap, i, 0);
+        u32 start  = read_col(mdt::PropertyMap, i, 1);
+        u32 end    = (i < pmap_rows) ? read_col(mdt::PropertyMap, i + 1, 1) : prop_rows + 1;
+        for (u32 p = start; p < end && p <= prop_rows; ++p) property_owner_[p] = parent;
+    }
+    u32 emap_rows = table_rows(mdt::EventMap);
+    for (u32 i = 1; i <= emap_rows; ++i) {
+        u32 parent = read_col(mdt::EventMap, i, 0);
+        u32 start  = read_col(mdt::EventMap, i, 1);
+        u32 end    = (i < emap_rows) ? read_col(mdt::EventMap, i + 1, 1) : event_rows + 1;
+        for (u32 e = start; e < end && e <= event_rows; ++e) event_owner_[e] = parent;
+    }
+
+    // nested type -> enclosing type, straight from the NestedClass table.
+    nested_enclosing_.assign(type_rows + 2, 0);
+    u32 nest_rows = table_rows(mdt::NestedClass);
+    for (u32 i = 1; i <= nest_rows; ++i) {
+        u32 nested = read_col(mdt::NestedClass, i, 0);
+        u32 encl   = read_col(mdt::NestedClass, i, 1);
+        if (nested >= 1 && nested <= type_rows) nested_enclosing_[nested] = encl;
+    }
+
+    // Constant table: index by decoded parent so a Field/Property/Param default
+    // is one map lookup rather than a per-member linear scan.
+    constant_index_.clear();
+    u32 const_rows = table_rows(mdt::Constant);
+    for (u32 i = 1; i <= const_rows; ++i) {
+        TokenRef parent = decode_coded(Coded::HasConstant, read_col(mdt::Constant, i, 1));
+        if (parent.table == 0xFFFFFFFF || parent.rid == 0) continue;
+        constant_index_[(parent.table << 24) | (parent.rid & 0x00FFFFFF)] = i;
+    }
 }
 
 u32 MetadataReader::read_col(u32 table, u32 rid, u32 col) const {
@@ -398,6 +439,37 @@ MetadataReader::ParamRow MetadataReader::param(u32 rid) const {
             read_col(mdt::Param, rid, 2)};
 }
 
+MetadataReader::PropertyRow MetadataReader::property(u32 rid) const {
+    return {static_cast<u16>(read_col(mdt::Property, rid, 0)),
+            read_col(mdt::Property, rid, 1), read_col(mdt::Property, rid, 2)};
+}
+
+MetadataReader::EventRow MetadataReader::event_row(u32 rid) const {
+    return {static_cast<u16>(read_col(mdt::Event, rid, 0)),
+            read_col(mdt::Event, rid, 1), read_col(mdt::Event, rid, 2)};
+}
+
+MetadataReader::SemanticsRow MetadataReader::method_semantics(u32 rid) const {
+    return {static_cast<u16>(read_col(mdt::MethodSemantics, rid, 0)),
+            read_col(mdt::MethodSemantics, rid, 1),
+            read_col(mdt::MethodSemantics, rid, 2)};
+}
+
+MetadataReader::IfaceImplRow MetadataReader::iface_impl(u32 rid) const {
+    return {read_col(mdt::InterfaceImpl, rid, 0),
+            read_col(mdt::InterfaceImpl, rid, 1)};
+}
+
+MetadataReader::NestedRow MetadataReader::nested_class(u32 rid) const {
+    return {read_col(mdt::NestedClass, rid, 0),
+            read_col(mdt::NestedClass, rid, 1)};
+}
+
+MetadataReader::CustomAttrRow MetadataReader::custom_attribute(u32 rid) const {
+    return {read_col(mdt::CustomAttribute, rid, 0),
+            read_col(mdt::CustomAttribute, rid, 1)};
+}
+
 std::string MetadataReader::assembly_name() const {
     // Assembly columns: HashAlgId,Major,Minor,Build,Rev,Flags,PublicKey,Name(7),Culture.
     if (!has_table(mdt::Assembly)) return {};
@@ -410,6 +482,18 @@ u32 MetadataReader::method_decl_type(u32 method_rid) const {
 
 u32 MetadataReader::field_decl_type(u32 field_rid) const {
     return field_rid < field_owner_.size() ? field_owner_[field_rid] : 0;
+}
+
+u32 MetadataReader::property_decl_type(u32 property_rid) const {
+    return property_rid < property_owner_.size() ? property_owner_[property_rid] : 0;
+}
+
+u32 MetadataReader::event_decl_type(u32 event_rid) const {
+    return event_rid < event_owner_.size() ? event_owner_[event_rid] : 0;
+}
+
+u32 MetadataReader::nested_enclosing(u32 type_rid) const {
+    return type_rid < nested_enclosing_.size() ? nested_enclosing_[type_rid] : 0;
 }
 
 // ---- Heaps --------------------------------------------------------------
@@ -746,6 +830,115 @@ std::string MetadataReader::field_type(u32 blob_off) const {
     const u8* end = p + len;
     if (p < end && *p == SIG_FIELD) ++p;   // FIELD calling convention
     return read_type(p, end);
+}
+
+std::string MetadataReader::property_type(u32 blob_off) const {
+    // PROPERTY sig: cc(0x08 [|0x20 HASTHIS]) paramCount RetType Param*  (II.23.2.5)
+    u32 len = 0;
+    const u8* p = blob_at(blob_off, len);
+    if (!p || len == 0) return "?";
+    const u8* end = p + len;
+    if (p < end) ++p;                       // calling convention byte
+    u32 pc = 0; read_compressed(p, end, pc);
+    return read_type(p, end);               // the property's own type
+}
+
+std::string MetadataReader::constant_for(u32 parent_table, u32 parent_rid) const {
+    auto it = constant_index_.find((parent_table << 24) | (parent_rid & 0x00FFFFFF));
+    if (it == constant_index_.end()) return {};
+    u32 crid = it->second;
+    u8 et = static_cast<u8>(read_col(mdt::Constant, crid, 0) & 0xFF);
+    u32 len = 0;
+    const u8* p = blob_at(read_col(mdt::Constant, crid, 2), len);
+    if (!p) return (et == ET_CLASS) ? "null" : std::string();
+    const u8* e = p + len;
+
+    auto rd_u = [&](int n) -> u64 {
+        u64 v = 0;
+        for (int i = 0; i < n && p < e; ++i) v |= static_cast<u64>(*p++) << (8 * i);
+        return v;
+    };
+    switch (et) {
+    case ET_BOOLEAN: return (len && p[0]) ? "true" : "false";
+    case ET_CHAR: {
+        u16 c = static_cast<u16>(rd_u(2));
+        if (c >= 0x20 && c < 0x7F && c != '\'' && c != '\\')
+            return fmt::format("'{}'", static_cast<char>(c));
+        return fmt::format("'\\u{:04x}'", c);
+    }
+    case ET_I1: return fmt::format("{}", static_cast<i8>(rd_u(1)));
+    case ET_U1: return fmt::format("{}", static_cast<u8>(rd_u(1)));
+    case ET_I2: return fmt::format("{}", static_cast<i16>(rd_u(2)));
+    case ET_U2: return fmt::format("{}", static_cast<u16>(rd_u(2)));
+    case ET_I4: return fmt::format("{}", static_cast<i32>(rd_u(4)));
+    case ET_U4: return fmt::format("{}", static_cast<u32>(rd_u(4)));
+    case ET_I8: return fmt::format("{}", static_cast<i64>(rd_u(8)));
+    case ET_U8: return fmt::format("{}", static_cast<u64>(rd_u(8)));
+    case ET_R4: { u32 r = static_cast<u32>(rd_u(4)); float f; std::memcpy(&f, &r, 4); return fmt::format("{}f", f); }
+    case ET_R8: { u64 r = rd_u(8); double d; std::memcpy(&d, &r, 8); return fmt::format("{}", d); }
+    case ET_STRING: {
+        std::string out = "\"";
+        for (u32 i = 0; i + 1 < len; i += 2) {
+            char16_t ch = static_cast<char16_t>(p[i] | (p[i + 1] << 8));
+            if (ch == '"') out += "\\\"";
+            else if (ch == '\\') out += "\\\\";
+            else if (ch == '\n') out += "\\n";
+            else if (ch == '\r') out += "\\r";
+            else if (ch == '\t') out += "\\t";
+            else if (ch >= 0x20 && ch < 0x7F) out += static_cast<char>(ch);
+            else out += fmt::format("\\u{:04x}", static_cast<u32>(ch));
+        }
+        return out + "\"";
+    }
+    case ET_CLASS: return "null";
+    default: return {};
+    }
+}
+
+MetadataReader::CallInfo MetadataReader::call_info(u32 token) const {
+    CallInfo ci;
+    u32 table = token >> 24;
+    u32 rid   = token & 0x00FFFFFF;
+    if (rid == 0) return ci;
+
+    auto from_sig = [&](u32 sig_blob) {
+        MethodSig s = parse_method_sig(sig_blob);
+        ci.arg_count    = static_cast<u32>(s.params.size());
+        ci.has_this     = s.has_this;
+        ci.returns_void = s.ret.empty() || s.ret == "void";
+    };
+
+    switch (table) {
+    case mdt::MethodDef: {
+        MethodDefRow mr = method_def(rid);
+        from_sig(mr.sig);
+        ci.simple_name = string_at(mr.name);
+        u32 owner = method_decl_type(rid);
+        ci.decl_type = owner ? type_name((mdt::TypeDef << 24) | owner) : std::string();
+        break;
+    }
+    case mdt::MemberRef: {
+        from_sig(read_col(mdt::MemberRef, rid, 2));
+        ci.simple_name = string_at(read_col(mdt::MemberRef, rid, 1));
+        TokenRef pr = decode_coded(Coded::MemberRefParent, read_col(mdt::MemberRef, rid, 0));
+        switch (pr.table) {
+        case mdt::TypeDef:  ci.decl_type = type_name((mdt::TypeDef << 24) | pr.rid); break;
+        case mdt::TypeRef:  ci.decl_type = type_name((mdt::TypeRef << 24) | pr.rid); break;
+        case mdt::TypeSpec: ci.decl_type = type_name((mdt::TypeSpec << 24) | pr.rid); break;
+        case mdt::ModuleRef: ci.decl_type = string_at(read_col(mdt::ModuleRef, pr.rid, 0)); break;
+        default: break;
+        }
+        break;
+    }
+    case mdt::MethodSpec: {
+        TokenRef m = decode_coded(Coded::MethodDefOrRef, read_col(mdt::MethodSpec, rid, 0));
+        u32 base_tok = (m.table == mdt::MethodDef) ? ((mdt::MethodDef << 24) | m.rid)
+                                                   : ((mdt::MemberRef << 24) | m.rid);
+        return call_info(base_tok);
+    }
+    default: break;
+    }
+    return ci;
 }
 
 }

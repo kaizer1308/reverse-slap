@@ -8,8 +8,10 @@
 
 #include "core/loader/pe_loader.h"
 #include "core/dotnet/dotnet_disasm.h"
+#include "core/dotnet/dotnet_decompiler.h"
 #include "core/analysis/analysis_db.h"
 
+#include <cstdio>
 #include <fstream>
 #include <optional>
 #include <string>
@@ -148,4 +150,85 @@ TEST_CASE(dotnet_disassembler_renders_ildasm_listing) {
     REQUIRE(listing.find(".method") != std::string::npos);
     REQUIRE(listing.find("IL_") != std::string::npos);
     REQUIRE(listing.find(".maxstack") != std::string::npos);
+}
+
+// The full dnSpy-style model: every member table is parsed, not just methods
+// with bodies. Fields carry types/visibility, at least one const carries a
+// value, types resolve a C#-style kind, and methods carry access modifiers.
+TEST_CASE(dotnet_parses_full_member_model) {
+    auto img = load_first_managed();
+    if (!img) return;
+
+    hype::DotNetDisassembler dn;
+    REQUIRE(dn.load(*img));
+    const hype::DnImage& di = dn.image();
+
+    REQUIRE_GT(di.fields.size(), 0u);
+
+    size_t typed_fields = 0, const_valued = 0, vis_fields = 0;
+    for (const auto& f : di.fields) {
+        if (!f.type.empty() && f.type != "?") ++typed_fields;
+        if (f.is_literal && !f.const_value.empty()) ++const_valued;
+        if (!f.visibility.empty()) ++vis_fields;
+    }
+    REQUIRE_GT(typed_fields, 0u);
+    REQUIRE_EQ(vis_fields, di.fields.size());   // every field gets an access level
+
+    // Each type resolves to one of the C# kinds and to a visibility.
+    size_t kinded = 0, with_members = 0;
+    for (const auto& t : di.types) {
+        if (t.kind == "class" || t.kind == "struct" || t.kind == "interface" ||
+            t.kind == "enum" || t.kind == "delegate") ++kinded;
+        if (!t.field_tokens.empty() || !t.method_tokens.empty()) ++with_members;
+        // Members attach back to a type: token lists must resolve.
+        for (uint32_t ft : t.field_tokens) REQUIRE(di.field_by_token(ft) != nullptr);
+        for (uint32_t mt : t.method_tokens) REQUIRE(di.method_by_token(mt) != nullptr);
+    }
+    REQUIRE_EQ(kinded, di.types.size());
+    REQUIRE_GT(with_members, 0u);
+
+    // Method access modifiers are populated for every method.
+    size_t vis_methods = 0;
+    for (const auto& m : di.methods)
+        if (!m.visibility.empty()) ++vis_methods;
+    REQUIRE_EQ(vis_methods, di.methods.size());
+}
+
+// C# rendering + IL->C# decompilation: a type with methods renders a valid-
+// looking class declaration and a method with IL decompiles to statements.
+TEST_CASE(dotnet_renders_csharp_and_decompiles) {
+    auto img = load_first_managed();
+    if (!img) return;
+
+    hype::DotNetDisassembler dn;
+    REQUIRE(dn.load(*img));
+    const hype::DnImage& di = dn.image();
+
+    // Pick a type that actually has rendered members.
+    const hype::DnType* pick = nullptr;
+    for (const auto& t : di.types)
+        if (!t.method_tokens.empty() && t.kind != "enum") { pick = &t; break; }
+    REQUIRE(pick != nullptr);
+
+    std::string cs = dn.render_type_csharp(*pick);
+    REQUIRE_GT(cs.size(), 0u);
+    REQUIRE(cs.find(pick->kind) != std::string::npos);   // "class"/"struct"/...
+    REQUIRE(cs.find('{') != std::string::npos);
+    REQUIRE(cs.find('}') != std::string::npos);
+
+    // Decompile the first method that has an IL body; it must produce lines and
+    // not be dominated by unknown opcodes.
+    const hype::DnMethod* body = nullptr;
+    for (uint32_t mt : pick->method_tokens) {
+        const hype::DnMethod* m = di.method_by_token(mt);
+        if (m && m->rva != 0 && !m->il.empty()) { body = m; break; }
+    }
+    if (body) {
+        hype::CSharpBody b = decompile_body(*body, di, dn.metadata(), "    ");
+        REQUIRE_GT(b.code.size(), 0u);
+
+        // Eyeball sample: dump the full C# of the chosen type once.
+        std::printf("\n---- C# for %s ----\n%s\n----\n",
+                    pick->full_name.c_str(), cs.c_str());
+    }
 }

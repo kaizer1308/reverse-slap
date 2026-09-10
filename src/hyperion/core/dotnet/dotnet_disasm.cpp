@@ -1,4 +1,5 @@
 #include "dotnet_disasm.h"
+#include "dotnet_decompiler.h"
 #include <spdlog/spdlog.h>
 #include <fmt/format.h>
 #include <cstring>
@@ -13,8 +14,61 @@ constexpr u32 kMaxTypes     = 1'000'000;
 constexpr u32 kMaxCodeSize  = 4 * 1024 * 1024;   // per-method IL byte cap
 constexpr u32 kMaxInsns     = 2'000'000;         // per-method instruction cap
 
-// TypeAttributes / MethodAttributes bits we care about (II.23.1).
-constexpr u16 kMethodStatic = 0x0010;
+// TypeAttributes / MethodAttributes / FieldAttributes bits (II.23.1).
+constexpr u16 kMethodStatic   = 0x0010;
+constexpr u16 kMethodFinal    = 0x0020;
+constexpr u16 kMethodVirtual  = 0x0040;
+constexpr u16 kMethodAbstract = 0x0400;
+constexpr u16 kMethodSpecialName = 0x0800;
+constexpr u16 kMethodRTSpecial   = 0x1000;
+constexpr u16 kMethodPInvoke  = 0x2000;
+
+constexpr u32 kTypeVisMask    = 0x00000007;
+constexpr u32 kTypeInterface  = 0x00000020;   // ClassSemantics = Interface
+constexpr u32 kTypeAbstract   = 0x00000080;
+constexpr u32 kTypeSealed     = 0x00000100;
+
+constexpr u16 kFieldStatic    = 0x0010;
+constexpr u16 kFieldInitOnly  = 0x0020;   // readonly
+constexpr u16 kFieldLiteral   = 0x0040;   // const
+
+// The member-access nibble is shared by FieldAttributes and MethodAttributes
+// (II.23.1.5 / II.23.1.10): 1=private ... 6=public.
+const char* member_access(u32 mask) {
+    switch (mask & 0x7) {
+    case 1: return "private";
+    case 2: return "protected internal";  // FamANDAssem
+    case 3: return "internal";            // Assembly
+    case 4: return "protected";           // Family
+    case 5: return "protected internal";  // FamORAssem
+    case 6: return "public";
+    default: return "private";            // 0 = CompilerControlled
+    }
+}
+
+// TypeAttributes visibility nibble (II.23.1.15).
+std::string type_visibility(u32 flags) {
+    switch (flags & kTypeVisMask) {
+    case 0: return "internal";            // NotPublic
+    case 1: return "public";
+    case 2: return "public";              // NestedPublic
+    case 3: return "private";             // NestedPrivate
+    case 4: return "protected";           // NestedFamily
+    case 5: return "internal";            // NestedAssembly
+    case 6: return "protected internal";  // NestedFamANDAssem
+    case 7: return "protected internal";  // NestedFamORAssem
+    default: return "internal";
+    }
+}
+
+// class / struct / interface / enum / delegate, from flags + base type.
+std::string type_kind(u32 flags, const std::string& base) {
+    if (flags & kTypeInterface) return "interface";
+    if (base == "System.Enum") return "enum";
+    if (base == "System.MulticastDelegate" || base == "System.Delegate") return "delegate";
+    if (base == "System.ValueType") return "struct";
+    return "class";
+}
 
 // RVA -> pointer into the mapped section bytes, with the count of bytes still
 // available in that section. Mirrors pe_loader's translation but walks the
@@ -136,13 +190,19 @@ bool DotNetDisassembler::load(const PEImage& img) {
     image_.runtime_version = md_.version();
     image_.assembly_name = md_.assembly_name();
 
-    const u32 type_rows = (std::min)(md_.table_rows(mdt::TypeDef), kMaxTypes);
-    const u32 meth_rows = (std::min)(md_.table_rows(mdt::MethodDef), kMaxMethods);
+    const u32 type_rows  = (std::min)(md_.table_rows(mdt::TypeDef), kMaxTypes);
+    const u32 meth_rows  = (std::min)(md_.table_rows(mdt::MethodDef), kMaxMethods);
+    const u32 field_rows = (std::min)(md_.table_rows(mdt::Field), kMaxTypes * 4);
+    const u32 prop_rows  = md_.table_rows(mdt::Property);
+    const u32 event_rows = md_.table_rows(mdt::Event);
 
     image_.types.reserve(type_rows);
     image_.methods.reserve(meth_rows);
+    image_.fields.reserve(field_rows);
+    image_.properties.reserve(prop_rows);
+    image_.events.reserve(event_rows);
 
-    // Build types.
+    // Build types (kind/visibility/base come now; members are attached below).
     for (u32 t = 1; t <= type_rows; ++t) {
         MetadataReader::TypeDefRow td = md_.type_def(t);
         DnType dt;
@@ -151,12 +211,125 @@ bool DotNetDisassembler::load(const PEImage& img) {
         dt.name = md_.string_at(td.name);
         dt.full_name = md_.type_name(dt.token);
         dt.flags = td.flags;
+        dt.enclosing = md_.nested_enclosing(t);
         if (td.extends) {
             MetadataReader::TokenRef ex = md_.decode_coded(
                 MetadataReader::Coded::TypeDefOrRef, td.extends);
             if (ex.rid) dt.base_type = md_.type_name((ex.table << 24) | ex.rid);
         }
+        dt.visibility  = type_visibility(td.flags);
+        dt.kind        = type_kind(td.flags, dt.base_type);
+        dt.is_abstract = (td.flags & kTypeAbstract) != 0;
+        dt.is_sealed   = (td.flags & kTypeSealed) != 0;
+        dt.is_static   = dt.is_abstract && dt.is_sealed && dt.kind == "class";
         image_.types.push_back(std::move(dt));
+    }
+
+    // Interfaces: InterfaceImpl maps class rid -> implemented interface.
+    for (u32 i = 1; i <= md_.table_rows(mdt::InterfaceImpl); ++i) {
+        MetadataReader::IfaceImplRow ii = md_.iface_impl(i);
+        if (ii.cls == 0 || ii.cls > image_.types.size()) continue;
+        MetadataReader::TokenRef r = md_.decode_coded(
+            MetadataReader::Coded::TypeDefOrRef, ii.iface);
+        if (r.rid) image_.types[ii.cls - 1].interfaces.push_back(
+            md_.type_name((r.table << 24) | r.rid));
+    }
+
+    // Nested type lists.
+    for (u32 t = 1; t <= type_rows; ++t) {
+        u32 encl = md_.nested_enclosing(t);
+        if (encl && encl <= image_.types.size())
+            image_.types[encl - 1].nested_tokens.push_back((mdt::TypeDef << 24) | t);
+    }
+
+    // Custom attributes on types (one pass; each row's parent decoded once).
+    for (u32 i = 1; i <= md_.table_rows(mdt::CustomAttribute); ++i) {
+        MetadataReader::CustomAttrRow ca = md_.custom_attribute(i);
+        MetadataReader::TokenRef parent = md_.decode_coded(
+            MetadataReader::Coded::HasCustomAttribute, ca.parent);
+        if (parent.table != mdt::TypeDef || parent.rid == 0 ||
+            parent.rid > image_.types.size()) continue;
+        auto& attrs = image_.types[parent.rid - 1].attributes;
+        if (attrs.size() >= 32) continue;
+        MetadataReader::TokenRef ctor = md_.decode_coded(
+            MetadataReader::Coded::CustomAttributeType, ca.type);
+        u32 ctor_tok = (ctor.table == mdt::MethodDef) ? ((mdt::MethodDef << 24) | ctor.rid)
+                                                      : ((mdt::MemberRef << 24) | ctor.rid);
+        std::string full = md_.method_name(ctor_tok);   // Type::.ctor
+        auto sep = full.find("::");
+        std::string tn = (sep == std::string::npos) ? full : full.substr(0, sep);
+        auto dot = tn.rfind('.');
+        std::string simple = (dot == std::string::npos) ? tn : tn.substr(dot + 1);
+        if (simple.size() > 9 && simple.compare(simple.size() - 9, 9, "Attribute") == 0)
+            simple.erase(simple.size() - 9);
+        if (!simple.empty()) attrs.push_back(simple);
+    }
+
+    // Fields.
+    for (u32 f = 1; f <= field_rows; ++f) {
+        MetadataReader::FieldRow fr = md_.field(f);
+        DnField df;
+        df.token = (mdt::Field << 24) | f;
+        df.name = md_.string_at(fr.name);
+        df.type = md_.field_type(fr.sig);
+        df.flags = fr.flags;
+        df.is_static   = (fr.flags & kFieldStatic) != 0;
+        df.is_literal  = (fr.flags & kFieldLiteral) != 0;
+        df.is_readonly = (fr.flags & kFieldInitOnly) != 0;
+        df.visibility  = member_access(fr.flags);
+        df.const_value = md_.constant_for(mdt::Field, f);
+        u32 owner = md_.field_decl_type(f);
+        if (owner && owner <= image_.types.size())
+            image_.types[owner - 1].field_tokens.push_back(df.token);
+        image_.fields.push_back(std::move(df));
+    }
+
+    // Properties + their accessor methods (via MethodSemantics).
+    for (u32 p = 1; p <= prop_rows; ++p) {
+        MetadataReader::PropertyRow pr = md_.property(p);
+        DnProperty dp;
+        dp.token = (mdt::Property << 24) | p;
+        dp.name = md_.string_at(pr.name);
+        dp.type = md_.property_type(pr.sig);
+        u32 owner = md_.property_decl_type(p);
+        if (owner && owner <= image_.types.size())
+            image_.types[owner - 1].property_tokens.push_back(dp.token);
+        image_.properties.push_back(std::move(dp));
+    }
+
+    // Events + their accessor methods.
+    for (u32 e = 1; e <= event_rows; ++e) {
+        MetadataReader::EventRow er = md_.event_row(e);
+        DnEvent de;
+        de.token = (mdt::Event << 24) | e;
+        de.name = md_.string_at(er.name);
+        MetadataReader::TokenRef r = md_.decode_coded(
+            MetadataReader::Coded::TypeDefOrRef, er.event_type);
+        if (r.rid) de.type = md_.type_name((r.table << 24) | r.rid);
+        u32 owner = md_.event_decl_type(e);
+        if (owner && owner <= image_.types.size())
+            image_.types[owner - 1].event_tokens.push_back(de.token);
+        image_.events.push_back(std::move(de));
+    }
+
+    // MethodSemantics wires getters/setters/adders/removers to their property
+    // or event; run before methods so accessor flags are known when rendering.
+    for (u32 s = 1; s <= md_.table_rows(mdt::MethodSemantics); ++s) {
+        MetadataReader::SemanticsRow sr = md_.method_semantics(s);
+        u32 mtok = (mdt::MethodDef << 24) | sr.method;
+        MetadataReader::TokenRef assoc = md_.decode_coded(
+            MetadataReader::Coded::HasSemantics, sr.assoc);
+        if (assoc.table == mdt::Property && assoc.rid >= 1 &&
+            assoc.rid <= image_.properties.size()) {
+            DnProperty& dp = image_.properties[assoc.rid - 1];
+            if (sr.flags & 0x2) dp.getter = mtok;   // Getter
+            if (sr.flags & 0x1) dp.setter = mtok;   // Setter
+        } else if (assoc.table == mdt::Event && assoc.rid >= 1 &&
+                   assoc.rid <= image_.events.size()) {
+            DnEvent& de = image_.events[assoc.rid - 1];
+            if (sr.flags & 0x8)  de.adder = mtok;    // AddOn
+            if (sr.flags & 0x10) de.remover = mtok;  // RemoveOn
+        }
     }
 
     // Build methods; associate each with its declaring type.
@@ -167,8 +340,14 @@ bool DotNetDisassembler::load(const PEImage& img) {
         m.rva = mr.rva;
         m.flags = mr.flags;
         m.impl_flags = mr.impl_flags;
-        m.is_static = (mr.flags & kMethodStatic) != 0;
+        m.is_static   = (mr.flags & kMethodStatic) != 0;
+        m.is_abstract = (mr.flags & kMethodAbstract) != 0;
+        m.is_virtual  = (mr.flags & kMethodVirtual) != 0;
+        m.is_final    = (mr.flags & kMethodFinal) != 0;
+        m.is_pinvoke  = (mr.flags & kMethodPInvoke) != 0;
+        m.visibility  = member_access(mr.flags);
         m.name = md_.string_at(mr.name);
+        m.is_ctor = (m.name == ".ctor" || m.name == ".cctor");
 
         u32 owner = md_.method_decl_type(r);
         m.decl_type = owner ? md_.type_name((mdt::TypeDef << 24) | owner) : std::string();
@@ -177,6 +356,7 @@ bool DotNetDisassembler::load(const PEImage& img) {
         // Signature -> return type, parameters, and a rendered C# line.
         MetadataReader::MethodSig sig = md_.parse_method_sig(mr.sig);
         m.ret_type = sig.ret.empty() ? "void" : sig.ret;
+        m.gen_param_count = sig.gen_params;
 
         // Parameter names come from the Param table via the ParamList range.
         std::vector<std::string> pnames;
@@ -217,10 +397,40 @@ bool DotNetDisassembler::load(const PEImage& img) {
     }
 
     image_.valid = true;
-    spdlog::info("dotnet: {} runtime, {} types, {} methods, il_only={}",
+    spdlog::info("dotnet: {} runtime, {} types, {} methods, {} fields, {} props, "
+                 "{} events, il_only={}",
                  image_.runtime_version.empty() ? "?" : image_.runtime_version,
-                 image_.types.size(), image_.methods.size(), image_.il_only);
+                 image_.types.size(), image_.methods.size(), image_.fields.size(),
+                 image_.properties.size(), image_.events.size(), image_.il_only);
     return true;
+}
+
+// ---- rid-1 token accessors ---------------------------------------------
+
+const DnType* DnImage::type_by_token(u32 token) const {
+    if ((token >> 24) != mdt::TypeDef) return nullptr;
+    u32 rid = token & 0x00FFFFFF;
+    return (rid >= 1 && rid <= types.size()) ? &types[rid - 1] : nullptr;
+}
+const DnMethod* DnImage::method_by_token(u32 token) const {
+    if ((token >> 24) != mdt::MethodDef) return nullptr;
+    u32 rid = token & 0x00FFFFFF;
+    return (rid >= 1 && rid <= methods.size()) ? &methods[rid - 1] : nullptr;
+}
+const DnField* DnImage::field_by_token(u32 token) const {
+    if ((token >> 24) != mdt::Field) return nullptr;
+    u32 rid = token & 0x00FFFFFF;
+    return (rid >= 1 && rid <= fields.size()) ? &fields[rid - 1] : nullptr;
+}
+const DnProperty* DnImage::property_by_token(u32 token) const {
+    if ((token >> 24) != mdt::Property) return nullptr;
+    u32 rid = token & 0x00FFFFFF;
+    return (rid >= 1 && rid <= properties.size()) ? &properties[rid - 1] : nullptr;
+}
+const DnEvent* DnImage::event_by_token(u32 token) const {
+    if ((token >> 24) != mdt::Event) return nullptr;
+    u32 rid = token & 0x00FFFFFF;
+    return (rid >= 1 && rid <= events.size()) ? &events[rid - 1] : nullptr;
 }
 
 void DotNetDisassembler::decode_body(const PEImage& img, DnMethod& m) const {
@@ -423,30 +633,35 @@ void DotNetDisassembler::decode_il(const u8* code, u32 size, va_t il_base, DnMet
         case ILOperand::Method: {
             if (!need(4)) break;
             u32 tok = rd32(code + pos); pos += 4;
+            di.token = tok;
             di.operand = md_.method_name(tok);
             break;
         }
         case ILOperand::Field: {
             if (!need(4)) break;
             u32 tok = rd32(code + pos); pos += 4;
+            di.token = tok;
             di.operand = md_.field_name(tok);
             break;
         }
         case ILOperand::Type: {
             if (!need(4)) break;
             u32 tok = rd32(code + pos); pos += 4;
+            di.token = tok;
             di.operand = md_.type_name(tok);
             break;
         }
         case ILOperand::Tok: {
             if (!need(4)) break;
             u32 tok = rd32(code + pos); pos += 4;
+            di.token = tok;
             di.operand = md_.token_name(tok);
             break;
         }
         case ILOperand::Str: {
             if (!need(4)) break;
             u32 tok = rd32(code + pos); pos += 4;
+            di.token = tok;
             di.operand = "\"" + md_.user_string_at(tok & 0x00FFFFFF) + "\"";
             break;
         }
@@ -461,6 +676,7 @@ void DotNetDisassembler::decode_il(const u8* code, u32 size, va_t il_base, DnMet
             i8 delta = static_cast<i8>(code[pos]); pos += 1;
             u32 tgt = pos + delta;
             di.target = il_base + tgt;
+            di.br_offset = tgt;
             di.operand = fmt::format("IL_{:04X}", tgt);
             break;
         }
@@ -469,6 +685,7 @@ void DotNetDisassembler::decode_il(const u8* code, u32 size, va_t il_base, DnMet
             i32 delta = static_cast<i32>(rd32(code + pos)); pos += 4;
             u32 tgt = pos + delta;
             di.target = il_base + tgt;
+            di.br_offset = tgt;
             di.operand = fmt::format("IL_{:04X}", tgt);
             break;
         }
@@ -482,6 +699,7 @@ void DotNetDisassembler::decode_il(const u8* code, u32 size, va_t il_base, DnMet
             for (u32 i = 0; i < n; ++i) {
                 u32 tgt = pos + deltas[i];
                 di.switch_targets.push_back(il_base + tgt);
+                di.switch_offsets.push_back(tgt);
                 if (i) ops += ", ";
                 ops += fmt::format("IL_{:04X}", tgt);
             }
@@ -594,6 +812,149 @@ std::string DotNetDisassembler::render_all() const {
         }
         out += "\n";
     }
+    return out;
+}
+
+// -------------------------------------------------------------------------
+// dnSpy-style C# rendering.
+
+namespace {
+
+// Drop a CLR generic-arity marker (`Name`1) for a cleaner C# display name.
+std::string strip_arity(const std::string& name) {
+    auto tick = name.find('`');
+    return tick == std::string::npos ? name : name.substr(0, tick);
+}
+
+// Method-level C# modifiers ("public static virtual "), trailing-space padded.
+std::string method_modifiers(const DnMethod& m, const std::string& kind) {
+    std::string s;
+    if (kind != "interface") s += m.visibility + " ";
+    if (m.is_pinvoke) s += "extern ";
+    if (m.is_static)  s += "static ";
+    else if (m.is_abstract) { if (kind != "interface") s += "abstract "; }
+    else if (m.is_virtual && !m.is_final) s += "virtual ";
+    return s;
+}
+
+bool is_accessor(const DnMethod& m) {
+    if (!(m.flags & 0x0800)) return false;   // SpecialName only
+    const std::string& n = m.name;
+    return n.rfind("get_", 0) == 0 || n.rfind("set_", 0) == 0 ||
+           n.rfind("add_", 0) == 0 || n.rfind("remove_", 0) == 0;
+}
+
+} // anon
+
+std::string DotNetDisassembler::render_type_csharp(const DnType& t) const {
+    std::string out;
+    const std::string ind1 = "    ";
+    const std::string ind2 = "        ";
+    const bool is_enum = t.kind == "enum";
+
+    for (const auto& a : t.attributes) out += fmt::format("[{}]\n", a);
+
+    // Declaration line.
+    std::string decl = t.visibility + " ";
+    if (t.is_static)        decl += "static ";
+    else if (t.is_abstract && t.kind == "class") decl += "abstract ";
+    if (t.is_sealed && t.kind == "class" && !t.is_static) decl += "sealed ";
+    decl += t.kind + " " + strip_arity(t.name);
+
+    // Base + interfaces (skip the implicit bases the compiler adds).
+    std::vector<std::string> bases;
+    if (!t.base_type.empty() && t.base_type != "System.Object" &&
+        t.base_type != "System.ValueType" && t.base_type != "System.Enum" &&
+        t.base_type != "System.MulticastDelegate" && t.base_type != "System.Delegate")
+        bases.push_back(strip_arity(t.base_type));
+    for (const auto& i : t.interfaces) bases.push_back(strip_arity(i));
+    if (!bases.empty()) {
+        decl += " : ";
+        for (size_t i = 0; i < bases.size(); ++i) { if (i) decl += ", "; decl += bases[i]; }
+    }
+    out += decl + "\n{\n";
+
+    if (is_enum) {
+        // Enum: literal fields as `Name = value,`, skip the special value__ field.
+        for (u32 tok : t.field_tokens) {
+            const DnField* f = image_.field_by_token(tok);
+            if (!f || !f->is_literal) continue;
+            out += ind1 + f->name;
+            if (!f->const_value.empty()) out += " = " + f->const_value;
+            out += ",\n";
+        }
+        out += "}\n";
+        return out;
+    }
+
+    // Fields.
+    for (u32 tok : t.field_tokens) {
+        const DnField* f = image_.field_by_token(tok);
+        if (!f) continue;
+        std::string line = ind1 + f->visibility + " ";
+        if (f->is_literal) line += "const ";
+        else { if (f->is_static) line += "static "; if (f->is_readonly) line += "readonly "; }
+        line += f->type + " " + f->name;
+        if (!f->const_value.empty()) line += " = " + f->const_value;
+        out += line + ";\n";
+    }
+    if (!t.field_tokens.empty() && (!t.property_tokens.empty() ||
+        !t.event_tokens.empty() || !t.method_tokens.empty())) out += "\n";
+
+    // Properties.
+    for (u32 tok : t.property_tokens) {
+        const DnProperty* p = image_.property_by_token(tok);
+        if (!p) continue;
+        const DnMethod* acc = p->getter ? image_.method_by_token(p->getter)
+                                        : image_.method_by_token(p->setter);
+        std::string vis = acc ? acc->visibility : std::string("public");
+        std::string statik = (acc && acc->is_static) ? "static " : "";
+        std::string body;
+        if (p->getter) body += "get; ";
+        if (p->setter) body += "set; ";
+        out += fmt::format("{}{} {}{} {} {{ {}}}\n", ind1, vis, statik, p->type,
+                           p->name, body);
+    }
+
+    // Events.
+    for (u32 tok : t.event_tokens) {
+        const DnEvent* e = image_.event_by_token(tok);
+        if (!e) continue;
+        out += fmt::format("{}public event {} {};\n", ind1, e->type, e->name);
+    }
+    if ((!t.property_tokens.empty() || !t.event_tokens.empty()) &&
+        !t.method_tokens.empty()) out += "\n";
+
+    // Methods (accessor methods are folded into their property/event above).
+    for (u32 tok : t.method_tokens) {
+        const DnMethod* mp = image_.method_by_token(tok);
+        if (!mp || is_accessor(*mp)) continue;
+        const DnMethod& m = *mp;
+
+        std::string sig = ind1 + method_modifiers(m, t.kind);
+        std::string name = m.is_ctor ? strip_arity(t.name) : m.name;
+        if (m.is_ctor) sig += name;
+        else           sig += m.ret_type + " " + name;
+
+        std::string params;
+        for (size_t i = 0; i < m.params.size(); ++i) {
+            if (i) params += ", ";
+            params += m.params[i].type + " " + m.params[i].name;
+        }
+        sig += "(" + params + ")";
+
+        if (m.is_abstract || m.rva == 0 || (m.is_pinvoke && m.il.empty())) {
+            out += sig + ";\n";
+            continue;
+        }
+        out += sig + "\n" + ind1 + "{\n";
+        CSharpBody body = decompile_body(m, image_, md_, ind2);
+        if (body.code.empty()) out += ind2 + "// (empty body)\n";
+        else                   out += body.code;
+        out += ind1 + "}\n";
+    }
+
+    out += "}\n";
     return out;
 }
 

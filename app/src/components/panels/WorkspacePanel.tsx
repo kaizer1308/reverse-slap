@@ -2,24 +2,27 @@
 // The tabbed centre area. Disassembly is ported; the remaining tabs keep their
 // empty states until each view lands
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { FolderOpen, Plus, ScanSearch, X } from "lucide-react";
 import DisassemblyView from "@/components/panels/DisassemblyView";
 import DebuggerView from "@/components/panels/DebuggerView";
+import DotNetView from "@/components/panels/DotNetView";
 import MemoryView from "@/components/panels/MemoryView";
 import PeView from "@/components/panels/PeView";
 import StringsView from "@/components/panels/StringsView";
 import { openBinary } from "@/lib/openBinary";
 import { useEngine } from "@/store/engine";
 import { useDisasm } from "@/store/disasm";
+import { useDotnet } from "@/store/dotnet";
 
-type TabId = "disassembly" | "strings" | "memory" | "debugger" | "pe";
+type TabId = "disassembly" | "dotnet" | "strings" | "memory" | "debugger" | "pe";
 
 // Which tabs read the static analysis session and which need a live process
 // Getting this wrong is what made Memory and Debugger look broken behind a
 // "no binary loaded" wall they never needed
 const kTabs: readonly { id: TabId; label: string; needs: "image" | "target" }[] = [
   { id: "disassembly", label: "Disassembly", needs: "image" },
+  { id: "dotnet", label: ".NET", needs: "image" },
   { id: "strings", label: "Strings", needs: "image" },
   { id: "memory", label: "Memory", needs: "target" },
   { id: "debugger", label: "Debugger", needs: "target" },
@@ -31,6 +34,9 @@ export default function WorkspacePanel() {
   const target = useEngine((s) => s.target);
   const hype = useEngine((s) => s.hype);
   const { image, busy, error, refreshLoaded, unload } = useDisasm();
+  const dotnetManaged = useDotnet((s) => s.status?.managed ?? false);
+  const dotnetRefresh = useDotnet((s) => s.refresh);
+  const dotnetReset = useDotnet((s) => s.reset);
 
   // The session is shared with the ImGui shell and with agents, so the image can
   // change without this window doing anything, re-read when the engine reports
@@ -39,8 +45,27 @@ export default function WorkspacePanel() {
     void refreshLoaded();
   }, [refreshLoaded, hype.has_image, hype.ready]);
 
+  // Probe the managed model once analysis lands: for a .NET image this reveals
+  // the tree and turns the ".NET" tab on; for a native image the probe is cheap
+  // (status only) and the tab stays hidden. Runs here, not in DotNetView, so the
+  // tree + expansion state survive tab switches (the view remounts on switch).
+  useEffect(() => {
+    if (image.ready && hype.ready) void dotnetRefresh();
+    else if (!image.ready) dotnetReset();
+  }, [image.ready, image.name, hype.ready, dotnetRefresh, dotnetReset]);
+
+  // The ".NET" tab only exists for managed images; if it vanishes while active,
+  // fall back to Disassembly rather than showing a blank pane.
+  const tabs = useMemo(
+    () => kTabs.filter((t) => t.id !== "dotnet" || dotnetManaged),
+    [dotnetManaged],
+  );
+  useEffect(() => {
+    if (!tabs.some((t) => t.id === active)) setActive("disassembly");
+  }, [tabs, active]);
+
   const body = () => {
-    const tab = kTabs.find((t) => t.id === active);
+    const tab = tabs.find((t) => t.id === active);
 
     if (tab?.needs === "target" && !target.attached) {
       return (
@@ -93,6 +118,8 @@ export default function WorkspacePanel() {
     switch (active) {
       case "disassembly":
         return <DisassemblyView />;
+      case "dotnet":
+        return <DotNetView />;
       case "strings":
         return <StringsView />;
       case "pe":
@@ -107,7 +134,7 @@ export default function WorkspacePanel() {
   return (
     <div className="panel">
       <div className="tabs">
-        {kTabs.map((t) => (
+        {tabs.map((t) => (
           <button
             key={t.id}
             className="tab"
