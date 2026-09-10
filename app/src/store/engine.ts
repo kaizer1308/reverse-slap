@@ -6,6 +6,7 @@ import { create } from "zustand";
 import * as events from "@/lib/events";
 import { call } from "@/lib/rpc";
 import { resolveEndpoint } from "@/lib/endpoint";
+import { useDisasm } from "@/store/disasm";
 
 export type BootStage = {
   stage: number;
@@ -63,7 +64,13 @@ export const useEngine = create<EngineStore>((set) => ({
     events.on("boot.stage", (boot) => set({ boot }));
     events.on("backend.changed", (backend) => set({ backend }));
     events.on("target.changed", (target) => set({ target }));
-    events.on("hype.progress", (hype) => set({ hype }));
+    events.on("hype.progress", (hype) => {
+      set({ hype });
+      // Let the disassembly store refresh its function list when background
+      // analysis completes (the fast native index queried at load time misses
+      // hyperion-only functions, e.g. every method of a .NET/IL image).
+      useDisasm.getState().onHypeProgress(hype.ready, hype.has_image);
+    });
     events.on("app.quitting", ({ reason }) => set({ quitting: reason }));
     events.connect();
 

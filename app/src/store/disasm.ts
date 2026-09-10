@@ -48,12 +48,16 @@ type DisasmStore = {
   filter: string;
   busy: boolean;
   error: string | null;
+  /** Last hyperion-ready state seen on the event stream, for edge detection. */
+  hypeReady: boolean;
 
   setFilter: (v: string) => void;
   refreshLoaded: () => Promise<void>;
   loadFile: (path: string) => Promise<void>;
   unload: () => Promise<void>;
   refreshFunctions: () => Promise<void>;
+  /** Fed by the engine's `hype.progress` stream (see store/engine.ts). */
+  onHypeProgress: (ready: boolean, hasImage: boolean) => void;
   select: (va: number) => Promise<void>;
   gotoAddress: (va: number) => Promise<void>;
   rename: (va: number, name: string) => Promise<void>;
@@ -82,6 +86,7 @@ export const useDisasm = create<DisasmStore>((set, get) => ({
   filter: "",
   busy: false,
   error: null,
+  hypeReady: false,
 
   setFilter: (filter) => set({ filter }),
 
@@ -98,7 +103,9 @@ export const useDisasm = create<DisasmStore>((set, get) => ({
   },
 
   loadFile: async (path) => {
-    set({ busy: true, error: null });
+    // A fresh image restarts analysis; clear the ready edge so its completion
+    // re-pulls the function list (see onHypeProgress).
+    set({ busy: true, error: null, hypeReady: false });
     try {
       await call("disasm", "load", { path });
       await get().refreshLoaded();
@@ -111,7 +118,29 @@ export const useDisasm = create<DisasmStore>((set, get) => ({
 
   unload: async () => {
     await call("disasm", "unload");
-    set({ image: { ready: false }, functions: [], insns: [], selected: null, total: 0 });
+    set({
+      image: { ready: false },
+      functions: [],
+      insns: [],
+      selected: null,
+      total: 0,
+      hypeReady: false,
+    });
+  },
+
+  onHypeProgress: (ready, hasImage) => {
+    // The engine streams background-analysis status. At load time the function
+    // list is seeded from the fast native index, which for a .NET/IL image
+    // holds only the entry stub — every managed method surfaces only once
+    // hyperion analysis finishes. Re-pull the listing (and the loaded summary)
+    // on the not-ready -> ready edge so the panel isn't stuck on that stale,
+    // native-only view.
+    const wasReady = get().hypeReady;
+    set({ hypeReady: ready });
+    if (ready && !wasReady && hasImage && get().image.ready) {
+      void get().refreshLoaded();
+      void get().refreshFunctions();
+    }
   },
 
   refreshFunctions: async () => {
