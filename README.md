@@ -47,6 +47,11 @@ The strings view with search, UTF-16 flagging and xref counts:
   diffing, packer detection, and security-focused reconnaissance.
 - **Decompiler:** Hyperion p-code lifting, SSA, dead-code elimination, type
   inference, control-flow structuring, and C-like output with source addresses.
+- **Managed .NET support:** ECMA-335 metadata parsing, CIL disassembly, an
+  IL-to-C# decompiler, and a dnSpy-style assembly explorer surfaced in both
+  the Tauri UI (`.NET` tab) and MCP (`dotnet` tool). Managed methods fold into
+  the shared analysis DB so the disassembly, decompiler, and cross-reference
+  tools see every method, not just the native entry stub.
 - **Debugging:** Win32 debugging plus optional kernel-assisted VEH debugging,
   breakpoints, stepping, registers, call stacks, SEH, watchpoints, tracepoints,
   and bounded instruction traces.
@@ -60,7 +65,7 @@ The strings view with search, UTF-16 flagging and xref counts:
 - **Unpacking and devirtualization:** Magicmida Themida sidecars, VM handler and
   opcode-map recovery, trace/lift/pseudocode flows, CFG recovery, predicate
   proofs, invariants, and IAT auditing.
-- **Agent-native control:** 22 MCP-visible domain tools with consolidated
+- **Agent-native control:** 23 MCP-visible domain tools with consolidated
   `action` parameters, plus an `/api`-only application-control tool and SSE
   events.
 
@@ -358,7 +363,8 @@ npm run tauri -- dev
 The Rust supervisor starts the C++ engine, waits up to 180 seconds for its
 handshake, places it in a kill-on-close job object, and lets it perform clean
 shutdown when the UI exits. The React shell exposes targets, modules, scripts,
-Frida, scanner/watchlist, disassembly, strings, memory, debugger, PE browser,
+Frida, scanner/watchlist, disassembly, a `.NET` assembly-explorer tab with a
+dnSpy-style tree and a C#/IL code pane, strings, memory, debugger, PE browser,
 output, inspector, theme/motion settings, and backend selection.
 
 ## Feature reference
@@ -395,6 +401,13 @@ output, inspector, theme/motion settings, and backend selection.
 - Structured decompilation pipeline: instruction lifting to p-code, SSA,
   propagation, dead-code elimination, type inference, control-flow structuring,
   and C-like emission.
+- Managed (.NET/CLI) pipeline: full ECMA-335 metadata parsing (types, fields
+  with const values, properties, events, nested types, interfaces, attributes),
+  a CIL disassembler with ILDASM-style listings, an IL→C# decompiler, and a
+  dnSpy-style C# renderer for whole types. Managed methods are folded into the
+  shared analysis DB so the disassembly view lists every method after Hyperion
+  analysis completes, not just the native entry stub. Each managed method also
+  carries an entry VA that cross-links back to `disasm` / `decomp`.
 - Per-line virtual-address mappings, optional address annotations, reconstructed
   stack variables, signatures, and persisted user names.
 - Binary-to-binary function diff with added/removed/modified functions and
@@ -691,6 +704,7 @@ operational guidance are returned by `tools/list`.
 | `persist` | `save`, `list`, `load`, `delete`, `kv_set`, `kv_get`, `hype_save`, `hype_load` |
 | `re` | `rtti_scan`, `vftable`, `danger`, `libsig` |
 | `decomp` | `function` |
+| `dotnet` | `status`, `tree`, `type`, `method`, `source`, `il` |
 | `detect` | `hidden_modules`, `minifilters`, `etw_sessions`, `kernel_callbacks` |
 | `fs` | `read_file`, `write_file`, `list_directory`, `create_directory`, `delete_path`, `search_files`, `grep_in_files` |
 | `web` | `fetch`, `post` |
