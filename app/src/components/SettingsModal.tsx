@@ -89,7 +89,7 @@ export default function SettingsModal({ onClose }: Props) {
             <img src={logoUrl} alt="reverse-slop" draggable={false} />
             <div className="settings-brand-name">reverse-slop</div>
             <div className="settings-brand-sub">
-              v0.1.0 · {backend.badge} engine
+              v0.1.1 · {backend.badge} engine
             </div>
           </div>
 

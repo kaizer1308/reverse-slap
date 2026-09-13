@@ -407,7 +407,7 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int n_cmd_show) {
         slop::core::infra::lifecycle::begin(std::move(cfg));
     }
 
-    slop::ui::panels::AppendBootLog("reverse-slop 0.1.0 (phase 2)");
+    slop::ui::panels::AppendBootLog("reverse-slop 0.1.1 (phase 2)");
     slop::ui::panels::AppendBootLog("renderer initialized (directx 11, composition swapchain)");
     slop::ui::panels::AppendBootLog("chrome: borderless + dwm acrylic backdrop");
     slop::ui::panels::AppendBootLog("font backend: freetype");

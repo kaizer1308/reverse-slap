@@ -152,7 +152,7 @@ export default function TitleBar() {
       {menu(
         "Help",
         <button className="menu-item" disabled>
-          reverse-slop 0.1.0
+          reverse-slop 0.1.1
         </button>,
       )}
 

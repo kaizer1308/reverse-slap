@@ -957,7 +957,7 @@ starting a job.
 
 ## Project status
 
-reverse-slop is version `0.1.0` and Windows-only. APIs and analysis output may
+reverse-slop is version `0.1.1` and Windows-only. APIs and analysis output may
 change. No root project license file is currently present; do not assume a
 license for reverse-slop itself. Third-party components retain their own
 licenses, and separately downloaded Magicmida/ScyllaHide components are GPLv3.

@@ -106,7 +106,7 @@ void DrawAboutModal() {
     ImGui::SetNextWindowPos(vp->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
     if (ImGui::BeginPopupModal("##about", nullptr,
             ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoTitleBar)) {
-        ImGui::TextUnformatted("reverse-slop 0.1.0 (phase 1)");
+        ImGui::TextUnformatted("reverse-slop 0.1.1 (phase 1)");
         ImGui::Separator();
         ImGui::TextDisabled("windows reverse-engineering workbench");
         if (ImGui::Button("Close", ImVec2(120.0f, 0.0f)))

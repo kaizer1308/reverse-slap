@@ -4,7 +4,7 @@
           manifestVersion="1.0">
   <assemblyIdentity type="win32"
                     name="reverse-slop-ui"
-                    version="0.1.0.0"
+                    version="0.1.1.0"
                     processorArchitecture="*"/>
   <!-- comctl32 v6. Replacing Tauri's default manifest means re-declaring this:
        rfd/muda import TaskDialogIndirect, which only v6 exports, so without the

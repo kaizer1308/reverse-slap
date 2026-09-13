@@ -35,7 +35,7 @@ std::map<std::string, std::shared_ptr<infra::cancel_source_t>> g_active;
 
 constexpr const char* kProtocolVersion = "2025-06-18";
 constexpr const char* kServerName      = "reverse-slop";
-constexpr const char* kServerVersion   = "0.1.0";
+constexpr const char* kServerVersion   = "0.1.1";
 
 // the little intro agents get when they connect so they know how to drive us
 constexpr const char* kInstructions =
