@@ -3,6 +3,8 @@ name: build
 on:
   push:
     branches: [main]
+    # a version tag (v0.1.1 or 0.1.1) also publishes the build as a github release
+    tags: ['v*', '[0-9]*']
   workflow_dispatch:
 
 concurrency:
@@ -237,7 +239,8 @@ jobs:
     timeout-minutes: 30
     needs: [cxx, driver, frontend-build]
     permissions:
-      contents: read
+      # write so a tag build can publish its release
+      contents: write
     steps:
       - uses: actions/checkout@v4
         with:
@@ -326,3 +329,26 @@ jobs:
           compression-level: 0
           path: app/src-tauri/target/release/bundle/nsis/*-setup.exe
           if-no-files-found: error
+
+      - name: zip the portable app for the release
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        run: Compress-Archive -Path dist/reverse-slop -DestinationPath "reverse-slop-portable-${{ github.ref_name }}.zip"
+
+      - name: publish the github release
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          # first run on a tag creates the release, a rerun or a manual dispatch
+          # on the same tag just replaces its assets
+          gh release view $env:TAG *> $null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $env:TAG --title $env:TAG --generate-notes --verify-tag
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+          $setup = Get-ChildItem app/src-tauri/target/release/bundle/nsis/*-setup.exe | Select-Object -First 1
+          gh release upload $env:TAG "reverse-slop-portable-$env:TAG.zip" $setup.FullName --clobber
+          exit $LASTEXITCODE
