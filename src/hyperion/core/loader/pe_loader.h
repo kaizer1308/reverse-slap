@@ -1,6 +1,7 @@
 #pragma once
 #include "core/types.h"
 #include <filesystem>
+#include <memory>
 #include <optional>
 
 namespace hype {
@@ -18,8 +19,23 @@ struct PEImage {
     std::vector<Import>        imports;
     std::vector<Export>        exports;
     std::vector<RuntimeFunc>   runtime_funcs;
-    std::vector<u8>            raw;
+    // Whole file bytes. load_buffer() borrows the caller's buffer, which must
+    // outlive the image; load() and the ELF/Mach-O loaders keep what they read,
+    // plus any zero-extended segment tails, alive in `storage`
+    std::span<const u8>                           raw;
+    std::vector<std::shared_ptr<std::vector<u8>>> storage;
 };
+
+// `file_sz` bytes at `p` as segment data, zero-extended to `mem_sz` when the
+// segment maps more than the file backs. Only that extended case copies
+inline std::span<const u8> segment_bytes(PEImage& img, const u8* p, size_t file_sz,
+                                         size_t mem_sz = 0) {
+    if (mem_sz <= file_sz) return {p, file_sz};
+    auto tail = std::make_shared<std::vector<u8>>(p, p + file_sz);
+    tail->resize(mem_sz, 0);
+    img.storage.push_back(tail);
+    return *tail;
+}
 
 class PELoader {
 public:

@@ -160,11 +160,13 @@ std::optional<PEImage> PELoader::load_buffer(const u8* data, size_t len) {
         return std::nullopt;
     }
 
+    // borrowed, not copied: a multi-hundred-megabyte image was held here and
+    // again per section on top of the caller's own buffer
     PEImage img;
-    img.raw.assign(data, data + len);
+    img.raw = {data, len};
 
-    base_ = img.raw.data();
-    size_ = img.raw.size();
+    base_ = data;
+    size_ = len;
 
     if (!parse_headers(img)) return std::nullopt;
     if (!parse_sections(img)) return std::nullopt;
@@ -200,15 +202,18 @@ std::optional<PEImage> PELoader::load(const std::filesystem::path& path) {
         return std::nullopt;
     }
 
-    std::vector<u8> raw(file_sz);
+    auto raw = std::make_shared<std::vector<u8>>(file_sz);
     f.seekg(0);
-    f.read(reinterpret_cast<char*>(raw.data()), static_cast<std::streamsize>(file_sz));
-    if (raw.size() < sizeof(DosHdr)) {
+    f.read(reinterpret_cast<char*>(raw->data()), static_cast<std::streamsize>(file_sz));
+    if (raw->size() < sizeof(DosHdr)) {
         spdlog::error("file too small for DOS header");
         return std::nullopt;
     }
 
-    return load_buffer(raw.data(), raw.size());
+    // load_buffer only borrows, so the image keeps the bytes it was parsed from
+    auto img = load_buffer(raw->data(), raw->size());
+    if (img) img->storage.push_back(std::move(raw));
+    return img;
 }
 
 bool PELoader::parse_headers(PEImage& img) {
@@ -295,7 +300,7 @@ bool PELoader::parse_sections(PEImage& img) {
 
         size_t raw_end;
         if (safe_add(sh->raw_ptr, sh->raw_sz, raw_end) && raw_end <= size_) {
-            seg.data.assign(base_ + sh->raw_ptr, base_ + sh->raw_ptr + sh->raw_sz);
+            seg.data = {base_ + sh->raw_ptr, sh->raw_sz};
         }
         img.segments.push_back(std::move(seg));
     }

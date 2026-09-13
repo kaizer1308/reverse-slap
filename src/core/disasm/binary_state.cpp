@@ -196,16 +196,10 @@ void unload() {
     unload_locked();
 }
 
-bool load_file(const std::string& path, uint64_t base_override) {
-    // cheap check outside the lock before we tear down the current session
-    {
-        std::ifstream probe(path, std::ios::binary);
-        if (!probe) return false;
-        probe.seekg(0, std::ios::end);
-        if (probe.tellg() < 1024) return false;
-    }
+namespace {
 
-    std::lock_guard lk(g_mu);
+// load_file body, caller holds g_mu
+bool load_locked(const std::string& path, uint64_t base_override) {
     unload_locked();
 
     std::ifstream f(path, std::ios::binary);
@@ -350,6 +344,28 @@ bool load_file(const std::string& path, uint64_t base_override) {
     // two overlap; mirror any renames the persisted store already holds.
     if (g_bin.hype) g_bin.hype->queue_names(g_bin.symbols);
     return true;
+}
+
+} // namespace
+
+bool load_file(const std::string& path, uint64_t base_override) {
+    // cheap check outside the lock before we tear down the current session
+    {
+        std::ifstream probe(path, std::ios::binary);
+        if (!probe) return false;
+        probe.seekg(0, std::ios::end);
+        if (probe.tellg() < 1024) return false;
+    }
+
+    std::lock_guard lk(g_mu);
+    try {
+        return load_locked(path, base_override);
+    } catch (...) {
+        // bad_alloc on an image bigger than the machine can hold: fail the
+        // load instead of throwing across the lua, mcp and ui callers
+        unload_locked();
+        return false;
+    }
 }
 
 bool load_from_target() {

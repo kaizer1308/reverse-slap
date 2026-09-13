@@ -26,7 +26,10 @@ struct Segment {
     u64         file_off;
     u64         file_sz;
     u32         flags;
-    std::vector<u8> data;
+    // View into the image bytes (PEImage::raw, or a zero-extended tail kept in
+    // PEImage::storage). An owned copy per segment held a large image in
+    // memory once more on top of the file itself
+    std::span<const u8> data;
 
     bool executable() const { return flags & 0x20000000; }
     bool writable()   const { return flags & 0x80000000; }

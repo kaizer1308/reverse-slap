@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdlib>
+#include <exception>
 #include <future>
 #include <thread>
 #include <vector>
@@ -58,7 +59,14 @@ void parallel_for_chunks(WorkerPool& pool, size_t n, F&& fn) {
             fn(c, begin, end);
         }));
     }
-    for (auto& f : futs) f.get();  // rethrows the first worker exception
+    // Join every chunk before rethrowing. Bailing on the first failed get()
+    // unwinds `fn` and the caller's locals while sibling chunks still run
+    // against them, turning a bad_alloc on a big image into a use-after-free
+    std::exception_ptr first;
+    for (auto& f : futs) {
+        try { f.get(); } catch (...) { if (!first) first = std::current_exception(); }
+    }
+    if (first) std::rethrow_exception(first);
 }
 
 // fn(i) for every i in [0, n).

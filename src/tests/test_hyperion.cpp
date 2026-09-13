@@ -7,14 +7,17 @@
 
 #include "core/disasm/binary_state.hpp"
 #include "core/disasm/hyperion_session.hpp"
+#include "threading/parallel.h"
 
 #include <Zydis/Zydis.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <fstream>
 #include <iterator>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -411,6 +414,46 @@ TEST_CASE(hyperion_pe_load_buffer_matches_path_load) {
         REQUIRE_EQ(a->segments[i].va, b->segments[i].va);
         REQUIRE_EQ(a->segments[i].size, b->segments[i].size);
     }
+}
+
+TEST_CASE(hyperion_segments_borrow_the_image_bytes) {
+    // Segments view the caller's buffer instead of copying it: the copies held
+    // a large image in memory three times over and ran big binaries out of RAM
+    const auto& bytes = slop_target_bytes();
+    hype::PELoader loader;
+    auto img = loader.load_buffer(bytes.data(), bytes.size());
+    REQUIRE(img.has_value());
+    REQUIRE(img->raw.data() == bytes.data());
+    for (const auto& seg : img->segments) {
+        if (seg.data.empty()) continue;
+        REQUIRE(seg.data.data() >= bytes.data());
+        REQUIRE(seg.data.data() + seg.data.size() <= bytes.data() + bytes.size());
+    }
+
+    // load(path) has no caller buffer to borrow, so the image owns its bytes
+    auto owned = loader.load(SLOP_TARGET_EXE_PATH);
+    REQUIRE(owned.has_value());
+    REQUIRE(!owned->storage.empty());
+    REQUIRE(owned->raw.data() == owned->storage.front()->data());
+}
+
+TEST_CASE(hyperion_parallel_for_joins_before_rethrow) {
+    // A failing chunk must not unwind the caller while sibling chunks still run
+    // against its locals; a bad_alloc on a huge image became a use-after-free
+    hype::WorkerPool pool(4);
+    std::atomic<int> finished{0};
+    bool threw = false;
+    try {
+        hype::parallel_for_chunks(pool, 8, [&](size_t chunk, size_t, size_t) {
+            if (chunk == 0) throw std::runtime_error("chunk failed");
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            ++finished;
+        });
+    } catch (const std::runtime_error&) {
+        threw = true;
+    }
+    REQUIRE(threw);
+    REQUIRE_EQ(finished.load(), 7);
 }
 
 TEST_CASE(hyperion_reanalysis_preserves_runtime_base) {

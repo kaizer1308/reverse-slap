@@ -195,10 +195,12 @@ std::optional<PEImage> MachOLoader::load(const std::filesystem::path& path) {
     f.seekg(0);
 
     PEImage img;
-    img.raw.resize(sz);
-    f.read(reinterpret_cast<char*>(img.raw.data()), static_cast<std::streamsize>(sz));
+    auto file = std::make_shared<std::vector<u8>>(sz);
+    f.read(reinterpret_cast<char*>(file->data()), static_cast<std::streamsize>(sz));
+    img.storage.push_back(file);
+    img.raw = *file;
 
-    base_ = img.raw.data();
+    base_ = file->data();
     size_ = sz;
 
     u32 magic = 0;
@@ -385,9 +387,7 @@ bool MachOLoader::parse_segment(PEImage& img, const u8* cmd) {
             seg.file_sz = sc->filesize;
             seg.flags = macho_to_pe_flags(sc->initprot);
             if (sc->fileoff + sc->filesize <= size_) {
-                seg.data.assign(base_ + sc->fileoff, base_ + sc->fileoff + sc->filesize);
-                if (sc->vmsize > sc->filesize)
-                    seg.data.resize(static_cast<size_t>(sc->vmsize), 0);
+                seg.data = segment_bytes(img, base_ + sc->fileoff, sc->filesize, sc->vmsize);
             }
             img.segments.push_back(std::move(seg));
         } else {
@@ -405,7 +405,7 @@ bool MachOLoader::parse_segment(PEImage& img, const u8* cmd) {
                 seg.file_sz = sec->size;
                 seg.flags = macho_to_pe_flags(sc->initprot);
                 if (sec->offset + sec->size <= size_) {
-                    seg.data.assign(base_ + sec->offset, base_ + sec->offset + sec->size);
+                    seg.data = segment_bytes(img, base_ + sec->offset, sec->size);
                 }
                 img.segments.push_back(std::move(seg));
             }
@@ -425,9 +425,7 @@ bool MachOLoader::parse_segment(PEImage& img, const u8* cmd) {
             seg.file_sz = sc->filesize;
             seg.flags = macho_to_pe_flags(sc->initprot);
             if (sc->fileoff + sc->filesize <= size_) {
-                seg.data.assign(base_ + sc->fileoff, base_ + sc->fileoff + sc->filesize);
-                if (sc->vmsize > sc->filesize)
-                    seg.data.resize(static_cast<size_t>(sc->vmsize), 0);
+                seg.data = segment_bytes(img, base_ + sc->fileoff, sc->filesize, sc->vmsize);
             }
             img.segments.push_back(std::move(seg));
         } else {
@@ -445,7 +443,7 @@ bool MachOLoader::parse_segment(PEImage& img, const u8* cmd) {
                 seg.file_sz = sec->size;
                 seg.flags = macho_to_pe_flags(sc->initprot);
                 if (sec->offset + sec->size <= size_) {
-                    seg.data.assign(base_ + sec->offset, base_ + sec->offset + sec->size);
+                    seg.data = segment_bytes(img, base_ + sec->offset, sec->size);
                 }
                 img.segments.push_back(std::move(seg));
             }

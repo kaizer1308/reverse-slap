@@ -2,6 +2,8 @@
 
 #include "core/analysis/imgpatch.hpp"
 
+#include "core/disasm/hyperion_session.hpp"
+
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
@@ -25,11 +27,19 @@ bool read_bin(const ds::binary_t& bin, uint64_t va, void* dst, size_t len) {
     return true;
 }
 
+// Hyperion reads the image bytes in place on its worker thread, so an analysis
+// still in flight is cancelled before any write. The lazy rebuild behind
+// indexes_dirty restarts it over the patched bytes
+void quiesce(ds::binary_t& bin) {
+    if (bin.hype) bin.hype->stop();
+}
+
 // Single journaled byte write. False when unmapped
 bool poke(ds::binary_t& bin, uint64_t va, uint8_t byte,
           std::vector<ds::binary_t::patch_rec_t>* journal) {
     auto off = bin.offset_of(va);
     if (!off || *off >= bin.file.size()) return false;
+    quiesce(bin);
     if (journal) {
         ds::binary_t::patch_rec_t rec;
         rec.va     = va;
@@ -502,6 +512,7 @@ op_result_t write_bytes(ds::binary_t& bin, uint64_t va,
         res.error = "range not mapped in image";
         return res;
     }
+    quiesce(bin);
     for (size_t i = 0; i < bytes.size(); ++i) {
         ds::binary_t::patch_rec_t rec;
         rec.va = va + i; rec.offset = *off + i;
@@ -523,6 +534,7 @@ op_result_t write_bytes(ds::binary_t& bin, uint64_t va,
 
 op_result_t revert_all(ds::binary_t& bin) {
     op_result_t res;
+    if (!bin.patches.empty()) quiesce(bin);
     for (auto it = bin.patches.rbegin(); it != bin.patches.rend(); ++it) {
         if (it->offset < bin.file.size())
             bin.file[it->offset] = it->before;

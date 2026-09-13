@@ -108,7 +108,8 @@ TEST_CASE(disasm_accuracy_iret_terminates_cfg) {
     text.name = ".text";
     text.va = image.entry;
     text.flags = 0x60000020;
-    text.data = {0x48, 0xCF, 0xB8, 0x2A, 0, 0, 0, 0xC3}; // iretq; unreachable mov/ret
+    static constexpr hype::u8 kText[] = {0x48, 0xCF, 0xB8, 0x2A, 0, 0, 0, 0xC3}; // iretq; unreachable mov/ret
+    text.data = kText;
     text.size = text.file_sz = text.data.size();
     image.segments.push_back(std::move(text));
     hype::WorkerPool pool(1);

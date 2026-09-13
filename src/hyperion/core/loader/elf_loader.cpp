@@ -160,10 +160,12 @@ std::optional<PEImage> ELFLoader::load(const std::filesystem::path& path) {
     f.seekg(0);
 
     PEImage img;
-    img.raw.resize(sz);
-    f.read(reinterpret_cast<char*>(img.raw.data()), sz);
+    auto file = std::make_shared<std::vector<u8>>(sz);
+    f.read(reinterpret_cast<char*>(file->data()), sz);
+    img.storage.push_back(file);
+    img.raw = *file;
 
-    base_ = img.raw.data();
+    base_ = file->data();
     size_ = sz;
 
     if (!parse_header(img)) return std::nullopt;
@@ -253,9 +255,7 @@ bool ELFLoader::parse_segments(PEImage& img) {
             seg.flags = elf_to_pe_flags(ph->p_flags);
 
             if (ph->p_offset + ph->p_filesz <= size_) {
-                seg.data.assign(base_ + ph->p_offset, base_ + ph->p_offset + ph->p_filesz);
-                if (ph->p_memsz > ph->p_filesz)
-                    seg.data.resize(static_cast<size_t>(ph->p_memsz), 0);
+                seg.data = segment_bytes(img, base_ + ph->p_offset, ph->p_filesz, ph->p_memsz);
             }
 
             if (seg.va < lo) lo = seg.va;
@@ -279,9 +279,7 @@ bool ELFLoader::parse_segments(PEImage& img) {
             seg.flags = elf_to_pe_flags(ph->p_flags);
 
             if (ph->p_offset + ph->p_filesz <= size_) {
-                seg.data.assign(base_ + ph->p_offset, base_ + ph->p_offset + ph->p_filesz);
-                if (ph->p_memsz > ph->p_filesz)
-                    seg.data.resize(static_cast<size_t>(ph->p_memsz), 0);
+                seg.data = segment_bytes(img, base_ + ph->p_offset, ph->p_filesz, ph->p_memsz);
             }
 
             if (seg.va < lo) lo = seg.va;
