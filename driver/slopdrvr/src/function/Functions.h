@@ -59,4 +59,10 @@ namespace functions {
     NTSTATUS handle_net_iface_enum(p_net_interface_enum request);
     NTSTATUS handle_pcap_export(p_pcap_export_request request);
     NTSTATUS handle_net_fingerprint(p_net_fingerprint_request request);
+
+    NTSTATUS handle_callback_enum(p_callback_enum request);
+    NTSTATUS handle_kmod_enum(p_kmod_enum request);
+    NTSTATUS handle_handle_table_enum(p_handle_table_enum request);
+    NTSTATUS handle_vad_walk(p_vad_enum request);
+    NTSTATUS handle_token_query(p_token_query request);
 }

@@ -187,6 +187,14 @@ TEST_CASE(abi_logctl_matches_kernel) {
     REQUIRE_EQ(offsetof(km::logctl_request, status), 12u);
 }
 
+TEST_CASE(abi_auth_matches_kernel) {
+    REQUIRE_EQ(sizeof(km::auth_request), 24u);
+    REQUIRE_EQ(offsetof(km::auth_request, challenge), 0u);
+    REQUIRE_EQ(offsetof(km::auth_request, response), 8u);
+    REQUIRE_EQ(offsetof(km::auth_request, status), 16u);
+    REQUIRE_EQ(offsetof(km::auth_request, padding), 20u);
+}
+
 // ---------------------------------------------------------------------------
 // Network + malware-safe ABI
 // ---------------------------------------------------------------------------
@@ -290,64 +298,66 @@ TEST_CASE(abi_ioctl_formula_matches_ctl_code) {
         return (device_unknown << 16) | (fn << 2) | method_buffered | any_access;
     };
 
-    // Function numbering mirrors the driver's kFunctionBase = 0x800
-    REQUIRE_EQ(ioctl_codes::DTB(), ctl(0x800));
-    REQUIRE_EQ(ioctl_codes::PHYS(), ctl(0x801));
-    REQUIRE_EQ(ioctl_codes::BASE(), ctl(0x802));
-    REQUIRE_EQ(ioctl_codes::RC(), ctl(0x804));
-    REQUIRE_EQ(ioctl_codes::CR(), ctl(0x805));
-    REQUIRE_EQ(ioctl_codes::AM(), ctl(0x806));
-    REQUIRE_EQ(ioctl_codes::FM(), ctl(0x807));
+    constexpr DWORD base = ioctl_codes::kFunctionBase;
 
-    REQUIRE_EQ(ioctl_codes::TCTX(), ctl(0x809));
-    REQUIRE_EQ(ioctl_codes::TENUM(), ctl(0x80A));
-    REQUIRE_EQ(ioctl_codes::TSR(), ctl(0x80B));
-    REQUIRE_EQ(ioctl_codes::QM(), ctl(0x80C));
-    REQUIRE_EQ(ioctl_codes::PM(), ctl(0x80D));
-    REQUIRE_EQ(ioctl_codes::ER(), ctl(0x80E));
-    REQUIRE_EQ(ioctl_codes::RPEB(), ctl(0x80F));
-    REQUIRE_EQ(ioctl_codes::SDF(), ctl(0x810));
-    REQUIRE_EQ(ioctl_codes::MEX(), ctl(0x811));
-    REQUIRE_EQ(ioctl_codes::V2P(), ctl(0x812));
+    REQUIRE_EQ(ioctl_codes::DTB(), ctl(base + 0));
+    REQUIRE_EQ(ioctl_codes::PHYS(), ctl(base + 1));
+    REQUIRE_EQ(ioctl_codes::BASE(), ctl(base + 2));
+    REQUIRE_EQ(ioctl_codes::RC(), ctl(base + 4));
+    REQUIRE_EQ(ioctl_codes::CR(), ctl(base + 5));
+    REQUIRE_EQ(ioctl_codes::AM(), ctl(base + 6));
+    REQUIRE_EQ(ioctl_codes::FM(), ctl(base + 7));
 
-    REQUIRE_EQ(ioctl_codes::NCON(), ctl(0x813));
-    REQUIRE_EQ(ioctl_codes::NCAP(), ctl(0x814));
-    REQUIRE_EQ(ioctl_codes::NCPG(), ctl(0x815));
-    REQUIRE_EQ(ioctl_codes::NDNS(), ctl(0x816));
-    REQUIRE_EQ(ioctl_codes::NFLT(), ctl(0x817));
-    REQUIRE_EQ(ioctl_codes::NSTS(), ctl(0x818));
+    REQUIRE_EQ(ioctl_codes::TCTX(), ctl(base + 9));
+    REQUIRE_EQ(ioctl_codes::TENUM(), ctl(base + 10));
+    REQUIRE_EQ(ioctl_codes::TSR(), ctl(base + 11));
+    REQUIRE_EQ(ioctl_codes::QM(), ctl(base + 12));
+    REQUIRE_EQ(ioctl_codes::PM(), ctl(base + 13));
+    REQUIRE_EQ(ioctl_codes::ER(), ctl(base + 14));
+    REQUIRE_EQ(ioctl_codes::RPEB(), ctl(base + 15));
+    REQUIRE_EQ(ioctl_codes::SDF(), ctl(base + 16));
+    REQUIRE_EQ(ioctl_codes::MEX(), ctl(base + 17));
+    REQUIRE_EQ(ioctl_codes::V2P(), ctl(base + 18));
 
-    REQUIRE_EQ(ioctl_codes::EWFP(), ctl(0x819));
-    REQUIRE_EQ(ioctl_codes::GSKT(), ctl(0x81A));
-    REQUIRE_EQ(ioctl_codes::SNBF(), ctl(0x81B));
-    REQUIRE_EQ(ioctl_codes::DTCP(), ctl(0x81C));
+    REQUIRE_EQ(ioctl_codes::NCON(), ctl(base + 19));
+    REQUIRE_EQ(ioctl_codes::NCAP(), ctl(base + 20));
+    REQUIRE_EQ(ioctl_codes::NCPG(), ctl(base + 21));
+    REQUIRE_EQ(ioctl_codes::NDNS(), ctl(base + 22));
+    REQUIRE_EQ(ioctl_codes::NFLT(), ctl(base + 23));
+    REQUIRE_EQ(ioctl_codes::NSTS(), ctl(base + 24));
 
-    REQUIRE_EQ(ioctl_codes::PINJ(), ctl(0x81D));
-    REQUIRE_EQ(ioctl_codes::PMOD(), ctl(0x81E));
-    REQUIRE_EQ(ioctl_codes::PRED(), ctl(0x81F));
-    REQUIRE_EQ(ioctl_codes::STRM(), ctl(0x820));
-    REQUIRE_EQ(ioctl_codes::DPIN(), ctl(0x821));
-    REQUIRE_EQ(ioctl_codes::IHLD(), ctl(0x822));
-    REQUIRE_EQ(ioctl_codes::CKIL(), ctl(0x823));
-    REQUIRE_EQ(ioctl_codes::DNSS(), ctl(0x824));
-    REQUIRE_EQ(ioctl_codes::BWMN(), ctl(0x825));
-    REQUIRE_EQ(ioctl_codes::NIFS(), ctl(0x826));
-    REQUIRE_EQ(ioctl_codes::PCEX(), ctl(0x827));
-    REQUIRE_EQ(ioctl_codes::NFPR(), ctl(0x828));
-    REQUIRE_EQ(ioctl_codes::EVTS(), ctl(0x836));   // 0x800 + 54
+    REQUIRE_EQ(ioctl_codes::EWFP(), ctl(base + 25));
+    REQUIRE_EQ(ioctl_codes::GSKT(), ctl(base + 26));
+    REQUIRE_EQ(ioctl_codes::SNBF(), ctl(base + 27));
+    REQUIRE_EQ(ioctl_codes::DTCP(), ctl(base + 28));
 
-    REQUIRE_EQ(ioctl_codes::PSBX(), ctl(0x837));
-    REQUIRE_EQ(ioctl_codes::USBX(), ctl(0x838));
-    REQUIRE_EQ(ioctl_codes::NLOG(), ctl(0x839));
-    REQUIRE_EQ(ioctl_codes::NPKT(), ctl(0x83A));
-    REQUIRE_EQ(ioctl_codes::SSDT(), ctl(0x83B));
-    REQUIRE_EQ(ioctl_codes::TQIF(), ctl(0x83C));
-    REQUIRE_EQ(ioctl_codes::TTERM(), ctl(0x83D));
-    REQUIRE_EQ(ioctl_codes::HCLS(), ctl(0x83E));
+    REQUIRE_EQ(ioctl_codes::PINJ(), ctl(base + 29));
+    REQUIRE_EQ(ioctl_codes::PMOD(), ctl(base + 30));
+    REQUIRE_EQ(ioctl_codes::PRED(), ctl(base + 31));
+    REQUIRE_EQ(ioctl_codes::STRM(), ctl(base + 32));
+    REQUIRE_EQ(ioctl_codes::DPIN(), ctl(base + 33));
+    REQUIRE_EQ(ioctl_codes::IHLD(), ctl(base + 34));
+    REQUIRE_EQ(ioctl_codes::CKIL(), ctl(base + 35));
+    REQUIRE_EQ(ioctl_codes::DNSS(), ctl(base + 36));
+    REQUIRE_EQ(ioctl_codes::BWMN(), ctl(base + 37));
+    REQUIRE_EQ(ioctl_codes::NIFS(), ctl(base + 38));
+    REQUIRE_EQ(ioctl_codes::PCEX(), ctl(base + 39));
+    REQUIRE_EQ(ioctl_codes::NFPR(), ctl(base + 40));
+    REQUIRE_EQ(ioctl_codes::EVTS(), ctl(base + 54));
 
-    REQUIRE_EQ(ioctl_codes::IDENT(), ctl(0x83F));
-    REQUIRE_EQ(ioctl_codes::SHUTDOWN(), ctl(0x840));
-    REQUIRE_EQ(ioctl_codes::LOGCTL(), ctl(0x841));
+    REQUIRE_EQ(ioctl_codes::PSBX(), ctl(base + 55));
+    REQUIRE_EQ(ioctl_codes::USBX(), ctl(base + 56));
+    REQUIRE_EQ(ioctl_codes::NLOG(), ctl(base + 57));
+    REQUIRE_EQ(ioctl_codes::NPKT(), ctl(base + 58));
+    REQUIRE_EQ(ioctl_codes::SSDT(), ctl(base + 59));
+    REQUIRE_EQ(ioctl_codes::TQIF(), ctl(base + 60));
+    REQUIRE_EQ(ioctl_codes::TTERM(), ctl(base + 61));
+    REQUIRE_EQ(ioctl_codes::HCLS(), ctl(base + 62));
+
+    REQUIRE_EQ(ioctl_codes::IDENT(), ctl(base + 63));
+    REQUIRE_EQ(ioctl_codes::SHUTDOWN(), ctl(base + 64));
+    REQUIRE_EQ(ioctl_codes::LOGCTL(), ctl(base + 65));
+    REQUIRE_EQ(ioctl_codes::AUTH(), ctl(base + 66));
 }
 
 TEST_CASE(abi_ioctl_codes_are_distinct) {
@@ -371,6 +381,7 @@ TEST_CASE(abi_ioctl_codes_are_distinct) {
         ioctl_codes::NLOG(), ioctl_codes::NPKT(), ioctl_codes::SSDT(),
         ioctl_codes::TQIF(), ioctl_codes::TTERM(), ioctl_codes::HCLS(),
         ioctl_codes::IDENT(), ioctl_codes::SHUTDOWN(), ioctl_codes::LOGCTL(),
+        ioctl_codes::AUTH(),
     };
     constexpr std::size_t kCount = sizeof(all) / sizeof(all[0]);
     for (std::size_t i = 0; i < kCount; ++i) {

@@ -588,8 +588,41 @@ bool voyager::device_t::connect() noexcept {
     diag::log_tagged_critical_fmt("comm-startup",
         "connect_success handle=0x%llX",
         reinterpret_cast<unsigned long long>(driver_handle_));
+
+    if (!authenticate()) {
+        diag::log_tagged_critical_fmt("comm-startup",
+            "connect_auth_failed handle=0x%llX",
+            reinterpret_cast<unsigned long long>(driver_handle_));
+        disconnect();
+        last_connect_error_ = ERROR_ACCESS_DENIED;
+        return false;
+    }
+    diag::log_tagged_critical_fmt("comm-startup",
+        "connect_authenticated handle=0x%llX",
+        reinterpret_cast<unsigned long long>(driver_handle_));
     return true;
 }
+
+bool voyager::device_t::authenticate() noexcept {
+    if (!is_connected()) return false;
+
+    detail::auth_request req{};
+    req.response = 0;
+    if (!send_request(ioctl_codes::AUTH(), &req, sizeof(req)))
+        return false;
+
+    std::uint64_t nonce = req.challenge;
+    std::uint64_t pid = static_cast<std::uint64_t>(GetCurrentProcessId());
+    req.response = slop_stealth::auth_response(nonce, pid);
+    req.challenge = 0;
+    req.status = 0;
+
+    if (!send_request(ioctl_codes::AUTH(), &req, sizeof(req)))
+        return false;
+
+    return req.status == 1;
+}
+
 void voyager::device_t::disconnect() noexcept {
     clear_process_context();
 
@@ -5752,4 +5785,125 @@ bool voyager::device_t::drain_debug_events(std::vector<debug_event_record>& out,
     return true;
 }
 
+std::vector<voyager::device_t::callback_info> voyager::device_t::enumerate_callbacks(callback_kind_e kind) noexcept {
+    std::vector<callback_info> result;
+    if (!is_connected()) return result;
 
+    auto buffer = std::make_unique<detail::callback_enum_request>();
+    std::memset(buffer.get(), 0, sizeof(*buffer));
+    buffer->kind = static_cast<std::uint32_t>(kind);
+
+    if (!send_request(ioctl_codes::CBEN(), buffer.get(), sizeof(*buffer)))
+        return result;
+
+    for (std::uint32_t i = 0; i < buffer->entry_count && i < detail::MAX_CALLBACK_ENTRIES; ++i) {
+        const auto& src = buffer->entries[i];
+        callback_info ci;
+        ci.callback_address = src.callback_address;
+        ci.module_base = src.module_base;
+        ci.kind = static_cast<callback_kind_e>(src.kind);
+        ci.index = src.index;
+        ci.active = src.active != 0;
+        result.push_back(ci);
+    }
+
+    return result;
+}
+
+std::vector<voyager::device_t::kmod_info> voyager::device_t::enumerate_kernel_modules() noexcept {
+    std::vector<kmod_info> result;
+    if (!is_connected()) return result;
+
+    auto buffer = std::make_unique<detail::kmod_enum_request>();
+    std::memset(buffer.get(), 0, sizeof(*buffer));
+
+    if (!send_request(ioctl_codes::KMOD(), buffer.get(), sizeof(*buffer)))
+        return result;
+
+    for (std::uint32_t i = 0; i < buffer->entry_count && i < detail::MAX_KMOD_ENTRIES; ++i) {
+        const auto& src = buffer->entries[i];
+        kmod_info ki;
+        ki.base = src.base;
+        ki.size = src.size;
+        ki.load_order = src.load_order;
+        ki.flags = src.flags;
+        ki.name = src.name;
+        result.push_back(std::move(ki));
+    }
+    return result;
+}
+
+std::vector<voyager::device_t::handle_info> voyager::device_t::enumerate_handles(std::uint32_t target_pid) noexcept {
+    std::vector<handle_info> result;
+    if (!is_connected()) return result;
+
+    auto buffer = std::make_unique<detail::handle_table_enum_request>();
+    std::memset(buffer.get(), 0, sizeof(*buffer));
+    buffer->pid = target_pid;
+
+    if (!send_request(ioctl_codes::HTBL(), buffer.get(), sizeof(*buffer)))
+        return result;
+
+    for (std::uint32_t i = 0; i < buffer->entry_count && i < detail::MAX_HANDLE_ENTRIES; ++i) {
+        const auto& src = buffer->entries[i];
+        handle_info hi;
+        hi.handle_value = src.handle_value;
+        hi.object_address = src.object_address;
+        hi.granted_access = src.granted_access;
+        hi.object_type_index = src.object_type_index;
+        result.push_back(hi);
+    }
+    return result;
+}
+
+std::vector<voyager::device_t::vad_info> voyager::device_t::enumerate_vads(std::uint32_t target_pid) noexcept {
+    std::vector<vad_info> result;
+    if (!is_connected()) return result;
+
+    auto buffer = std::make_unique<detail::vad_enum_request>();
+    std::memset(buffer.get(), 0, sizeof(*buffer));
+    buffer->pid = target_pid;
+
+    if (!send_request(ioctl_codes::VADW(), buffer.get(), sizeof(*buffer)))
+        return result;
+
+    for (std::uint32_t i = 0; i < buffer->entry_count && i < detail::MAX_VAD_ENTRIES; ++i) {
+        const auto& src = buffer->entries[i];
+        vad_info vi;
+        vi.base = src.base;
+        vi.size = src.size;
+        vi.allocation_base = src.allocation_base;
+        vi.state = src.state;
+        vi.protect = src.protect;
+        vi.type = src.type;
+        vi.allocation_protect = src.allocation_protect;
+        std::size_t len = 0;
+        while (len < 127 && src.mapped_name[len]) ++len;
+        if (len > 0) vi.mapped_name.assign(src.mapped_name, len);
+        result.push_back(std::move(vi));
+    }
+    return result;
+}
+
+bool voyager::device_t::query_token(std::uint32_t target_pid, token_info& out) noexcept {
+    out = {};
+    if (!is_connected()) return false;
+
+    detail::token_query_request req{};
+    req.pid = target_pid;
+
+    if (!send_request(ioctl_codes::TOKN(), &req, sizeof(req)))
+        return false;
+
+    out.integrity_level = req.integrity_level;
+    out.session_id = req.session_id;
+    out.elevated = req.elevated != 0;
+    for (std::uint32_t i = 0; i < req.privilege_count && i < detail::MAX_TOKEN_PRIVILEGES; ++i) {
+        token_info::privilege p;
+        p.luid_low = req.privileges[i].luid_low;
+        p.luid_high = req.privileges[i].luid_high;
+        p.attributes = req.privileges[i].attributes;
+        out.privileges.push_back(p);
+    }
+    return true;
+}

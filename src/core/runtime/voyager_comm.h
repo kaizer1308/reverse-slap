@@ -18,9 +18,10 @@
 #include <string>
 #include <vector>
 #include <intrin.h>
+#include "../../../driver/slopdrvr/src/stealth_config.h"
 
 namespace ioctl_codes {
-    constexpr std::uint32_t kFunctionBase = 0x800u;
+    constexpr std::uint32_t kFunctionBase = slop_stealth::kIoctlFunctionBase;
 
     __forceinline DWORD make(std::uint32_t offset) {
         return static_cast<DWORD>(0x00220000u | ((kFunctionBase + offset) << 2));
@@ -88,6 +89,12 @@ namespace ioctl_codes {
     __forceinline DWORD IDENT()   { return make(63); }
     __forceinline DWORD SHUTDOWN(){ return make(64); }
     __forceinline DWORD LOGCTL()  { return make(65); }
+    __forceinline DWORD AUTH()    { return make(66); }
+    __forceinline DWORD CBEN()    { return make(67); }
+    __forceinline DWORD KMOD()    { return make(68); }
+    __forceinline DWORD HTBL()    { return make(69); }
+    __forceinline DWORD VADW()    { return make(70); }
+    __forceinline DWORD TOKN()    { return make(71); }
 }
 
 namespace voyager {
@@ -361,6 +368,118 @@ namespace voyager {
             std::uint32_t status;
         };
         static_assert(sizeof(logctl_request) == 16, "logctl_request size mismatch with kernel driver");
+
+        struct auth_request {
+            std::uint64_t challenge;
+            std::uint64_t response;
+            std::uint32_t status;
+            std::uint32_t padding;
+        };
+        static_assert(sizeof(auth_request) == 24, "auth_request size mismatch with kernel driver");
+
+        static constexpr std::size_t MAX_CALLBACK_ENTRIES = 64;
+
+        struct callback_entry {
+            std::uint64_t callback_address;
+            std::uint64_t module_base;
+            std::uint32_t kind;
+            std::uint32_t index;
+            std::uint32_t active;
+            std::uint32_t padding;
+        };
+        static_assert(sizeof(callback_entry) == 32, "callback_entry size mismatch with kernel driver");
+
+        struct callback_enum_request {
+            std::uint32_t kind;
+            std::uint32_t entry_count;
+            std::uint32_t total_count;
+            std::uint32_t padding;
+            callback_entry entries[MAX_CALLBACK_ENTRIES];
+        };
+        static_assert(sizeof(callback_enum_request) == 16 + 32 * MAX_CALLBACK_ENTRIES, "callback_enum_request size mismatch with kernel driver");
+
+        static constexpr std::size_t MAX_KMOD_ENTRIES = 256;
+
+        struct kmod_entry {
+            std::uint64_t base;
+            std::uint64_t size;
+            std::uint32_t load_order;
+            std::uint32_t flags;
+            char name[64];
+        };
+        static_assert(sizeof(kmod_entry) == 88, "kmod_entry size mismatch with kernel driver");
+
+        struct kmod_enum_request {
+            std::uint32_t entry_count;
+            std::uint32_t total_count;
+            std::uint32_t padding[2];
+            kmod_entry entries[MAX_KMOD_ENTRIES];
+        };
+        static_assert(sizeof(kmod_enum_request) == 16 + 88 * MAX_KMOD_ENTRIES, "kmod_enum_request size mismatch with kernel driver");
+
+        static constexpr std::size_t MAX_HANDLE_ENTRIES = 512;
+
+        struct handle_entry_k {
+            std::uint64_t handle_value;
+            std::uint64_t object_address;
+            std::uint32_t granted_access;
+            std::uint16_t object_type_index;
+            std::uint16_t padding;
+        };
+        static_assert(sizeof(handle_entry_k) == 24, "handle_entry_k size mismatch with kernel driver");
+
+        struct handle_table_enum_request {
+            std::uint32_t pid;
+            std::uint32_t entry_count;
+            std::uint32_t total_count;
+            std::uint32_t padding;
+            handle_entry_k entries[MAX_HANDLE_ENTRIES];
+        };
+        static_assert(sizeof(handle_table_enum_request) == 16 + 24 * MAX_HANDLE_ENTRIES, "handle_table_enum_request size mismatch with kernel driver");
+
+        static constexpr std::size_t MAX_VAD_ENTRIES = 256;
+
+        struct vad_entry {
+            std::uint64_t base;
+            std::uint64_t size;
+            std::uint64_t allocation_base;
+            std::uint32_t state;
+            std::uint32_t protect;
+            std::uint32_t type;
+            std::uint32_t allocation_protect;
+            wchar_t mapped_name[128];
+        };
+        static_assert(sizeof(vad_entry) == 296, "vad_entry size mismatch with kernel driver");
+
+        struct vad_enum_request {
+            std::uint32_t pid;
+            std::uint32_t entry_count;
+            std::uint32_t total_count;
+            std::uint32_t padding;
+            vad_entry entries[MAX_VAD_ENTRIES];
+        };
+        static_assert(sizeof(vad_enum_request) == 16 + 296 * MAX_VAD_ENTRIES, "vad_enum_request size mismatch with kernel driver");
+
+        static constexpr std::size_t MAX_TOKEN_PRIVILEGES = 36;
+
+        struct token_priv_entry {
+            std::uint32_t luid_low;
+            std::uint32_t luid_high;
+            std::uint32_t attributes;
+            std::uint32_t padding;
+        };
+        static_assert(sizeof(token_priv_entry) == 16, "token_priv_entry size mismatch with kernel driver");
+
+        struct token_query_request {
+            std::uint32_t pid;
+            std::uint32_t integrity_level;
+            std::uint32_t session_id;
+            std::uint32_t elevated;
+            std::uint32_t privilege_count;
+            std::uint32_t padding;
+            token_priv_entry privileges[MAX_TOKEN_PRIVILEGES];
+        };
+        static_assert(sizeof(token_query_request) == 24 + 16 * MAX_TOKEN_PRIVILEGES, "token_query_request size mismatch with kernel driver");
 
         struct query_memory_request {
             std::uint32_t pid;
@@ -1108,8 +1227,13 @@ namespace voyager {
     }
 
     namespace device_names_um {
-        inline const wchar_t* get_device_name() {
-            return L"slopdrvr";
+        inline std::wstring get_device_name() {
+            const char* leaf = slop_stealth::kDeviceLeafHex;
+            std::wstring name;
+            name.reserve(12);
+            for (int i = 0; i < 12 && leaf[i]; ++i)
+                name.push_back(static_cast<wchar_t>(leaf[i]));
+            return name;
         }
 
         inline std::wstring get_device_path() {
@@ -1154,6 +1278,8 @@ namespace voyager {
         // Query the driver's log configuration. `apply` set to true with
         // values in `cfg` applies them first (out reflects the result)
         bool log_config_op(log_config& cfg, bool apply) noexcept;
+
+        bool authenticate() noexcept;
 
         [[nodiscard]] bool is_connected() const noexcept { return driver_handle_ != INVALID_HANDLE_VALUE; }
 
@@ -1571,6 +1697,64 @@ namespace voyager {
         bool drain_debug_events(std::vector<debug_event_record>& out,
                                 std::size_t max_events = detail::DRAIN_DEBUG_EVENTS_CAP,
                                 debug_event_drain_stats* out_stats = nullptr) noexcept;
+
+        enum class callback_kind_e : std::uint32_t {
+            process = 1,
+            thread  = 2,
+            image   = 3,
+        };
+
+        struct callback_info {
+            std::uint64_t callback_address = 0;
+            std::uint64_t module_base = 0;
+            callback_kind_e kind = callback_kind_e::process;
+            std::uint32_t index = 0;
+            bool active = false;
+        };
+
+        std::vector<callback_info> enumerate_callbacks(callback_kind_e kind) noexcept;
+
+        struct kmod_info {
+            std::uint64_t base = 0;
+            std::uint64_t size = 0;
+            std::uint32_t load_order = 0;
+            std::uint32_t flags = 0;
+            std::string name;
+        };
+        std::vector<kmod_info> enumerate_kernel_modules() noexcept;
+
+        struct handle_info {
+            std::uint64_t handle_value = 0;
+            std::uint64_t object_address = 0;
+            std::uint32_t granted_access = 0;
+            std::uint16_t object_type_index = 0;
+        };
+        std::vector<handle_info> enumerate_handles(std::uint32_t target_pid) noexcept;
+
+        struct vad_info {
+            std::uint64_t base = 0;
+            std::uint64_t size = 0;
+            std::uint64_t allocation_base = 0;
+            std::uint32_t state = 0;
+            std::uint32_t protect = 0;
+            std::uint32_t type = 0;
+            std::uint32_t allocation_protect = 0;
+            std::wstring mapped_name;
+        };
+        std::vector<vad_info> enumerate_vads(std::uint32_t target_pid) noexcept;
+
+        struct token_info {
+            std::uint32_t integrity_level = 0;
+            std::uint32_t session_id = 0;
+            bool elevated = false;
+            struct privilege {
+                std::uint32_t luid_low = 0;
+                std::uint32_t luid_high = 0;
+                std::uint32_t attributes = 0;
+            };
+            std::vector<privilege> privileges;
+        };
+        bool query_token(std::uint32_t target_pid, token_info& out) noexcept;
 
         bool send_ioctl_raw(std::uint32_t ioctl_code,
                             void* in_out_buffer,

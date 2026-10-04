@@ -8,9 +8,10 @@
 #include <function/DebugEvents.h>
 #include <function/MalwareSafe.h>
 #include <function/KernelDebugCapture.h>
+#include "../stealth_config.h"
 
 namespace ioctl_codes {
-    constexpr ULONG kFunctionBase = 0x800;
+    constexpr ULONG kFunctionBase = slop_stealth::kIoctlFunctionBase;
 
     __forceinline ULONG make(ULONG offset) {
         return 0x00220000u | ((kFunctionBase + offset) << 2);
@@ -80,9 +81,13 @@ namespace ioctl_codes {
     __forceinline ULONG IDENT()   { return make(63); }
     __forceinline ULONG SHUTDOWN(){ return make(64); }
 
-    // Runtime log control (level + cap), since the registry values live in
-    // the mapper's ephemeral service key and can't be set before load.
     __forceinline ULONG LOGCTL()  { return make(65); }
+    __forceinline ULONG AUTH()    { return make(66); }
+    __forceinline ULONG CBEN()    { return make(67); }
+    __forceinline ULONG KMOD()    { return make(68); }
+    __forceinline ULONG HTBL()    { return make(69); }
+    __forceinline ULONG VADW()    { return make(70); }
+    __forceinline ULONG TOKN()    { return make(71); }
 }
 
 namespace sd_state {
@@ -207,10 +212,6 @@ namespace dispatcher {
             }
         }
 
-        // --- clean-shutdown lifecycle -------------------------------------
-        // IDENT is the one code honored while quiescing (the client polls it
-        // to observe the state); everything else is refused so no new work
-        // can start against a driver that is going away.
         if (sd_state::g_unloading && code != ioctl_codes::IDENT()) {
             SD_LOG("DISPATCH reject_unloading code=0x%08X", code);
             irp->IoStatus.Status = STATUS_DELETE_PENDING;
@@ -223,7 +224,37 @@ namespace dispatcher {
             ~ioctl_guard_t() { _InterlockedDecrement(&sd_state::g_active_ioctls); }
         } ioctl_guard;
 
-        if (code == ioctl_codes::IDENT()) {
+        if (code == ioctl_codes::AUTH()) {
+            if (input_size >= sizeof(_SD_AUTH) && output_size >= sizeof(_SD_AUTH)) {
+                p_sd_auth_request auth = (p_sd_auth_request)buffer;
+                if (auth->response == 0) {
+                    auth->challenge = caller_validation::boot_nonce();
+                    auth->status = 0;
+                    SD_LOG("AUTH challenge_issued pid=%llu nonce=0x%llx",
+                        static_cast<UINT64>(reinterpret_cast<ULONG_PTR>(PsGetCurrentProcessId())),
+                        static_cast<unsigned long long>(auth->challenge));
+                } else {
+                    HANDLE pid = PsGetCurrentProcessId();
+                    if (caller_validation::verify_response(pid, auth->response)) {
+                        auth->status = 1;
+                        SD_LOG("AUTH success pid=%llu",
+                            static_cast<UINT64>(reinterpret_cast<ULONG_PTR>(pid)));
+                    } else {
+                        auth->status = 0;
+                        SD_LOG("AUTH failed pid=%llu response=0x%llx expected=0x%llx",
+                            static_cast<UINT64>(reinterpret_cast<ULONG_PTR>(pid)),
+                            static_cast<unsigned long long>(auth->response),
+                            static_cast<unsigned long long>(caller_validation::expected_response(pid)));
+                    }
+                }
+                status = STATUS_SUCCESS;
+                bytes = sizeof(_SD_AUTH);
+            }
+            else {
+                status = STATUS_INFO_LENGTH_MISMATCH;
+            }
+        }
+        else if (code == ioctl_codes::IDENT()) {
             if (input_size >= sizeof(_SD_IDENT) && output_size >= sizeof(_SD_IDENT)) {
                 p_sd_ident_request ident = (p_sd_ident_request)buffer;
                 RtlZeroMemory(ident, sizeof(*ident));
@@ -299,6 +330,15 @@ namespace dispatcher {
             else {
                 status = STATUS_INFO_LENGTH_MISMATCH;
             }
+        }
+        else if (!caller_validation::is_authenticated()) {
+            SD_LOG("DISPATCH reject_unauthenticated code=0x%08X pid=%llu",
+                code,
+                static_cast<UINT64>(reinterpret_cast<ULONG_PTR>(PsGetCurrentProcessId())));
+            irp->IoStatus.Status = STATUS_ACCESS_DENIED;
+            irp->IoStatus.Information = 0;
+            _IofCompleteRequest(irp, IO_NO_INCREMENT);
+            return STATUS_ACCESS_DENIED;
         }
         else if (code == ioctl_codes::PRW()) {
             if (input_size >= sizeof(_PRW) && output_size >= sizeof(_PRW)) {
@@ -1003,6 +1043,41 @@ namespace dispatcher {
                 SD_MALSAFE_LOG_INFO("ioctl NPKT pid=%lu max=%lu returned=%lu dropped_since=%llu out_bytes=%lu",
                     req_pid_value, max_records, returned, (unsigned long long)dropped_window, bytes);
             }
+        }
+        else if (code == ioctl_codes::CBEN()) {
+            if (input_size >= sizeof(callback_enum) && output_size >= sizeof(callback_enum)) {
+                status = functions::handle_callback_enum((p_callback_enum)buffer);
+                bytes = sizeof(callback_enum);
+            }
+            else { status = STATUS_INFO_LENGTH_MISMATCH; }
+        }
+        else if (code == ioctl_codes::KMOD()) {
+            if (input_size >= sizeof(kmod_enum) && output_size >= sizeof(kmod_enum)) {
+                status = functions::handle_kmod_enum((p_kmod_enum)buffer);
+                bytes = sizeof(kmod_enum);
+            }
+            else { status = STATUS_INFO_LENGTH_MISMATCH; }
+        }
+        else if (code == ioctl_codes::HTBL()) {
+            if (input_size >= sizeof(handle_table_enum) && output_size >= sizeof(handle_table_enum)) {
+                status = functions::handle_handle_table_enum((p_handle_table_enum)buffer);
+                bytes = sizeof(handle_table_enum);
+            }
+            else { status = STATUS_INFO_LENGTH_MISMATCH; }
+        }
+        else if (code == ioctl_codes::VADW()) {
+            if (input_size >= sizeof(vad_enum) && output_size >= sizeof(vad_enum)) {
+                status = functions::handle_vad_walk((p_vad_enum)buffer);
+                bytes = sizeof(vad_enum);
+            }
+            else { status = STATUS_INFO_LENGTH_MISMATCH; }
+        }
+        else if (code == ioctl_codes::TOKN()) {
+            if (input_size >= sizeof(token_query) && output_size >= sizeof(token_query)) {
+                status = functions::handle_token_query((p_token_query)buffer);
+                bytes = sizeof(token_query);
+            }
+            else { status = STATUS_INFO_LENGTH_MISMATCH; }
         }
         else {
             status = STATUS_INVALID_DEVICE_REQUEST;

@@ -10,7 +10,7 @@ backend_usermode_t g_user{};
 backend_kernel_t   g_kernel{};
 backend_t*         g_active = nullptr;
 
-backend_pref_t     g_pref = backend_pref_t::auto_detect;
+backend_pref_t     g_pref = backend_pref_t::force_kernel;
 bool               g_initialized = false;
 
 void apply_preference() {

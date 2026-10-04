@@ -228,6 +228,117 @@ typedef struct _SD_LOGCTL {
 } sd_logctl_request, * p_sd_logctl_request;
 static_assert(sizeof(sd_logctl_request) == 16, "sd_logctl_request size must be 16 bytes");
 
+typedef struct _SD_AUTH {
+    UINT64 challenge;
+    UINT64 response;
+    UINT32 status;
+    UINT32 padding;
+} sd_auth_request, * p_sd_auth_request;
+static_assert(sizeof(sd_auth_request) == 24, "sd_auth_request size must be 24 bytes");
+
+#define MAX_CALLBACK_ENTRIES 64
+
+typedef struct _CALLBACK_ENTRY {
+    UINT64 callback_address;
+    UINT64 module_base;
+    UINT32 kind;
+    UINT32 index;
+    UINT32 active;
+    UINT32 padding;
+} CALLBACK_ENTRY, *PCALLBACK_ENTRY;
+static_assert(sizeof(CALLBACK_ENTRY) == 32, "CALLBACK_ENTRY size must be 32 bytes");
+
+typedef struct _CBEN {
+    UINT32 kind;
+    UINT32 entry_count;
+    UINT32 total_count;
+    UINT32 padding;
+    CALLBACK_ENTRY entries[MAX_CALLBACK_ENTRIES];
+} callback_enum, *p_callback_enum;
+static_assert(sizeof(callback_enum) == 16 + 32 * MAX_CALLBACK_ENTRIES, "callback_enum size mismatch");
+
+#define MAX_KMOD_ENTRIES 256
+
+typedef struct _KMOD_ENTRY {
+    UINT64 base;
+    UINT64 size;
+    UINT32 load_order;
+    UINT32 flags;
+    char name[64];
+} KMOD_ENTRY, *PKMOD_ENTRY;
+static_assert(sizeof(KMOD_ENTRY) == 88, "KMOD_ENTRY size must be 88 bytes");
+
+typedef struct _KMOD_ENUM {
+    UINT32 entry_count;
+    UINT32 total_count;
+    UINT32 padding[2];
+    KMOD_ENTRY entries[MAX_KMOD_ENTRIES];
+} kmod_enum, *p_kmod_enum;
+static_assert(sizeof(kmod_enum) == 16 + 88 * MAX_KMOD_ENTRIES, "kmod_enum size mismatch");
+
+#define MAX_HANDLE_ENTRIES 512
+
+typedef struct _HANDLE_ENTRY_K {
+    UINT64 handle_value;
+    UINT64 object_address;
+    UINT32 granted_access;
+    UINT16 object_type_index;
+    UINT16 padding;
+} HANDLE_ENTRY_K, *PHANDLE_ENTRY_K;
+static_assert(sizeof(HANDLE_ENTRY_K) == 24, "HANDLE_ENTRY_K size must be 24 bytes");
+
+typedef struct _HANDLE_TABLE_ENUM {
+    UINT32 pid;
+    UINT32 entry_count;
+    UINT32 total_count;
+    UINT32 padding;
+    HANDLE_ENTRY_K entries[MAX_HANDLE_ENTRIES];
+} handle_table_enum, *p_handle_table_enum;
+static_assert(sizeof(handle_table_enum) == 16 + 24 * MAX_HANDLE_ENTRIES, "handle_table_enum size mismatch");
+
+#define MAX_VAD_ENTRIES 256
+
+typedef struct _VAD_ENTRY {
+    UINT64 base;
+    UINT64 size;
+    UINT64 allocation_base;
+    UINT32 state;
+    UINT32 protect;
+    UINT32 type;
+    UINT32 allocation_protect;
+    wchar_t mapped_name[128];
+} VAD_ENTRY, *PVAD_ENTRY;
+static_assert(sizeof(VAD_ENTRY) == 296, "VAD_ENTRY size must be 296 bytes");
+
+typedef struct _VAD_ENUM {
+    UINT32 pid;
+    UINT32 entry_count;
+    UINT32 total_count;
+    UINT32 padding;
+    VAD_ENTRY entries[MAX_VAD_ENTRIES];
+} vad_enum, *p_vad_enum;
+static_assert(sizeof(vad_enum) == 16 + 296 * MAX_VAD_ENTRIES, "vad_enum size mismatch");
+
+#define MAX_TOKEN_PRIVILEGES 36
+
+typedef struct _TOKEN_PRIV_ENTRY {
+    UINT32 luid_low;
+    UINT32 luid_high;
+    UINT32 attributes;
+    UINT32 padding;
+} TOKEN_PRIV_ENTRY, *PTOKEN_PRIV_ENTRY;
+static_assert(sizeof(TOKEN_PRIV_ENTRY) == 16, "TOKEN_PRIV_ENTRY size must be 16 bytes");
+
+typedef struct _TOKEN_QUERY {
+    UINT32 pid;
+    UINT32 integrity_level;
+    UINT32 session_id;
+    UINT32 elevated;
+    UINT32 privilege_count;
+    UINT32 padding;
+    TOKEN_PRIV_ENTRY privileges[MAX_TOKEN_PRIVILEGES];
+} token_query, *p_token_query;
+static_assert(sizeof(token_query) == 24 + 16 * MAX_TOKEN_PRIVILEGES, "token_query size mismatch");
 
 typedef struct _QM {
     UINT32 pid;
