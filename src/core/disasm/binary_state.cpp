@@ -44,8 +44,8 @@ std::string symbols_dir() {
     char base[MAX_PATH]{};
     const DWORD n = GetEnvironmentVariableA("LOCALAPPDATA", base, MAX_PATH);
     if (n == 0 || n >= MAX_PATH) return {};
-    const std::string dir = std::string(base, n) + "\\reverse-slop\\symbols";
-    CreateDirectoryA((std::string(base, n) + "\\reverse-slop").c_str(), nullptr);
+    const std::string dir = std::string(base, n) + "\\appdata\\symbols";
+    CreateDirectoryA((std::string(base, n) + "\\appdata").c_str(), nullptr);
     CreateDirectoryA(dir.c_str(), nullptr);
     return dir;
 }

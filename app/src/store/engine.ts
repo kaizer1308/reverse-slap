@@ -83,7 +83,7 @@ export const useEngine = create<EngineStore>((set) => ({
         target: { attached: boolean; pid?: number; name?: string };
       }>("app", "status");
       set({
-        backend: { badge: status.backend, kernel: status.backend === "kernel" },
+        backend: { badge: status.backend, kernel: status.backend !== "user" },
         target: status.target,
         boot: { stage: 6, total: 6, label: "ready", done: true },
       });

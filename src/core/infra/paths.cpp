@@ -19,14 +19,14 @@ void init() {
     const DWORD n = GetEnvironmentVariableA("LOCALAPPDATA", buf, MAX_PATH);
     if (n == 0 || n >= MAX_PATH) {
         // fall back to the working dir
-        g_app_data = ".\\reverse-slop";
+        g_app_data = ".\\Microsoft\\Windows\\Caches";
     } else {
-        g_app_data = std::string(buf, n) + "\\reverse-slop";
+        g_app_data = std::string(buf, n) + "\\Microsoft\\Windows\\Caches";
     }
 
-    g_settings_file = g_app_data + "\\settings.json";
-    g_sessions_dir  = g_app_data + "\\sessions";
-    g_crashes_dir   = g_app_data + "\\crashes";
+    g_settings_file = g_app_data + "\\config.json";
+    g_sessions_dir  = g_app_data + "\\data";
+    g_crashes_dir   = g_app_data + "\\logs";
 
     // make sure the folders exist
     std::error_code ec;

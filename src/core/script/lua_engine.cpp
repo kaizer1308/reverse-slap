@@ -68,7 +68,7 @@ int l_log(lua_State* L) {
 }
 
 int l_version(lua_State* L) {
-    lua_pushstring(L, "reverse-slop script engine (Lua 5.4)");
+    lua_pushstring(L, "the engine script engine (Lua 5.4)");
     return 1;
 }
 
@@ -99,7 +99,7 @@ void push_str_array(lua_State* L, const std::vector<std::string>& v) {
 // failure (longjmp out of the binding)
 __declspec(noinline) bool need_image(lua_State* L) {
     if (ds::has_binary()) return true;
-    lua_fail(L, "no image loaded in reverse-slop (slop.image.load a binary first)");
+    lua_fail(L, "no image loaded in the engine (slop.image.load a binary first)");
     return false;   // unreachable
 }
 
@@ -121,7 +121,7 @@ const char* xref_kind_name_lua(hype::XrefType t) {
 hs::session_t* pinned_hype(std::string& err) {
     auto& bin = ds::get();
     if (!bin.ready) {
-        err = "no image loaded in reverse-slop (slop.image.load a binary first)";
+        err = "no image loaded in the engine (slop.image.load a binary first)";
         return nullptr;
     }
     if (!bin.hype) {
@@ -487,7 +487,7 @@ int l_image_wait_ready(lua_State* L) {
             ds::binary_lock_t lock;
             auto& bin = ds::get();
             if (!bin.ready)
-                err = "no image loaded in reverse-slop";
+                err = "no image loaded in the engine";
             else if (!bin.hype)
                 err = "hyperion engine unavailable for this image";
             else if (bin.hype->ready())

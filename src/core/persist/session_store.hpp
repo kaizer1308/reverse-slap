@@ -48,6 +48,6 @@ private:
     void* db_ = nullptr;   // sqlite3*
 };
 
-std::string default_store_path();   // %LOCALAPPDATA%\reverse-slop\sessions.db
+std::string default_store_path();   // %LOCALAPPDATA%\the engine\sessions.db
 
 } // namespace slop::core::persist

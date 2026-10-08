@@ -84,7 +84,7 @@ void draw_loading_screen() {
                       ImGuiWindowFlags_NoScrollbar);
 
     ImGui::PushFont(big);
-    ImGui::TextUnformatted("reverse-slop");
+    ImGui::TextUnformatted("engine");
     ImGui::PopFont();
     ImGui::TextDisabled("windows reverse-engineering workbench, booting");
     ImGui::Separator();
@@ -194,7 +194,7 @@ void draw_loading_screen() {
 namespace {
 
 constexpr wchar_t kWindowClass[] = L"ReverseSlopMain";
-constexpr wchar_t kWindowTitle[] = L"reverse-slop";
+constexpr wchar_t kWindowTitle[] = L"engine";
 
 ID3D11Device*           g_device      = nullptr;
 ID3D11DeviceContext*    g_context     = nullptr;
@@ -327,7 +327,7 @@ std::string BuildIniFilePath() {
     char base[MAX_PATH]{};
     const DWORD n = GetEnvironmentVariableA("LOCALAPPDATA", base, MAX_PATH);
     if (n == 0 || n >= MAX_PATH) return {};
-    std::string dir = std::string(base, n) + "\\reverse-slop";
+    std::string dir = std::string(base, n) + "\\appdata";
     CreateDirectoryA(dir.c_str(), nullptr);
     return dir + "\\dock.ini";
 }
@@ -407,7 +407,7 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int n_cmd_show) {
         slop::core::infra::lifecycle::begin(std::move(cfg));
     }
 
-    slop::ui::panels::AppendBootLog("reverse-slop 0.1.1 (phase 2)");
+    slop::ui::panels::AppendBootLog("the engine 0.1.1 (phase 2)");
     slop::ui::panels::AppendBootLog("renderer initialized (directx 11, composition swapchain)");
     slop::ui::panels::AppendBootLog("chrome: borderless + dwm acrylic backdrop");
     slop::ui::panels::AppendBootLog("font backend: freetype");

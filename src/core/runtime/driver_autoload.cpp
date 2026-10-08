@@ -1,6 +1,7 @@
 // src/core/runtime/driver_autoload.cpp
 
 #include "core/runtime/driver_autoload.hpp"
+#include "core/runtime/xorstr.hpp"
 
 #include "core/runtime/backend_kernel.hpp"
 #include "core/runtime/backend_registry.hpp"
@@ -152,10 +153,10 @@ bool recover_quiesced_driver() {
                     == ERROR_SUCCESS) {
                 const std::wstring img(image);
                 // Mapper-loaded copies live under
-                // %LOCALAPPDATA%\reverse-slop\DriverRuntime\<random>.sys
-                if (img.find(L"reverse-slop\\DriverRuntime") !=
+                // %LOCALAPPDATA%\the engine\DriverRuntime\<random>.sys
+                if (img.find(L"appdata\\DriverRuntime") !=
                         std::wstring::npos ||
-                    img.find(L"reverse-slop/DriverRuntime") !=
+                    img.find(L"system/DriverRuntime") !=
                         std::wstring::npos) {
                     key = L"\\Registry\\Machine\\System\\CurrentControlSet"
                           L"\\Services\\" + std::wstring(name);
@@ -211,7 +212,7 @@ artifact_paths_t find_artifacts(const std::string& exe_dir) {
 }
 
 bool device_present() {
-    HANDLE h = CreateFileA("\\\\.\\slopdrvr", 0,
+    HANDLE h = CreateFileA(XORSTR("\\\\.\\slopdrvr"), 0,
                            FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
                            OPEN_EXISTING, 0, nullptr);
     if (h == INVALID_HANDLE_VALUE) return false;
@@ -232,7 +233,7 @@ load_report_t ensure_loaded_with(bool artifacts_available,
     }
     if (!artifacts_available) {
         rep.error = "slop_mapper.exe / slopdrvr.sys not found next to "
-                    "reverse-slop.exe, driver stays unloaded";
+                    "the engine.exe, driver stays unloaded";
         return rep;
     }
 
@@ -248,7 +249,7 @@ load_report_t ensure_loaded_with(bool artifacts_available,
     }
     if (!probe()) {
         rep.error = "device \\\\.\\slopdrvr still absent after mapper run "
-                    "(old build may be resident until reverse-slop exits)";
+                    "(old build may be resident until the engine exits)";
         return rep;
     }
     rep.log_tail = tail;

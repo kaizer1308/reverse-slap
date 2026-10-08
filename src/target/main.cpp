@@ -148,7 +148,7 @@ void process_command(const char* line) {
 int main(int argc, char* argv[]) {
     SetUnhandledExceptionFilter(crash_dump_filter);
     setvbuf(stdout, nullptr, _IONBF, 0);
-    std::printf("SlopTarget v0.1 - reverse-slop test target\n");
+    std::printf("SlopTarget v0.1 - the engine test target\n");
     std::printf("PID: %u\n\n", GetCurrentProcessId());
 
     // Initialize subsystems

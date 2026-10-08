@@ -1,0 +1,10 @@
+{
+    "bundle":  {
+                   "resources":  {
+                                    "../../build/src/engine/RuntimeBroker.exe":  "engine/RuntimeBroker.exe",
+                                     "../../build/src/engine/slop_frida.dll":  "engine/slop_frida.dll",
+                                     "../../build/mapper/slop_mapper.exe":  "engine/slop_mapper.exe",
+                                     "../../build/tools/magicmida":  "engine/tools/magicmida"
+                                 }
+               }
+}

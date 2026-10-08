@@ -81,7 +81,8 @@ bool mcp_enabled() {
 
 uint16_t mcp_port() {
     std::lock_guard lk(g_mu);
-    return static_cast<uint16_t>(g_data.value("mcp_port", 8765));
+    // default 0 = random ephemeral port. never a fixed predictable port.
+    return static_cast<uint16_t>(g_data.value("mcp_port", 0));
 }
 
 std::string mcp_token() {

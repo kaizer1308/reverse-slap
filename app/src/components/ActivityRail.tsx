@@ -1,15 +1,20 @@
 // app/src/components/ActivityRail.tsx
 // The icon strip on the left of the mockup. Chooses what the left panel shows
 
-import { Boxes, Radio, ScrollText, Settings, Target } from "lucide-react";
+import { Boxes, Crosshair, Cpu, FolderOpen, Package, Radio, ScrollText, Settings, Target, Wifi } from "lucide-react";
 
-export type RailView = "targets" | "modules" | "scripts" | "frida";
+export type RailView = "targets" | "modules" | "scripts" | "frida" | "game" | "network" | "kernel" | "files" | "plugins";
 
 const kItems: readonly { id: RailView; label: string; Icon: typeof Target }[] = [
   { id: "targets", label: "Targets", Icon: Target },
   { id: "modules", label: "Modules", Icon: Boxes },
+  { id: "game", label: "Game Tools", Icon: Crosshair },
+  { id: "network", label: "Network", Icon: Wifi },
+  { id: "kernel", label: "Kernel", Icon: Cpu },
+  { id: "files", label: "Files", Icon: FolderOpen },
   { id: "scripts", label: "Scripts", Icon: ScrollText },
   { id: "frida", label: "Frida", Icon: Radio },
+  { id: "plugins", label: "Plugins", Icon: Package },
 ];
 
 type Props = {

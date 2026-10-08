@@ -159,6 +159,28 @@ add_library(slop_core STATIC
     runtime/backend_registry.cpp
     runtime/backend_kernel.hpp
     runtime/backend_kernel.cpp
+    runtime/backend_winotify.hpp
+    runtime/backend_winotify.cpp
+    runtime/injector.hpp
+    runtime/injector.cpp
+    runtime/ptwalk.hpp
+    runtime/ptwalk.cpp
+    runtime/winotify_driver.hpp
+    runtime/winotify_driver.cpp
+    runtime/game_tools.hpp
+    runtime/game_tools.cpp
+    runtime/exploit_tools.hpp
+    runtime/exploit_tools.cpp
+    runtime/server_exploit_tools.hpp
+    runtime/server_exploit_tools.cpp
+    overlay/discord_overlay.hpp
+    overlay/discord_overlay.cpp
+    runtime/world_projection.hpp
+    runtime/world_projection.cpp
+    runtime/investigation.hpp
+    runtime/investigation.cpp
+    runtime/engine_dumper.hpp
+    runtime/engine_dumper.cpp
     runtime/scan_bridge.hpp
     runtime/scan_bridge.cpp
     runtime/voyager_comm.cpp
@@ -179,6 +201,8 @@ add_library(slop_core STATIC
     process/module_table.cpp
     process/module_dump.hpp
     process/module_dump.cpp
+    process/runtime_dump.hpp
+    process/runtime_dump.cpp
     process/thread_table.hpp
     process/thread_table.cpp
     process/handle_table.hpp

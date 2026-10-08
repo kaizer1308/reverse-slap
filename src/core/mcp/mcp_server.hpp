@@ -10,7 +10,7 @@
 namespace slop::core::mcp {
 
 struct server_config_t {
-    uint16_t    port  = 8765;
+    uint16_t    port  = 0;      // 0 = random ephemeral port
     std::string token;          // empty = no auth
 };
 

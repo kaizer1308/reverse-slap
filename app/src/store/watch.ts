@@ -30,7 +30,17 @@ export const useWatch = create<WatchStore>((set) => ({
     const offValues = events.on("watch.values", ({ attached, values }) =>
       set({ attached, values: new Map(values.map((v) => [v.id, v])) }),
     );
-    return () => { offList(); offValues(); };
+    // Fallback: poll every 500ms when SSE doesn't deliver watch.values
+    // (e.g. engine connected but no active target — values stale)
+    const poll = setInterval(() => {
+      void call<{ entries: WatchEntry[]; values: WatchValue[] }>("memory", "watch_list")
+        .then((res) => set({
+          entries: res.entries ?? [],
+          values: new Map((res.values ?? []).map((v) => [v.id, v])),
+        }))
+        .catch(() => { /* ignore — engine may be down */ });
+    }, 500);
+    return () => { offList(); offValues(); clearInterval(poll); };
   },
 
   load: async () => {

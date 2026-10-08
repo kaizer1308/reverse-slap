@@ -1,6 +1,8 @@
 // src/core/process/heap_list.cpp
 
 #include "core/process/heap_list.hpp"
+#include "core/runtime/lazy_import.hpp"
+namespace lazy = slop::core::runtime::lazy;
 
 #include <windows.h>
 #include <tlhelp32.h>
@@ -9,7 +11,7 @@ namespace slop::core::process {
 
 std::vector<heap_info_t> list_heaps(uint32_t pid, std::string* error) {
     std::vector<heap_info_t> out;
-    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPHEAPLIST, pid);
+    HANDLE snap = lazy::resolve_CreateToolhelp32Snapshot()(TH32CS_SNAPHEAPLIST, pid);
     if (snap == INVALID_HANDLE_VALUE) {
         if (error) *error = "snapshot failed";
         return out;
@@ -49,7 +51,7 @@ std::vector<heap_block_t> walk_heap_blocks(uint32_t pid, uint64_t heap_base,
                                            std::string* error,
                                            size_t max_blocks) {
     std::vector<heap_block_t> out;
-    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPHEAPLIST, pid);
+    HANDLE snap = lazy::resolve_CreateToolhelp32Snapshot()(TH32CS_SNAPHEAPLIST, pid);
     if (snap == INVALID_HANDLE_VALUE) {
         if (error) *error = "snapshot failed";
         return out;

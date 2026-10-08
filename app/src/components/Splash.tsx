@@ -8,7 +8,7 @@ import logoUrl from "@/assets/reverse-slop-icon.png";
 const kStageLabels = [
   "runtime pool & job queue",
   "process / target services",
-  "kernel bridge (slopdrvr)",
+  "kernel bridge",
   "settings & session store",
   "mcp server",
   "interface",

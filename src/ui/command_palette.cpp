@@ -119,7 +119,7 @@ void RebuildCommands() {
     }
     {
         Command c;
-        c.id = "app.quit"; c.title = "Quit reverse-slop"; c.group = "App"; c.shortcut = "Alt+F4";
+        c.id = "app.quit"; c.title = "Quit the engine"; c.group = "App"; c.shortcut = "Alt+F4";
         c.run = [] { PostQuitMessage(0); };
         g_commands.push_back(std::move(c));
     }

@@ -24,7 +24,7 @@ namespace {
 voyager::device_t* active_dev(std::string* error) {
     auto* k = dynamic_cast<backend_kernel_t*>(&active());
     if (!k || !k->device()) {
-        if (error) *error = "kernel driver not active (load slopdrvr first)";
+        if (error) *error = "kernel driver not active";
         return nullptr;
     }
     return k->device();

@@ -23,7 +23,16 @@ add_library(slop_ui STATIC
     view_strings.cpp
     view_pe.cpp
     view_debugger.cpp
-    view_unpacker.cpp
+    view_kernel_tools.cpp
+    view_game_tools.cpp
+    view_exploits.cpp
+    view_server_exploits.cpp
+    view_scripting.cpp
+    view_overlay.cpp
+    view_engine_helpers.cpp
+    view_investigation.cpp
+    view_engine_dump.cpp
+    view_analysis.cpp
 )
 
 target_link_libraries(slop_ui PRIVATE comdlg32)

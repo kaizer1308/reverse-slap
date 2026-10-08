@@ -1,32 +1,56 @@
 // app/src/components/panels/WorkspacePanel.tsx
-// The tabbed centre area. Disassembly is ported; the remaining tabs keep their
-// empty states until each view lands
+// The tabbed centre area with all workspace views
 
 import { useEffect, useMemo, useState } from "react";
 import { FolderOpen, Plus, ScanSearch, X } from "lucide-react";
-import DisassemblyView from "@/components/panels/DisassemblyView";
+import AnalyzeView from "@/components/panels/AnalyzeView";
+import CallGraphView from "@/components/panels/CallGraphView";
 import DebuggerView from "@/components/panels/DebuggerView";
+import DecompView from "@/components/panels/DecompView";
+import DevirtView from "@/components/panels/DevirtView";
+import DisassemblyView from "@/components/panels/DisassemblyView";
 import DotNetView from "@/components/panels/DotNetView";
+import EmulateView from "@/components/panels/EmulateView";
+import HexDiffView from "@/components/panels/HexDiffView";
 import MemoryView from "@/components/panels/MemoryView";
+import NotesView from "@/components/panels/NotesView";
+import PatchView2 from "@/components/panels/PatchView2";
 import PeView from "@/components/panels/PeView";
+import PersistView from "@/components/panels/PersistView";
+import PointerScanView from "@/components/panels/PointerScanView";
+import ProxyView from "@/components/panels/ProxyView";
 import StringsView from "@/components/panels/StringsView";
+import TypesView from "@/components/panels/TypesView";
+import XrayView from "@/components/panels/XrayView";
 import { openBinary } from "@/lib/openBinary";
 import { useEngine } from "@/store/engine";
 import { useDisasm } from "@/store/disasm";
 import { useDotnet } from "@/store/dotnet";
 
-type TabId = "disassembly" | "dotnet" | "strings" | "memory" | "debugger" | "pe";
+type TabId = "disassembly" | "dotnet" | "strings" | "memory" | "debugger" | "pe"
+  | "xray" | "patch" | "devirt" | "types" | "notes" | "analyze"
+  | "decomp" | "emulate" | "proxy" | "sessions" | "callgraph" | "ptrscan" | "hexdiff";
 
-// Which tabs read the static analysis session and which need a live process
-// Getting this wrong is what made Memory and Debugger look broken behind a
-// "no binary loaded" wall they never needed
-const kTabs: readonly { id: TabId; label: string; needs: "image" | "target" }[] = [
+const kTabs: readonly { id: TabId; label: string; needs: "image" | "target" | "none" }[] = [
   { id: "disassembly", label: "Disassembly", needs: "image" },
+  { id: "decomp", label: "Decompiler", needs: "image" },
   { id: "dotnet", label: ".NET", needs: "image" },
   { id: "strings", label: "Strings", needs: "image" },
   { id: "memory", label: "Memory", needs: "target" },
   { id: "debugger", label: "Debugger", needs: "target" },
   { id: "pe", label: "PE Browser", needs: "image" },
+  { id: "xray", label: "X-Ray", needs: "image" },
+  { id: "patch", label: "Patch", needs: "image" },
+  { id: "devirt", label: "Devirt", needs: "image" },
+  { id: "emulate", label: "Emulate", needs: "image" },
+  { id: "callgraph", label: "Call Graph", needs: "image" },
+  { id: "ptrscan", label: "Ptr Scan", needs: "target" },
+  { id: "hexdiff", label: "Diff", needs: "none" },
+  { id: "proxy", label: "Proxy", needs: "none" },
+  { id: "types", label: "Types", needs: "none" },
+  { id: "notes", label: "Notes", needs: "none" },
+  { id: "sessions", label: "Sessions", needs: "none" },
+  { id: "analyze", label: "Analyze", needs: "image" },
 ];
 
 export default function WorkspacePanel() {
@@ -116,18 +140,25 @@ export default function WorkspacePanel() {
     }
 
     switch (active) {
-      case "disassembly":
-        return <DisassemblyView />;
-      case "dotnet":
-        return <DotNetView />;
-      case "strings":
-        return <StringsView />;
-      case "pe":
-        return <PeView />;
-      case "memory":
-        return <MemoryView />;
-      case "debugger":
-        return <DebuggerView />;
+      case "disassembly": return <DisassemblyView />;
+      case "decomp": return <DecompView />;
+      case "dotnet": return <DotNetView />;
+      case "strings": return <StringsView />;
+      case "pe": return <PeView />;
+      case "memory": return <MemoryView />;
+      case "debugger": return <DebuggerView />;
+      case "xray": return <XrayView />;
+      case "patch": return <PatchView2 />;
+      case "devirt": return <DevirtView />;
+      case "emulate": return <EmulateView />;
+      case "callgraph": return <CallGraphView />;
+      case "ptrscan": return <PointerScanView />;
+      case "hexdiff": return <HexDiffView />;
+      case "proxy": return <ProxyView />;
+      case "types": return <TypesView />;
+      case "notes": return <NotesView />;
+      case "sessions": return <PersistView />;
+      case "analyze": return <AnalyzeView />;
     }
   };
 

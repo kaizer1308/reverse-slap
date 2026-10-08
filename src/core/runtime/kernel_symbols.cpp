@@ -128,7 +128,7 @@ pdb_ref_t find_rsds(std::string* error) {
 std::string cache_dir() {
     char base[MAX_PATH]{};
     const DWORD n = GetEnvironmentVariableA("LOCALAPPDATA", base, MAX_PATH);
-    std::string dir = n ? std::string(base) + "\\reverse-slop\\symsrv"
+    std::string dir = n ? std::string(base) + "\\appdata\\symsrv"
                         : ".\\symsrv";
     CreateDirectoryA(dir.c_str(), nullptr);
     return dir;

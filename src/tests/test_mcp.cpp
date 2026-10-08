@@ -84,7 +84,7 @@ TEST_CASE(mcp_initialize_handshake) {
     json res = fx.rpc("initialize");
     REQUIRE(res.contains("result"));
     REQUIRE_STR_EQ(res.at("result").at("protocolVersion").get<std::string>(), "2025-06-18");
-    REQUIRE_STR_EQ(res.at("result").at("serverInfo").at("name").get<std::string>(), "reverse-slop");
+    REQUIRE_STR_EQ(res.at("result").at("serverInfo").at("name").get<std::string>(), "engine");
     REQUIRE(res.at("result").at("capabilities").contains("tools"));
 
     // Session context rides the handshake: the agent knows what the app has

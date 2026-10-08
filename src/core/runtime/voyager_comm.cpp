@@ -1,4 +1,6 @@
 #include "voyager_comm.h"
+#include "core/runtime/lazy_import.hpp"
+namespace lazy = slop::core::runtime::lazy;
 #include "core/infra/diag.hpp"
 
 namespace slop { namespace core { namespace infra { namespace diag {
@@ -703,7 +705,7 @@ void voyager::device_t::set_process_id(std::uint32_t pid) noexcept {
 
     bool prev_pid_alive = true;
     if (prev_pid != 0) {
-        HANDLE prev_h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, static_cast<DWORD>(prev_pid));
+        HANDLE prev_h = lazy::resolve_OpenProcess()(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, static_cast<DWORD>(prev_pid));
         if (prev_h == nullptr) {
             prev_pid_alive = false;
         } else {
@@ -814,7 +816,7 @@ std::uint32_t voyager::device_t::find_process(const char* process_name) noexcept
         return 0;
     }
 
-    const HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    const HANDLE snapshot = lazy::resolve_CreateToolhelp32Snapshot()(TH32CS_SNAPPROCESS, 0);
     if (snapshot == INVALID_HANDLE_VALUE) {
         return 0;
     }
@@ -2293,7 +2295,7 @@ std::uint64_t voyager::device_t::call_function_attempt(
     thread_hijack::scatter_timing();
 
 
-    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    HANDLE snapshot = lazy::resolve_CreateToolhelp32Snapshot()(TH32CS_SNAPTHREAD, 0);
     if (snapshot == INVALID_HANDLE_VALUE) {
         DWORD err = GetLastError();
         remote_call_um_set_failure("thread_snapshot_failed", err, 0, 0);

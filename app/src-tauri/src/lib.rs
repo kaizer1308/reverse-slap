@@ -86,7 +86,7 @@ fn engine_endpoint(engine: State<'_, Engine>) -> Result<Endpoint, String> {
 /// resource engine at cargo build time and a stale copy cost an afternoon
 /// of debugging once
 fn sidecar_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
-    const NAME: &str = "reverse-slop-engine.exe";
+    const NAME: &str = "RuntimeBroker.exe";
 
     let dev_tree = || -> Option<PathBuf> {
         let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))

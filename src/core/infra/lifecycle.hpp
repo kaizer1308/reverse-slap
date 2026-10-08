@@ -41,7 +41,7 @@ struct config_t {
 
 struct boot_result_t {
     bool        kernel_attempted = false;   // mapper actually ran
-    bool        kernel_ok        = false;   // \\.\slopdrvr present afterwards
+    bool        kernel_ok        = false;   // kernel transport active
     std::string kernel_detail;              // mapper story for the splash
     bool        mcp_ok           = false;
     uint16_t    mcp_port         = 0;

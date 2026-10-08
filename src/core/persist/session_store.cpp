@@ -183,8 +183,8 @@ std::string default_store_path() {
     char base[MAX_PATH]{};
     const DWORD n = GetEnvironmentVariableA("LOCALAPPDATA", base, MAX_PATH);
     if (n == 0 || n >= MAX_PATH) return {};
-    CreateDirectoryA((std::string(base, n) + "\\reverse-slop").c_str(), nullptr);
-    return std::string(base, n) + "\\reverse-slop\\sessions.db";
+    CreateDirectoryA((std::string(base, n) + "\\appdata").c_str(), nullptr);
+    return std::string(base, n) + "\\appdata\\sessions.db";
 }
 
 } // namespace slop::core::persist

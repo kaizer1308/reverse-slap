@@ -175,7 +175,7 @@ std::string& aob_err_scrub() { static std::string e; e.clear(); return e; }
 
 int main() {
     setvbuf(stdout, nullptr, _IONBF, 0);
-    std::printf("=== reverse-slop LIVE DRIVE ===\n\n");
+    std::printf("=== the engine LIVE DRIVE ===\n\n");
 
     target_t tgt;
     if (!spawn_target(tgt))

@@ -34,7 +34,7 @@ std::mutex                       g_active_mu;
 std::map<std::string, std::shared_ptr<infra::cancel_source_t>> g_active;
 
 constexpr const char* kProtocolVersion = "2025-06-18";
-constexpr const char* kServerName      = "reverse-slop";
+constexpr const char* kServerName      = "engine";
 constexpr const char* kServerVersion   = "0.1.1";
 
 // the little intro agents get when they connect so they know how to drive us
@@ -49,7 +49,7 @@ constexpr const char* kInstructions =
     "Live flow: target.list -> target.attach(pid) -> memory.scan. Actions "
     "fail fast with structured errors when a precondition is missing (target "
     "attached, image.ready, image.hype.ready), re-check state rather than "
-    "retrying. driver.status reports whether the slopdrvr kernel backend is "
+    "retrying. driver.status reports whether the kernel backend is "
     "active; kernel-only actions return structured errors when it is not. "
     "Annotations (disasm.symbol_set, notes, types) persist per binary hash "
     "and are shared with the UI.";

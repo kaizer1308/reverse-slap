@@ -151,7 +151,7 @@ TEST_CASE(webfetch_hits_loopback_origin) {
 TEST_CASE(pki_ca_lifecycle) {
     // Generate is idempotent; issue requires it
     std::string err;
-    REQUIRE(slop::core::network::mitm::generate_ca("reverse-slop Local CA",
+    REQUIRE(slop::core::network::mitm::generate_ca("Local Development CA",
                                                    &err));
     REQUIRE(err.empty());
     REQUIRE(slop::core::network::mitm::ca_exists());

@@ -16,7 +16,11 @@ backend_kind_t   active_kind() noexcept;
 const char*      active_badge() noexcept;
 
 // live switch, returns true when a kernel backend is active
-bool             set_backend_preference(backend_pref_t pref);
-backend_pref_t   current_preference() noexcept;
+bool set_backend_preference(backend_pref_t pref);
+backend_pref_t current_preference() noexcept;
+
+// disconnects the active backend and unloads the winotify driver when this
+// process staged it, safe to call on every shutdown path
+void registry_shutdown();
 
 } // namespace slop::core::runtime

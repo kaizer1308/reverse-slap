@@ -1,15 +1,15 @@
 // src/core/runtime/backend_usermode.cpp
-// the plain win32 backend, openprocess and friends
+// the plain win32 backend — all suspicious APIs resolved at runtime via
+// PEB walk + manual export resolution so they never appear in our IAT
 
 #include "core/runtime/backend_usermode.hpp"
 #include "core/runtime/context.hpp"
+#include "core/runtime/lazy_import.hpp"
 
 #include <tlhelp32.h>
-
 #include <psapi.h>
 
 #include "core/infra/limits.hpp"
-
 namespace slop::core::runtime {
 
 namespace infra = slop::core::infra;
@@ -25,7 +25,7 @@ io_result_t rpm(HANDLE h, uintptr_t addr, void* buf, size_t len) {
     io_result_t r;
     if (len == 0) { r.ok = true; return r; }
     SIZE_T got = 0;
-    const BOOL ok = ReadProcessMemory(h, reinterpret_cast<LPCVOID>(addr), buf,
+    const BOOL ok = lazy::resolve_ReadProcessMemory()(h, reinterpret_cast<LPCVOID>(addr), buf,
                                       static_cast<SIZE_T>(len), &got);
     r.bytes = static_cast<size_t>(got);
     r.ok    = ok != FALSE && got == len;
@@ -37,7 +37,7 @@ io_result_t wpm(HANDLE h, uintptr_t addr, const void* buf, size_t len) {
     io_result_t r;
     if (len == 0) { r.ok = true; return r; }
     SIZE_T put = 0;
-    const BOOL ok = WriteProcessMemory(h, reinterpret_cast<LPVOID>(addr), buf,
+    const BOOL ok = lazy::resolve_WriteProcessMemory()(h, reinterpret_cast<LPVOID>(addr), buf,
                                        static_cast<SIZE_T>(len), &put);
     r.bytes = static_cast<size_t>(put);
     r.ok    = ok != FALSE && put == len;
@@ -54,7 +54,7 @@ arch_t detect_arch(HANDLE h) {
 
 elevation_t detect_elevation(uint32_t pid) {
     elevation_t e = elevation_t::unknown;
-    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    HANDLE h = lazy::resolve_OpenProcess()(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
     if (!h) return e;
     HANDLE tok = nullptr;
     if (OpenProcessToken(h, TOKEN_QUERY, &tok)) {
@@ -112,8 +112,8 @@ const char* backend_usermode_t::badge() const noexcept {
 target_handle_t backend_usermode_t::attach(uint32_t pid) {
     target_handle_t t;
     t.pid    = pid;
-    t.native = OpenProcess(kProcAccess, FALSE, pid);
-    if (!t.native) t.native = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, FALSE, pid);
+    t.native = lazy::resolve_OpenProcess()(kProcAccess, FALSE, pid);
+    if (!t.native) t.native = lazy::resolve_OpenProcess()(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, FALSE, pid);
     return t;
 }
 
@@ -141,7 +141,7 @@ io_result_t backend_usermode_t::protect_memory(const target_handle_t& h, uintptr
                                                size_t len, uint32_t new_prot, uint32_t* old_prot) {
     if (!h.valid()) return { false, 0, ERROR_INVALID_HANDLE };
     DWORD old = 0;
-    const BOOL ok = VirtualProtectEx(static_cast<HANDLE>(h.native),
+    const BOOL ok = lazy::resolve_VirtualProtectEx()(static_cast<HANDLE>(h.native),
                                      reinterpret_cast<LPVOID>(addr),
                                      static_cast<SIZE_T>(len),
                                      static_cast<DWORD>(new_prot), &old);
@@ -153,7 +153,7 @@ io_result_t backend_usermode_t::protect_memory(const target_handle_t& h, uintptr
 io_result_t backend_usermode_t::allocate_memory(const target_handle_t& h, uintptr_t addr,
                                                 size_t len, uint32_t prot, uintptr_t* out_addr) {
     if (!h.valid()) return { false, 0, ERROR_INVALID_HANDLE };
-    LPVOID p = VirtualAllocEx(static_cast<HANDLE>(h.native),
+    LPVOID p = lazy::resolve_VirtualAllocEx()(static_cast<HANDLE>(h.native),
                               reinterpret_cast<LPVOID>(addr),
                               static_cast<SIZE_T>(len),
                               MEM_RESERVE | MEM_COMMIT, static_cast<DWORD>(prot));
@@ -175,7 +175,7 @@ enum_result_t<process_info_t> backend_usermode_t::enum_processes() {
     enum_result_t<process_info_t> r;
     r.ok = true;
 
-    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    HANDLE snap = lazy::resolve_CreateToolhelp32Snapshot()(TH32CS_SNAPPROCESS, 0);
     if (snap == INVALID_HANDLE_VALUE) {
         r.ok    = false;
         r.error = GetLastError();
@@ -198,7 +198,7 @@ enum_result_t<process_info_t> backend_usermode_t::enum_processes() {
             pi.name = narrow;
 
             // arch and elevation probes are per pid syscalls, keep them cheap
-            HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pi.pid);
+            HANDLE h = lazy::resolve_OpenProcess()(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pi.pid);
             if (h) {
                 pi.arch = detect_arch(h);
                 // queryfullprocessimagename works without vm read and the handle is already open
@@ -230,7 +230,7 @@ enum_result_t<module_info_t> backend_usermode_t::enum_modules(const target_handl
     enum_result_t<module_info_t> r;
     if (!h.valid()) { r.error = ERROR_INVALID_HANDLE; return r; }
 
-    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32,
+    HANDLE snap = lazy::resolve_CreateToolhelp32Snapshot()(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32,
                                            h.pid);
     if (snap == INVALID_HANDLE_VALUE) {
         r.error = GetLastError();
@@ -267,7 +267,7 @@ enum_result_t<thread_info_t> backend_usermode_t::enum_threads(uint32_t pid) {
     enum_result_t<thread_info_t> r;
     r.ok = true;
 
-    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    HANDLE snap = lazy::resolve_CreateToolhelp32Snapshot()(TH32CS_SNAPTHREAD, 0);
     if (snap == INVALID_HANDLE_VALUE) {
         r.ok    = false;
         r.error = GetLastError();
@@ -299,7 +299,7 @@ enum_result_t<region_info_t> backend_usermode_t::enum_regions(const target_handl
     MEMORY_BASIC_INFORMATION mbi{};
     LPCVOID cursor = nullptr;
 
-    while (VirtualQueryEx(static_cast<HANDLE>(h.native), cursor, &mbi, sizeof(mbi))) {
+    while (lazy::resolve_VirtualQueryEx()(static_cast<HANDLE>(h.native), cursor, &mbi, sizeof(mbi))) {
         region_info_t ri;
         ri.base    = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
         ri.size    = mbi.RegionSize;

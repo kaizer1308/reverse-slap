@@ -1,6 +1,7 @@
 // src/core/analysis/danger.cpp
 
 #include "core/analysis/danger.hpp"
+#include "core/runtime/xorstr.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -14,7 +15,7 @@ struct risk_entry_t {
     const char* category;
 };
 
-constexpr risk_entry_t kRiskTable[] = {
+const risk_entry_t kRiskTable[] = {
     {"gets",               "unbounded-input"},
     {"strcpy",             "unbounded-copy"},
     {"strcat",             "unbounded-copy"},
@@ -36,11 +37,11 @@ constexpr risk_entry_t kRiskTable[] = {
     {"GetProcAddress",     "library-load"},
     {"SetWindowsHookExA",  "hooking"},
     {"SetWindowsHookExW",  "hooking"},
-    {"VirtualAllocEx",     "injection"},
-    {"VirtualAllocExNuma", "injection"},
-    {"WriteProcessMemory", "injection"},
-    {"CreateRemoteThread", "injection"},
-    {"CreateRemoteThreadEx", "injection"},
+    {XORSTR("VirtualAllocEx"),     "injection"},
+    {XORSTR("VirtualAllocExNuma"), "injection"},
+    {XORSTR("WriteProcessMemory"), "injection"},
+    {XORSTR("CreateRemoteThread"), "injection"},
+    {XORSTR("CreateRemoteThreadEx"), "injection"},
 };
 
 const char* risk_for(const std::string& name) {

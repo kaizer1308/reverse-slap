@@ -32,8 +32,8 @@ std::string store_dir() {
     char base[MAX_PATH]{};
     const DWORD n = GetEnvironmentVariableA("LOCALAPPDATA", base, MAX_PATH);
     if (n == 0 || n >= MAX_PATH) return {};
-    const std::string dir = std::string(base, n) + "\\reverse-slop\\types";
-    CreateDirectoryA((std::string(base, n) + "\\reverse-slop").c_str(), nullptr);
+    const std::string dir = std::string(base, n) + "\\appdata\\types";
+    CreateDirectoryA((std::string(base, n) + "\\appdata").c_str(), nullptr);
     CreateDirectoryA(dir.c_str(), nullptr);
     return dir;
 }

@@ -40,7 +40,7 @@ inline std::span<const u8> segment_bytes(PEImage& img, const u8* p, size_t file_
 class PELoader {
 public:
     std::optional<PEImage> load(const std::filesystem::path& path);
-    // In-memory variant (reverse-slop port): parse from a byte buffer —
+    // In-memory variant (the engine port): parse from a byte buffer —
     // e.g. the session's patched `file` image — instead of re-reading disk.
     std::optional<PEImage> load_buffer(const u8* data, size_t len);
 

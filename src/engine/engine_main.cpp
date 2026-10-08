@@ -50,8 +50,8 @@ BOOL WINAPI ctrl_handler(DWORD type) {
     case CTRL_LOGOFF_EVENT:
     case CTRL_SHUTDOWN_EVENT:
         control::request_quit("console signal");
-        // close event gives us about 5 seconds, the main loop sees the flag and tears down
-        std::this_thread::sleep_for(std::chrono::milliseconds(2500));
+        // give the main loop time to see the quit flag and tear down cleanly
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
         return TRUE;
     default:
         return FALSE;

@@ -61,6 +61,12 @@
 #include "core/debugger/debugger.hpp"
 #include "core/debugger/callstack.hpp"
 #include "core/disasm/binary_state.hpp"
+#include "core/runtime/game_tools.hpp"
+#include "core/runtime/exploit_tools.hpp"
+#include "core/runtime/server_exploit_tools.hpp"
+#include "core/runtime/world_projection.hpp"
+#include "core/overlay/discord_overlay.hpp"
+#include "core/process/runtime_dump.hpp"
 #include "core/disasm/engine.hpp"
 #include "core/disasm/function_index.hpp"
 #include "core/disasm/pe_parser.hpp"
@@ -72,6 +78,8 @@
 #include "core/runtime/backend_kernel.hpp"
 #include "core/runtime/scan_bridge.hpp"
 #include "core/runtime/session.hpp"
+#include "core/runtime/backend_winotify.hpp"
+#include "core/runtime/ptwalk.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -100,6 +108,7 @@ namespace recover = slop::core::analysis::recover;
 namespace devirt = slop::core::analysis::devirt;
 namespace magicmida = slop::core::analysis::magicmida;
 namespace unwind = slop::core::debugger::unwind;
+namespace ptwalk = slop::core::runtime::ptwalk;
 
 namespace {
 
@@ -826,7 +835,7 @@ const char* hint_for_tool_action(const std::string& tool, const std::string& act
     } else if (tool == "network") {
         if (action == "packets") return "protocol/direction are raw ints, read *_str (6=tcp 17=udp; 0=outbound 1=inbound). payload_hex capped at 96B; fetch full bytes via stream_data.";
         if (action == "stream_data") return "bytes is returned length, not the stream total; offset/len page through it. text substitutes '.' for non-printables.";
-        return "Capture flow: capture_start -> packets/dns/streams/stats -> capture_stop. Kernel actions need slopdrvr (see driver.status); store actions work without it.";
+        return "Capture flow: capture_start -> packets/dns/streams/stats -> capture_stop. Kernel actions need a driver (see driver.status); store actions work without it.";
     } else if (tool == "frida") {
         return "Handles are opaque: session/script ids come from attach/script_create, never OS pids. script_unload is terminal. Drain async output with messages(), call exports with rpc().";
     } else if (tool == "persist") {
@@ -1010,8 +1019,8 @@ void enrich_error(const std::string& tool, const json& args, json& payload) {
         else if (err.find("kernel") != std::string::npos ||
                  err.find("driver") != std::string::npos ||
                  err.find("DTB") != std::string::npos ||
-                 err.find("slopdrvr") != std::string::npos)
-            fix = "Check driver.status; kernel-read actions need slopdrvr active with a resolved kernel context.";
+                 err.find("driver") != std::string::npos)
+            fix = "Check driver.status; kernel-read actions need the kernel backend active with a resolved context.";
         else if (err.find("debugger") != std::string::npos ||
                  err.find("paused") != std::string::npos ||
                  err.find("wait_halt") != std::string::npos)
@@ -1278,7 +1287,7 @@ json tool_target(const json& args) {
                     {"image", loaded_image_json()}};
         if (!image_auto_loaded && !ds::has_binary())
             out["hint"] = "main module could not be read from disk; pass an explicit "
-                          "'path' to static tools or open a binary in reverse-slop";
+                          "'path' to static tools or open a binary in the engine";
         return out;
     }
 
@@ -2179,7 +2188,7 @@ json tool_disasm(const json& args) {
         } else {
             std::lock_guard lk(ds::state_mutex());
             auto& bin = ds::get();
-            if (!bin.ready) fail("no target attached and no image loaded in reverse-slop");
+            if (!bin.ready) fail("no target attached and no image loaded in the engine");
             auto off = bin.pe.va_to_offset(addr);
             if (!off) fail("address not mapped in loaded image (base may differ)");
             have = std::min(buf.size(), bin.file.size() - *off);
@@ -2320,7 +2329,7 @@ json tool_disasm(const json& args) {
         if (!args.contains("name") || !args.at("name").is_string())
             fail("missing 'name' string (empty clears)");
         const std::string name = args.at("name").get<std::string>();
-        if (!ds::has_binary()) fail("no image loaded in reverse-slop");
+        if (!ds::has_binary()) fail("no image loaded in the engine");
         ds::set_symbol(addr, name);   // saved, the ui sees it instantly
         return {{"va", addr}, {"name", name}, {"cleared", name.empty()}};
     }
@@ -2392,7 +2401,7 @@ json tool_disasm(const json& args) {
     } else {
         shared_lock.emplace();
         auto& bin = ds::get();
-        if (!bin.ready) fail("no image: pass 'path' or load a binary in reverse-slop "
+        if (!bin.ready) fail("no image: pass 'path' or load a binary in the engine "
                              "(see disasm.loaded)");
         // patches dirty the indexes so rebuild them lazily
         if (bin.indexes_dirty &&
@@ -2699,7 +2708,7 @@ json tool_disasm(const json& args) {
     if (action == "blocks" || action == "globals" || action == "vtables") {
         if (have_path)
             fail(action + " requires the app-loaded image (no 'path' support, "
-                 "load the binary in reverse-slop first)");
+                 "load the binary in the engine first)");
         // the lock above still guards the session
         auto& bin = ds::get();
         if (!bin.hype) fail("hyperion engine unavailable for this image");
@@ -3197,9 +3206,14 @@ json tool_driver(const json& args) {
         } else {
             out["hwbp_supported"] = false;
         }
-        out["device"] = "\\\\.\\slopdrvr";
+        out["device"] = runtime::active_badge() == std::string("kernel (signed winotify)")
+                            ? "\\\\.\\kernel bridge"
+                            : "\\\\.\\kernel driver";
+        out["transport"] = runtime::active_badge();
         out["preference"] = backend_pref_name(runtime::current_preference());
-        out["load_hint"] = "slop_mapper.exe load build\\driver\\slopdrvr.sys  (admin; closes of reverse-slop unload the driver cleanly)";
+        out["load_hint"] = runtime::active_badge() == std::string("kernel (signed winotify)")
+            ? "signed driver loads on demand via NtLoadDriver (admin); shutdown unloads it"
+            : "place signed driver.sys in driver/ next to the engine, or use slop_mapper.exe for the fallback driver";
         return out;
     }
 
@@ -3715,12 +3729,12 @@ json tool_driver(const json& args) {
         }
         if (!ntos_base) fail("could not locate ntoskrnl base");
         static const char* const kCriticalExports[] = {
-            "NtReadVirtualMemory", "NtWriteVirtualMemory", "NtOpenProcess",
+            "nt memory read", "nt memory write", "NtOpenProcess",
             "NtAllocateVirtualMemory", "NtProtectVirtualMemory",
             "NtQueryVirtualMemory", "NtCreateThreadEx",
             "NtDeviceIoControlFile", "NtQuerySystemInformation",
             "NtSetInformationThread", "NtClose", "NtDuplicateObject",
-            "MmCopyVirtualMemory", "KeStackAttachProcess",
+            "kernel memory copy", "kernel process attach",
             "KeUnstackDetachProcess", "PsLookupProcessByProcessId",
             "PsLookupThreadByThreadId", "ObOpenObjectByPointer",
             "MmProbeAndLockPages",
@@ -3855,21 +3869,80 @@ json tool_driver(const json& args) {
                 {"max_captures", max_caps}, {"bp_index", bp_index}};
     }
 
+    // ═══ STEALTH OPS ═══
+    if (action == "stealth_full") {
+        auto* w = dynamic_cast<runtime::backend_winotify_t*>(&runtime::active());
+        if (!w || !w->device()) fail("winotify kernel backend required");
+        auto& dev = *w->device();
+        auto r = ptwalk::run_full_stealth(dev, dev.native_handle(), GetCurrentProcessId());
+        return {
+            {"module_hidden", r.module_hidden}, {"headers_wiped", r.headers_wiped},
+            {"text_mutated", r.text_mutated}, {"device_renamed", r.device_renamed},
+            {"name_wiped", r.name_wiped}, {"piddb_clean", r.piddb_clean},
+            {"unloaded_clean", r.unloaded_clean}, {"handle_cloaked", r.handle_cloaked},
+            {"etw_blinded", r.etw_blinded}, {"callstacks_spoofed", r.callstacks_spoofed},
+            {"bigpool_scrubbed", r.bigpool_scrubbed},
+        };
+    }
+    if (action == "stealth_piddb") {
+        auto* w = dynamic_cast<runtime::backend_winotify_t*>(&runtime::active());
+        if (!w || !w->device()) fail("winotify kernel backend required");
+        return {{"clean", ptwalk::clean_piddb_cache(*w->device())}};
+    }
+    if (action == "stealth_unloaded") {
+        auto* w = dynamic_cast<runtime::backend_winotify_t*>(&runtime::active());
+        if (!w || !w->device()) fail("winotify kernel backend required");
+        return {{"clean", ptwalk::clean_mm_unloaded_drivers(*w->device())}};
+    }
+    if (action == "stealth_handle_cloak") {
+        auto* w = dynamic_cast<runtime::backend_winotify_t*>(&runtime::active());
+        if (!w || !w->device()) fail("winotify kernel backend required");
+        return {{"cloaked", ptwalk::cloak_handle_table_entry(
+            *w->device(), w->device()->native_handle(), GetCurrentProcessId())}};
+    }
+    if (action == "stealth_etw_blind") {
+        auto* w = dynamic_cast<runtime::backend_winotify_t*>(&runtime::active());
+        if (!w || !w->device()) fail("winotify kernel backend required");
+        return {{"blinded", ptwalk::blind_etw_ti_provider(*w->device())}};
+    }
+    if (action == "stealth_spoof_stacks") {
+        auto* w = dynamic_cast<runtime::backend_winotify_t*>(&runtime::active());
+        if (!w || !w->device()) fail("winotify kernel backend required");
+        return {{"spoofed", ptwalk::spoof_thread_callstacks(*w->device(), GetCurrentProcessId())}};
+    }
+    if (action == "stealth_bigpool") {
+        auto* w = dynamic_cast<runtime::backend_winotify_t*>(&runtime::active());
+        if (!w || !w->device()) fail("winotify kernel backend required");
+        return {{"scrubbed", ptwalk::scrub_bigpool_tags(*w->device())}};
+    }
+    if (action == "stealth_clear_ic") {
+        // clear InstrumentationCallback on target's EPROCESS
+        auto* w = dynamic_cast<runtime::backend_winotify_t*>(&runtime::active());
+        if (!w || !w->device()) fail("winotify kernel backend required");
+        auto s = process::active_session();
+        if (!s || !s->valid()) fail("attach to target first");
+        auto eproc = ptwalk::find_eprocess(*w->device(), s->pid());
+        if (!eproc) fail("cannot resolve target EPROCESS");
+        return {{"cleared", ptwalk::clear_instrumentation_callback(*w->device(), eproc)}};
+    }
+
     fail("driver: unknown action (status|backend|kernel_modules|dump_driver|"
          "kernel_read|kernel_write|kernel_search|call|v2p|ssdt|peb|"
          "resolve_export|windows|find_references|heap_walk|heap_blocks|"
          "defer_call|defer_list|defer_execute|defer_results|defer_cancel|"
          "symbols_load|symbols_lookup|symbols_nearest|anti_debug_spoof|"
          "sandbox_protect|sandbox_unprotect|log_config|read_teb|peb_modules|"
-         "integrity_checks|sniff_buffers)");
+         "integrity_checks|sniff_buffers|stealth_full|stealth_piddb|"
+         "stealth_unloaded|stealth_handle_cloak|stealth_etw_blind|"
+         "stealth_spoof_stacks|stealth_bigpool|stealth_clear_ic)");
 }
 
 
 
 // tool: inject
 //
-// Kernel-assisted dll injection over slopdrvr. Every touch on the target
-// rides ioctls (allocate through KeStackAttachProcess, write via dtb physical
+// Kernel-assisted dll injection over kernel driver. Every touch on the target
+// rides ioctls (allocate through kernel process attach, write via dtb physical
 // paths, execute via thread hijack with spoofed return), so the user-mode
 // side never opens the target and never spawns a remote thread. Two modes:
 //   loadlibrary -> resolve kernel32!LoadLibraryW in target, hijack a running
@@ -4031,7 +4104,7 @@ json tool_emulate(const json& args) {
     if (!have_code && args.contains("file_addr")) {
         std::lock_guard lk(ds::state_mutex());
         auto& bin = ds::get();
-        if (!bin.ready) fail("no image loaded in reverse-slop (see disasm.loaded)");
+        if (!bin.ready) fail("no image loaded in the engine (see disasm.loaded)");
         const uint64_t addr = parse_addr(args, "file_addr");
         uint64_t len = args.contains("code_len") ? parse_addr(args, "code_len") : 64;
         if (len == 0 || len > (1ull << 20)) fail("bad code_len");
@@ -4456,7 +4529,7 @@ json tool_analyze(const json& args,
         shared_lock.emplace();
         auto& bin = ds::get();
         if (!bin.ready)
-            fail("no image: pass 'path' or load a binary in reverse-slop "
+            fail("no image: pass 'path' or load a binary in the engine "
                  "(see disasm.loaded)");
         pe = &bin.pe; file = &bin.file;
         img_name = bin.name;
@@ -5590,7 +5663,7 @@ std::string assemble_one(const std::string& text, uint64_t addr,
                 if (ti < tokens.size() && tokens[ti] == "*") {
                     ti++;
                     if (ti < tokens.size())
-                        op.mem.scale = static_cast<uint32_t>(
+                        op.mem.scale = static_cast<ZyanU8>(
                             std::strtoul(tokens[ti++].c_str(), nullptr, 0));
                 }
             }
@@ -5730,7 +5803,7 @@ void dotnet_wait_ready() {
         {
             std::lock_guard lk(ds::state_mutex());
             auto& bin0 = ds::get();
-            if (!bin0.ready) fail("no image loaded in reverse-slop (see disasm.loaded)");
+            if (!bin0.ready) fail("no image loaded in the engine (see disasm.loaded)");
             if (!bin0.hype)  fail("hyperion engine unavailable for this image");
             if (bin0.hype->ready()) break;
             const std::string herr = bin0.hype->error();
@@ -5777,7 +5850,7 @@ json tool_dotnet(const json& args) {
 
     std::lock_guard lk(ds::state_mutex());
     auto& bin = ds::get();
-    if (!bin.ready) fail("no image loaded in reverse-slop (see disasm.loaded)");
+    if (!bin.ready) fail("no image loaded in the engine (see disasm.loaded)");
     if (!bin.hype)  fail("hyperion engine unavailable for this image");
 
     if (!bin.hype->is_dotnet()) {
@@ -6009,7 +6082,7 @@ json tool_decomp(const json& args) {
                 std::lock_guard lk(ds::state_mutex());
                 auto& bin0 = ds::get();
                 if (!bin0.ready)
-                    fail("no image loaded in reverse-slop (see disasm.loaded)");
+                    fail("no image loaded in the engine (see disasm.loaded)");
                 if (!bin0.hype) fail("hyperion engine unavailable for this image");
                 if (bin0.hype->ready()) break;
                 // cancelled or failed means waiting is pointless
@@ -6037,7 +6110,7 @@ json tool_decomp(const json& args) {
 
     std::lock_guard lk(ds::state_mutex());
     auto& bin = ds::get();
-    if (!bin.ready) fail("no image loaded in reverse-slop (see disasm.loaded)");
+    if (!bin.ready) fail("no image loaded in the engine (see disasm.loaded)");
     if (!bin.hype) fail("hyperion engine unavailable for this image");
 
     // Fast reject: an unmapped VA can never decompile. Without this the
@@ -6323,7 +6396,7 @@ json tool_re(const json& args) {
         shared_lock.emplace();
         auto& bin = ds::get();
         if (!bin.ready)
-            fail("no image: pass 'path' or load a binary in reverse-slop");
+            fail("no image: pass 'path' or load a binary in the engine");
         pe = &bin.pe; file = &bin.file; fidx = &bin.fns; xidx = &bin.xrefs;
         session_base = bin.base;
         if (bin.hype && bin.hype->ready()) hdb = &bin.hype->db();
@@ -6525,7 +6598,7 @@ json tool_xray(const json& args) {
         shared_lock.emplace();
         auto& bin = ds::get();
         if (!bin.ready)
-            fail("no image: pass 'path' or load a binary in reverse-slop");
+            fail("no image: pass 'path' or load a binary in the engine");
         pe = &bin.pe; file = &bin.file;
         default_base = bin.base;
         img_name = bin.name;
@@ -6896,7 +6969,7 @@ json tool_xray(const json& args) {
 
 json tool_patch(const json& args) {
     const std::string action = require_action(args);
-    if (!ds::has_binary()) fail("no image loaded in reverse-slop (see disasm.loaded)");
+    if (!ds::has_binary()) fail("no image loaded in the engine (see disasm.loaded)");
 
     ds::binary_lock_t lk;
     auto& bin = ds::get();
@@ -6950,30 +7023,30 @@ json tool_patch(const json& args) {
         return {{"patches", arr}, {"total", bin.patches.size()},
                 {"indexes_dirty", bin.indexes_dirty}};
     } else if (action == "full_pass") {
-        auto r = imgpatch::full_pass(bin, parse_addr(args, "addr"),
-                                     args.value("dry_run", false));
-        if (!r.ok) fail(r.error);
+        auto fp = imgpatch::full_pass(bin, parse_addr(args, "addr"),
+                                      args.value("dry_run", false));
+        if (!fp.ok) fail(fp.error);
         json steps = json::array();
-        for (const auto& s : r.steps)
+        for (const auto& s : fp.steps)
             steps.push_back({{"step", s.name}, {"success", s.success},
                              {"note", s.note}});
         return {{"ok", true},
-                {"dry_run", r.dry_run},
+                {"dry_run", fp.dry_run},
                 {"steps", steps},
-                {"pre_obfuscation_score", r.pre_score},
-                {"post_obfuscation_score", r.post_score},
-                {"score_reduction", r.pre_score - r.post_score},
-                {"strings_found", r.strings_found},
-                {"bytes_changed", r.bytes_changed},
+                {"pre_obfuscation_score", fp.pre_score},
+                {"post_obfuscation_score", fp.post_score},
+                {"score_reduction", fp.pre_score - fp.post_score},
+                {"strings_found", fp.strings_found},
+                {"bytes_changed", fp.bytes_changed},
                 {"journal_total", bin.patches.size()}};
     } else if (action == "rebuild") {
-        auto r = imgpatch::rebuild(bin, parse_addr(args, "addr"));
-        if (!r.ok) fail(r.error);
+        auto rb = imgpatch::rebuild(bin, parse_addr(args, "addr"));
+        if (!rb.ok) fail(rb.error);
         json insns = json::array();
-        for (const auto& [va, text] : r.insns)
+        for (const auto& [va, text] : rb.insns)
             insns.push_back({{"va", va}, {"text", text}});
         return {{"ok", true},
-                {"instruction_count", r.instruction_count},
+                {"instruction_count", rb.instruction_count},
                 {"insns", insns},
                 {"indexes_dirty", bin.indexes_dirty}};
     } else {
@@ -7235,7 +7308,7 @@ json tool_types(const json& args) {
 
 json tool_notes(const json& args) {
     const std::string action = require_action(args);
-    if (!ds::has_binary()) fail("no image loaded in reverse-slop (see disasm.loaded)");
+    if (!ds::has_binary()) fail("no image loaded in the engine (see disasm.loaded)");
 
     if (action == "set_comment") {
         const uint64_t va = parse_addr(args, "addr");
@@ -7356,7 +7429,7 @@ json tool_devirt(const json& args) {
         shared_lock.emplace();
         auto& bin = ds::get();
         if (!bin.ready)
-            fail("no image: pass 'path' or load a binary in reverse-slop");
+            fail("no image: pass 'path' or load a binary in the engine");
         img.pe = &bin.pe; img.file = &bin.file;
         img.base = bin.base;
         img_name = bin.name;
@@ -8203,6 +8276,149 @@ json tool_app(const json& args) {
     return {};
 }
 
+
+// ═══ tool: game — unified game analysis, exploit, overlay, and engine tools ═══
+
+json tool_game(const json& args) {
+    namespace game_tools = slop::core::runtime::game_tools;
+    namespace exploit_tools = slop::core::runtime::exploit_tools;
+    namespace server_exploit = slop::core::runtime::server_exploit;
+    namespace projection = slop::core::runtime::projection;
+    namespace overlay = slop::core::overlay;
+    namespace runtime = slop::core::runtime;
+    namespace process = slop::core::process;
+    const std::string action = args.value("action", std::string{});
+    auto& session = need_session();
+    game_tools::reader_t rd;
+    rd.be = &runtime::active();
+    rd.h  = session.handle();
+
+    if (action == "aob_generate") {
+        const uint64_t addr = parse_addr(args, "addr");
+        auto pat = game_tools::generate_aob(rd, addr, args.value("len", 32),
+            args.value("label", std::string{}));
+        return {{"pattern", pat.pattern}, {"origin", pat.origin_va}, {"byte_count", pat.byte_count}};
+    }
+    if (action == "crypto_scan") {
+        auto mods = runtime::active().enum_modules(session.handle());
+        json arr = json::array();
+        for (const auto& m : mods.items) {
+            for (const auto& h : game_tools::scan_crypto_constants(rd, m.base, m.size))
+                arr.push_back({{"address", h.address}, {"algorithm", h.algorithm}, {"constant", h.constant_name}});
+            if (arr.size() > 1024) break;
+        }
+        return {{"hits", arr}, {"count", arr.size()}};
+    }
+    if (action == "binary_map") {
+        auto blocks = game_tools::build_binary_map(rd, parse_addr(args, "base"),
+            args.value("size", 0u), args.value("block_size", 256));
+        json arr = json::array();
+        for (const auto& b : blocks) arr.push_back({{"va", b.va}, {"entropy", b.entropy}, {"kind", static_cast<int>(b.kind)}});
+        return {{"blocks", arr}, {"count", arr.size()}};
+    }
+    if (action == "find_timers") {
+        auto regs = runtime::active().enum_regions(session.handle());
+        auto timers = exploit_tools::find_timers(rd, regs.items, args.value("sample_ms", 500), args.value("min_rate", 0.5f));
+        json arr = json::array();
+        for (const auto& t : timers) arr.push_back({{"address", t.addr}, {"initial", t.initial}, {"current", t.current}, {"rate", t.rate}, {"type", t.type}});
+        return {{"timers", arr}, {"count", arr.size()}};
+    }
+    if (action == "find_exploit") {
+        auto mods = runtime::active().enum_modules(session.handle());
+        auto regs = runtime::active().enum_regions(session.handle());
+        const std::string type = args.value("type", std::string{"ammo"});
+        exploit_tools::exploit_result_t result;
+        if (type == "ammo") result = exploit_tools::find_ammo_exploit(rd, mods.items, regs.items, args.value("known_value", 0u));
+        else if (type == "cooldown") result = exploit_tools::find_cooldown_exploit(rd, regs.items);
+        else if (type == "health") result = exploit_tools::find_health_exploit(rd, mods.items, regs.items, args.value("known_value", 0.0f));
+        else if (type == "recoil") result = exploit_tools::find_recoil_exploit(rd, regs.items);
+        else if (type == "firerate") result = exploit_tools::find_firerate_exploit(rd, regs.items);
+        else fail("unknown exploit type: " + type);
+        json addrs = json::array();
+        for (auto va : result.candidate_addrs) addrs.push_back(va);
+        return {{"name", result.name}, {"status", result.status}, {"description", result.description}, {"candidates", addrs}};
+    }
+    if (action == "find_code_caves") {
+        auto mods = runtime::active().enum_modules(session.handle());
+        auto caves = exploit_tools::find_code_caves(rd, mods.items, args.value("min_size", 32));
+        json arr = json::array();
+        for (const auto& c : caves) arr.push_back({{"address", c.addr}, {"size", c.size}, {"module", c.module}});
+        return {{"caves", arr}, {"count", arr.size()}};
+    }
+    if (action == "test_authority") {
+        auto r = server_exploit::test_authority(rd, runtime::active(), session.handle(),
+            parse_addr(args, "addr"), args.value("size", 4), args.value("label", std::string{}), args.value("wait_ms", 2000));
+        const char* a = r.authority == server_exploit::authority_t::client ? "client" : r.authority == server_exploit::authority_t::server ? "server" : "hybrid";
+        return {{"authority", a}, {"response_ms", r.response_ms}, {"notes", r.notes}};
+    }
+    if (action == "tick_rate") {
+        auto r = server_exploit::detect_tick_rate(g_traffic, session.pid());
+        return {{"tick_rate_hz", r.tick_rate_hz}, {"avg_interval_ms", r.avg_interval_ms}, {"jitter_ms", r.jitter_ms}, {"samples", r.sample_count}};
+    }
+    if (action == "find_position") {
+        auto regs = runtime::active().enum_regions(session.handle());
+        auto pos = server_exploit::find_position_values(rd, regs.items);
+        json arr = json::array();
+        for (const auto& p : pos) arr.push_back({{"address", p.addr}, {"x", p.x}, {"y", p.y}, {"z", p.z}});
+        return {{"positions", arr}, {"count", arr.size()}};
+    }
+    if (action == "find_speed") {
+        auto regs = runtime::active().enum_regions(session.handle());
+        auto spd = server_exploit::find_speed_values(rd, regs.items);
+        json arr = json::array();
+        for (const auto& s : spd) arr.push_back({{"address", s.addr}, {"value", s.value}, {"context", s.context}});
+        return {{"speeds", arr}, {"count", arr.size()}};
+    }
+    if (action == "world_to_screen") {
+        float w[3] = {args.value("x", 0.0f), args.value("y", 0.0f), args.value("z", 0.0f)};
+        float sw = args.value("screen_w", 1920.0f), sh = args.value("screen_h", 1080.0f);
+        const std::string mode = args.value("mode", std::string{"ue"});
+        projection::screen_point_t result;
+        if (mode == "ue") { auto v = projection::read_ue_view_info(rd, parse_addr(args, "camera")); result = projection::ue_world_to_screen({w[0],w[1],w[2]}, v, sw, sh); }
+        else { float m[16]={}; rd.read(parse_addr(args, "matrix_addr"), m, 64); result = mode=="transposed" ? projection::world_to_screen_transposed({w[0],w[1],w[2]},m,sw,sh) : projection::world_to_screen_rowmajor({w[0],w[1],w[2]},m,sw,sh); }
+        return {{"x", result.x}, {"y", result.y}, {"visible", result.visible}};
+    }
+    if (action == "read_tarray") {
+        auto elems = projection::read_tarray(rd, parse_addr(args, "addr"), args.value("max", 4096));
+        json arr = json::array();
+        for (auto va : elems) arr.push_back(va);
+        return {{"elements", arr}, {"count", arr.size()}};
+    }
+    if (action == "dump_deobfuscated") {
+        process::runtime_dump_options_t opts;
+        opts.reconstruct_imports = args.value("imports", true);
+        opts.detect_oep = args.value("oep", true);
+        auto r = process::dump_deobfuscated(const_cast<runtime::session_t&>(session),
+            parse_addr(args, "base"), args.value("size", 0u), args.at("path").get<std::string>(), opts);
+        if (!r.ok) fail("dump failed: " + r.error);
+        return {{"ok", true}, {"bytes", r.bytes_written}, {"oep_rva", r.detected_oep_rva},
+                {"oep_method", r.oep_method}, {"imports", r.total_imports}, {"resolved", r.resolved_imports}};
+    }
+    if (action == "overlay_connect") {
+        return {{"connected", overlay::connect(session.pid())}, {"error", overlay::state().error}};
+    }
+    if (action == "overlay_disconnect") { overlay::disconnect(); return {{"ok", true}}; }
+    if (action == "overlay_draw") {
+        std::vector<overlay::draw_cmd_t> cmds;
+        if (args.contains("commands")) for (const auto& c : args["commands"]) {
+            overlay::draw_cmd_t cmd; const std::string t = c.value("type", std::string{"rect"});
+            if (t=="line") cmd.type=overlay::cmd_type_t::line; else if (t=="rect") cmd.type=overlay::cmd_type_t::rect;
+            else if (t=="filled_rect") cmd.type=overlay::cmd_type_t::filled_rect; else if (t=="circle") cmd.type=overlay::cmd_type_t::circle;
+            else if (t=="text") cmd.type=overlay::cmd_type_t::text; else if (t=="cross") cmd.type=overlay::cmd_type_t::cross;
+            else if (t=="corner_box") cmd.type=overlay::cmd_type_t::corner_box;
+            cmd.x1=c.value("x1",0.f); cmd.y1=c.value("y1",0.f); cmd.x2=c.value("x2",0.f); cmd.y2=c.value("y2",0.f);
+            cmd.radius=c.value("radius",0.f); cmd.thickness=c.value("thickness",1.f); cmd.font_size=c.value("font_size",14.f);
+            if (c.contains("text")) cmd.text=c["text"]; if (c.contains("color")) { cmd.color={c["color"].value("r",(uint8_t)255),c["color"].value("g",(uint8_t)255),c["color"].value("b",(uint8_t)255),c["color"].value("a",(uint8_t)255)}; }
+            cmds.push_back(std::move(cmd));
+        }
+        overlay::submit(std::move(cmds)); overlay::render();
+        return {{"rendered", true}, {"frame", overlay::state().frame_count}};
+    }
+    if (action == "overlay_clear") { overlay::clear(); return {{"cleared", true}}; }
+
+    fail("game: unknown action");
+}
+
 } // namespace
 
 void list_tools(json& out) {
@@ -8252,26 +8468,28 @@ void list_tools(json& out) {
         R"({"type":"object","properties":{"action":{"type":"string","enum":["read_file","write_file","list_directory","create_directory","delete_path","search_files","grep_in_files"]},"path":{"type":"string"},"hex":{"type":"string"},"text":{"type":"string"},"append":{"type":"boolean"},"root":{"type":"string"},"needle":{"type":"string"},"suffix":{"type":"string"},"limit":{"type":"integer"},"max_bytes":{"type":"integer"}},"required":["action"]})";
     const char* web_schema =
         R"({"type":"object","properties":{"action":{"type":"string","enum":["fetch","post"]},"url":{"type":"string"},"body":{"type":"string"},"content_type":{"type":"string"},"timeout_ms":{"type":"integer"}},"required":["action"]})";
+    const char* game_schema =
+        R"({"type":"object","properties":{"action":{"type":"string","enum":["aob_generate","crypto_scan","binary_map","find_timers","find_exploit","find_code_caves","test_authority","tick_rate","find_position","find_speed","world_to_screen","read_tarray","dump_deobfuscated","overlay_connect","overlay_disconnect","overlay_draw","overlay_clear","rtti"]},"addr":{"type":"integer"},"base":{"type":"integer"},"size":{"type":"integer"},"len":{"type":"integer"},"label":{"type":"string"},"pattern":{"type":"string"},"type":{"type":"string"},"known_value":{},"mode":{"type":"string"},"x":{"type":"number"},"y":{"type":"number"},"z":{"type":"number"},"screen_w":{"type":"number"},"screen_h":{"type":"number"},"camera":{"type":"integer"},"matrix_addr":{"type":"integer"},"path":{"type":"string"},"imports":{"type":"boolean"},"oep":{"type":"boolean"},"commands":{"type":"array"},"sample_ms":{"type":"integer"},"min_rate":{"type":"number"},"wait_ms":{"type":"integer"},"limit":{"type":"integer"},"min_size":{"type":"integer"},"block_size":{"type":"integer"},"max":{"type":"integer"}},"required":["action"]})";
     const char* inject_schema =
         R"({"type":"object","properties":{"action":{"type":"string","enum":["status","find_module","resolve_export","loadlibrary","manual_map","unload"]},"pid":{"type":"integer","minimum":1},"name":{"type":"string"},"module":{"type":"string"},"dll_path":{"type":"string"},"dll_hex":{"type":"string"},"base":{"type":"integer"},"manual_mapped":{"type":"boolean"},"erase_pe_header":{"type":"boolean"},"protect_sections":{"type":"boolean"},"call_dllmain":{"type":"boolean"},"call_tls_callbacks":{"type":"boolean"},"unlink_peb":{"type":"boolean"},"timeout_ms":{"type":"integer","minimum":100,"maximum":60000}},"required":["action"]})";
 
     out.push_back({{"name", "target"},
-                   {"description", "Select and inspect the live process used by memory, debugger, and other runtime tools. Start with action='status' to read the active backend plus attached-target and shared-image context; use action='list' to find a pid, then action='attach' with pid. Attach uses the kernel DTB path when slopdrvr is active and best-effort loads the process's main module from disk at its runtime base, unless the UI already has a binary loaded. dump_module selects a loaded module by base or exact name, reconstructs a conventional PE from its mapped bytes to output path, and optionally load=true opens it in the shared Hyperion analysis session. strict defaults true; false zero-fills unreadable section spans and reports complete=false. Actions modules, dump_module, threads, regions, and handles require an attached target. Detach clears the live target but does not unload a separately UI-loaded image."},
+                   {"description", "Select and inspect the live process used by memory, debugger, and other runtime tools. Start with action='status' to read the active backend plus attached-target and shared-image context; use action='list' to find a pid, then action='attach' with pid. Attach uses the kernel DTB path when the kernel backend is active and best-effort loads the process's main module from disk at its runtime base, unless the UI already has a binary loaded. dump_module selects a loaded module by base or exact name, reconstructs a conventional PE from its mapped bytes to output path, and optionally load=true opens it in the shared Hyperion analysis session. strict defaults true; false zero-fills unreadable section spans and reports complete=false. Actions modules, dump_module, threads, regions, and handles require an attached target. Detach clears the live target but does not unload a separately UI-loaded image."},
                    {"inputSchema", json::parse(target_schema)}, {"read_only", false}});
     out.push_back({{"name", "memory"},
-                   {"description", "Read, search, compare, and modify memory in the process attached by target. Most actions require target.status attached=true; the active user/kernel backend is chosen automatically. Core actions: read/write bytes, protect/alloc/free pages, AOB pattern search, pointer scan, signature generation, and live crypto-constant search. CE-style scan creates per-PID scan state; follow it with rescan, inspect it with scan_state, and release it with scan_reset. snapshot returns an id; compare two ids with diff using a and b, list with snapshots, and release with snapshot_free. Scan filters cover numeric width/comparison/rounding, region type and protection, address bounds, alignment/tail, workers, chunks, and result caps. Kernel mode uses slopdrvr DTB reads and driver region enumeration."},
+                   {"description", "Read, search, compare, and modify memory in the process attached by target. Most actions require target.status attached=true; the active user/kernel backend is chosen automatically. Core actions: read/write bytes, protect/alloc/free pages, AOB pattern search, pointer scan, signature generation, and live crypto-constant search. CE-style scan creates per-PID scan state; follow it with rescan, inspect it with scan_state, and release it with scan_reset. snapshot returns an id; compare two ids with diff using a and b, list with snapshots, and release with snapshot_free. Scan filters cover numeric width/comparison/rounding, region type and protection, address bounds, alignment/tail, workers, chunks, and result caps. Kernel mode uses kernel driver DTB reads and driver region enumeration."},
                    {"inputSchema", json::parse(memory_schema)}, {"read_only", false}});
     out.push_back({{"name", "disasm"},
                    {"description", "Primary static-analysis and instruction tool for the shared binary session. Call action='loaded' first: image.ready means a PE is loaded; image.hype.ready means background Hyperion analysis is complete; image.hype.progress/error explain pending or failed analysis. Use load(path) and unload to manage the same session as the UI, and analyze_stop to cancel analysis. pe/functions/xrefs/strings/symbols use the shared image or an explicit path; blocks/globals/vtables require hype.ready. disassemble reads attached-process memory first and otherwise the loaded file image. assemble converts x86/x64 text to bytes. symbol_set renames a VA persistently (empty name clears) and updates the UI. Strings paginate with limit and omit executable sections unless include_exec=true. Runtime-base loads make static and live VAs directly comparable."},
                    {"inputSchema", json::parse(disasm_schema)}, {"read_only", false}});
     out.push_back({{"name", "debugger"},
-                   {"description", "Control a live debugging session. Call status first; attach(pid) starts kernel-stealth VEH debugging when slopdrvr is available, otherwise the classic Win32 debug loop. Set software or hardware breakpoints with bp_set(addr, hw); optional condition, log, auto_continue, and one_shot fields create conditional stops or tracepoints. After continue or a step action, use wait_halt(timeout_ms), then inspect regs, events, callstack, or seh; set_register mutates paused state. watchpoint_set/clear/list manage page-guard access watches, and trace_run records a bounded instruction trace. suspend_all/resume_all freeze or thaw target threads. Hardware DR0-DR3 breakpoints and handle-free thread control require the driver."},
+                   {"description", "Control a live debugging session. Call status first; attach(pid) starts kernel-stealth VEH debugging when the kernel backend is available, otherwise the classic Win32 debug loop. Set software or hardware breakpoints with bp_set(addr, hw); optional condition, log, auto_continue, and one_shot fields create conditional stops or tracepoints. After continue or a step action, use wait_halt(timeout_ms), then inspect regs, events, callstack, or seh; set_register mutates paused state. watchpoint_set/clear/list manage page-guard access watches, and trace_run records a bounded instruction trace. suspend_all/resume_all freeze or thaw target threads. Hardware DR0-DR3 breakpoints and handle-free thread control require the driver."},
                    {"inputSchema", json::parse(debugger_schema)}, {"read_only", false}});
     out.push_back({{"name", "driver"},
-                   {"description", "Inspect and control the optional slopdrvr kernel bridge. Start with status to discover connection, capabilities, and active backend. backend reads or sets pref='auto'|'kernel'|'user', but cannot switch while a target or debugger session is live. Kernel actions include modules, memory read/write/search, driver dump, calls, virtual-to-physical translation, SSDT/PEB/TEB/loader views, exports, windows, heaps, references, symbols, deferred calls, integrity checks, anti-debug spoofing, sandboxing, logs, and network-buffer sniffing. Kernel-address operations lazily resolve the kernel DTB and return structured errors when unavailable; a symbols_load response with ntos_base=0 means the kernel context was not established and symbol lookups will fail. sniff_buffers uses op to start/get/store/stop capture. Use status rather than assuming the driver is installed."},
+                   {"description", "Inspect and control the kernel bridge. Start with status to discover connection, capabilities, and active backend. backend reads or sets pref='auto'|'kernel'|'user', but cannot switch while a target or debugger session is live. Kernel actions include modules, memory read/write/search, driver dump, calls, virtual-to-physical translation, SSDT/PEB/TEB/loader views, exports, windows, heaps, references, symbols, deferred calls, integrity checks, anti-debug spoofing, sandboxing, logs, and network-buffer sniffing. Kernel-address operations lazily resolve the kernel DTB and return structured errors when unavailable; a symbols_load response with ntos_base=0 means the kernel context was not established and symbol lookups will fail. sniff_buffers uses op to start/get/store/stop capture. Use status rather than assuming the driver is installed."},
                    {"inputSchema", json::parse(driver_schema)}, {"read_only", false}});
     out.push_back({{"name", "inject"},
-                   {"description", "Kernel-assisted DLL injection over slopdrvr. Every touch on the target rides IOCTLs (kernel-side NtAllocateVirtualMemory via KeStackAttachProcess, DTB physical writes, thread-hijack execution with a spoofed return address), so the user-mode side never opens the target, never calls VirtualAllocEx/WriteProcessMemory, and never spawns a remote thread — none of the ObRegisterCallbacks / PsSetCreateThreadNotifyRoutine hooks a kernel anticheat subscribes to fire from us. Two modes: action='loadlibrary' resolves kernel32!LoadLibraryW in the target and hijacks a resident thread to call it (still fires PsSetLoadImageNotifyRoutine because it goes through LdrLoadDll — the callstack from the AC's view is a clean legitimate thread). action='manual_map' maps the DLL by hand — headers, sections, relocs, imports resolved against the target's already-loaded modules (LoadLibrary'ing missing deps recursively), TLS callbacks, then DllMain(DLL_PROCESS_ATTACH) — no LDR entry, no LoadImageNotify, and by default the PE header is zeroed and each section re-protected with its true RWX chars so scan-based ac won't spot a fresh RWX region with an MZ. dll_path OR dll_hex; dll_path is a host filesystem path (bytes read locally). find_module and resolve_export are helpers that walk the target's PEB LDR through the driver. unload frees a loadlibrary DLL via FreeLibrary or, for a manual-mapped base, calls DllMain(DETACH) then kernel-frees. Requires slopdrvr active; check inject.status first. Options: erase_pe_header (default true), protect_sections (default true), call_dllmain (default true), call_tls_callbacks (default true), unlink_peb (loadlibrary only, default false — unlinks from all three LDR lists so toolhelp snapshots and hidden-module walks miss it), timeout_ms (per-hijack call budget)."},
+                   {"description", "Kernel-assisted DLL injection over the kernel backend. Every touch on the target rides IOCTLs (kernel-side NtAllocateVirtualMemory via kernel process attach, DTB physical writes, thread-hijack execution with a spoofed return address), so the user-mode side never opens the target, never calls remote allocation/process memory write, and never spawns a remote thread — none of the object callbacks / thread notify hooks a kernel anticheat subscribes to fire from us. Two modes: action='loadlibrary' resolves kernel32!LoadLibraryW in the target and hijacks a resident thread to call it (still fires PsSetLoadImageNotifyRoutine because it goes through LdrLoadDll — the callstack from the AC's view is a clean legitimate thread). action='manual_map' maps the DLL by hand — headers, sections, relocs, imports resolved against the target's already-loaded modules (LoadLibrary'ing missing deps recursively), TLS callbacks, then DllMain(DLL_PROCESS_ATTACH) — no LDR entry, no LoadImageNotify, and by default the PE header is zeroed and each section re-protected with its true RWX chars so scan-based ac won't spot a fresh RWX region with an MZ. dll_path OR dll_hex; dll_path is a host filesystem path (bytes read locally). find_module and resolve_export are helpers that walk the target's PEB LDR through the driver. unload frees a loadlibrary DLL via FreeLibrary or, for a manual-mapped base, calls DllMain(DETACH) then kernel-frees. Requires kernel driver active; check inject.status first. Options: erase_pe_header (default true), protect_sections (default true), call_dllmain (default true), call_tls_callbacks (default true), unlink_peb (loadlibrary only, default false — unlinks from all three LDR lists so toolhelp snapshots and hidden-module walks miss it), timeout_ms (per-hijack call budget)."},
                    {"inputSchema", json::parse(inject_schema)}, {"read_only", false}});
     out.push_back({{"name", "xray"},
                    {"description", "Run focused read-only static-analysis queries on the shared image or an explicit path. For cfg, complexity, cff, obfuscation, strings_recon, indirect_calls, and anti_analysis, pass addr as a function-start VA; known functions use indexed bounds and unknown addresses fall back to linear decode. Whole-image actions detect hooks, direct syscalls and SSNs, imported-API hashes, entropy windows, page classes, crypto constants, and ROP gadgets. apihash only searches imports of this image, including bare API and 'DLL!API' forms; it is not a global hash dictionary. Use disasm.loaded/functions first to establish image state and valid function VAs."},
@@ -8295,7 +8513,7 @@ void list_tools(json& out) {
                    {"description", "Run whole-binary read-only analysis. packer uses the shared image or path and reports protector names, entry signatures, entropy, import anomalies, W+X sections, TLS, overlay, crypto constants, and the shared Hyperion verdict when available. signatures requires the analyzed shared session and returns analyzer-derived names in named_functions; names may come from RTTI, vtables, thunks, or signature candidates and are not provenance-verified as FLIRT. diff(path_a,path_b) performs two full Hyperion analyses and reports added, removed, and modified functions with similarity scores, so expect a longer call; for huge binaries use async diff_start(path_a,path_b) then poll diff_job(id) for stage/progress and stop with diff_cancel(id). Check disasm.loaded before shared-session actions."},
                    {"inputSchema", json::parse(analyze_schema)}, {"read_only", true}});
     out.push_back({{"name", "network"},
-                   {"description", "Capture, query, and manipulate Windows network traffic through slopdrvr/WFP. Call status first. A common read flow is capture_start -> packets/dns/streams/stats -> capture_stop; packets filter syntax includes port=80;host:1.2.3.4;text:foo;pid:1234;proto:tcp, and stream_data reads payload by id/offset/len. Mutation actions cover WFP rules, injection, pattern replacement, redirects, DNS spoofing, connection kill, hold/modify/release interception, bandwidth controls, and block_ip/block_port/block_process (direction in|out|both, default both). System inspection includes connections, DPI, callouts, socket handles, TCB dump, interfaces, fingerprints, and reassembly. Driver-dependent actions return structured errors when slopdrvr is unavailable."},
+                   {"description", "Capture, query, and manipulate Windows network traffic through the kernel driver/WFP. Call status first. A common read flow is capture_start -> packets/dns/streams/stats -> capture_stop; packets filter syntax includes port=80;host:1.2.3.4;text:foo;pid:1234;proto:tcp, and stream_data reads payload by id/offset/len. Mutation actions cover WFP rules, injection, pattern replacement, redirects, DNS spoofing, connection kill, hold/modify/release interception, bandwidth controls, and block_ip/block_port/block_process (direction in|out|both, default both). System inspection includes connections, DPI, callouts, socket handles, TCB dump, interfaces, fingerprints, and reassembly. Driver-dependent actions return structured errors when kernel driver is unavailable."},
                    {"inputSchema", json::parse(network_schema)}, {"read_only", false}});
     out.push_back({{"name", "proxy"},
                    {"description", "Run the built-in localhost HTTP/1.1 inspection proxy. Use start(port) -> status -> entries(limit); fetch one captured exchange with entry(id), and replay a logged plain-HTTP request with replay(id). CONNECT tunnels record SNI and metadata but encrypted tunnel bodies are not decrypted, so replay applies only to captured plain HTTP. stop releases the listener. This proxy is independent of the kernel network capture tool."},
@@ -8313,7 +8531,7 @@ void list_tools(json& out) {
                    {"description", "Browse a managed (.NET/CLI) assembly the way dnSpy does, over the shared image. Prerequisite: disasm.loaded with image.hype.ready=true on a managed binary (dotnet.status reports managed=false otherwise). status returns assembly/runtime/COR flags and member counts. tree returns the namespace -> type -> nested-type hierarchy with per-type kind (class/struct/interface/enum/delegate), visibility, base, interfaces and member counts; filter is a case-insensitive substring over full type names, limit caps types. type(token) expands one TypeDef (0x02xxxxxx token) into its fields (with const values), properties (get/set), events, methods (signatures, tokens, has_body) and nested types. method(token) returns one MethodDef (0x06xxxxxx) with its C# signature, locals, exception handlers, the resolved CIL listing (il[] plus il_text), and a best-effort C# decompilation (csharp; csharp_structured flags confidence). source(token) renders a whole type as dnSpy-style C#. il returns the ILDASM-style listing for one method (token) or, with no token, the whole assembly (capped). Methods that have IL bodies also carry an entry VA that cross-links to disasm/decomp."},
                    {"inputSchema", json::parse(dotnet_schema)}, {"read_only", true}});
     out.push_back({{"name", "detect"},
-                   {"description", "Inspect local Windows security and kernel artifacts without changing them. hidden_modules cross-checks EnumDeviceDrivers against SystemModuleInformation; minifilters enumerates filesystem filters through fltlib; etw_sessions lists active trace sessions; kernel_callbacks walks notify routines through slopdrvr using build-specific anchors. The first three actions can operate without an attached target; kernel_callbacks requires a working driver and returns a structured error when unavailable."},
+                   {"description", "Inspect local Windows security and kernel artifacts without changing them. hidden_modules cross-checks EnumDeviceDrivers against SystemModuleInformation; minifilters enumerates filesystem filters through fltlib; etw_sessions lists active trace sessions; kernel_callbacks walks notify routines through kernel driver using build-specific anchors. The first three actions can operate without an attached target; kernel_callbacks requires a kernel backend and returns a structured error when unavailable."},
                    {"inputSchema", json::parse(detect_schema)}, {"read_only", true}});
     out.push_back({{"name", "fs"},
                    {"description", "Access the Windows host filesystem, not target-process memory. read_file(path,max_bytes) returns file content; write_file(path,text|hex,append) creates or updates a file. list_directory and create_directory operate on path, while delete_path removes a file or directory. search_files(root,needle,suffix,limit) finds names and grep_in_files(root,needle,suffix,limit) searches text content. Use absolute paths when context matters and apply max_bytes/limit to bound large results."},
@@ -8322,8 +8540,11 @@ void list_tools(json& out) {
                    {"description", "Make outbound HTTP(S) requests from the host through WinHTTP. fetch(url,timeout_ms) performs GET; post(url,body,content_type,timeout_ms) performs POST. Results include response status/body or a structured transport error. Use this for symbol downloads, API queries, and target-related lookups; it is unrelated to captured traffic in network or proxy and does not inherit browser cookies."},
                    {"inputSchema", json::parse(web_schema)}, {"read_only", false}});
     out.push_back({{"name", "script"},
-                   {"description", "Run a Lua 5.4 automation script inside reverse-slop, the scripting layer over static analysis, like IDAPython for IDA. action='run' requires code; timeout_ms defaults to 5000 and is capped at 60000 (pass a higher timeout_ms when waiting for analysis). print() output is captured and returned values are serialized as 'return: <value>'. Scripts operate on the SAME shared binary session as the UI and every other MCP tool, so loads, renames, and comments are visible everywhere. Static-analysis API: slop.image.{load(path[,base]),load_from_target,unload,status,wait_ready([ms])}; slop.disasm.{decode(addr[,n]),functions([limit]),function_at(va),xrefs_to(va),strings([min_len[,limit]]) -- note min-length FIRST, so strings(4,3000) not strings(2000),pe(),bytes(addr[,len]),name(va),set_name(va,name),comment(va),set_comment(va,text),bookmark_toggle(va),bookmarks()}; slop.decomp.{decompile(va),blocks(va),vtables(),globals(),rtti()} (decomp.* needs slop.image.wait_ready first). Live analysis: slop.target.{list,attach,status}, slop.mem.{read_hex,write_hex,scan}, slop.disasm.disassemble(addr,count), slop.analyze.packer. Typical flow: image.load(path) -> image.wait_ready() -> disasm.functions() -> decomp.decompile(va). Use direct MCP tools when one operation is sufficient."},
+                   {"description", "Run a Lua 5.4 automation script inside the engine, the scripting layer over static analysis, like IDAPython for IDA. action='run' requires code; timeout_ms defaults to 5000 and is capped at 60000 (pass a higher timeout_ms when waiting for analysis). print() output is captured and returned values are serialized as 'return: <value>'. Scripts operate on the SAME shared binary session as the UI and every other MCP tool, so loads, renames, and comments are visible everywhere. Static-analysis API: slop.image.{load(path[,base]),load_from_target,unload,status,wait_ready([ms])}; slop.disasm.{decode(addr[,n]),functions([limit]),function_at(va),xrefs_to(va),strings([min_len[,limit]]) -- note min-length FIRST, so strings(4,3000) not strings(2000),pe(),bytes(addr[,len]),name(va),set_name(va,name),comment(va),set_comment(va,text),bookmark_toggle(va),bookmarks()}; slop.decomp.{decompile(va),blocks(va),vtables(),globals(),rtti()} (decomp.* needs slop.image.wait_ready first). Live analysis: slop.target.{list,attach,status}, slop.mem.{read_hex,write_hex,scan}, slop.disasm.disassemble(addr,count), slop.analyze.packer. Typical flow: image.load(path) -> image.wait_ready() -> disasm.functions() -> decomp.decompile(va). Use direct MCP tools when one operation is sufficient."},
                    {"inputSchema", json::parse(script_schema)}, {"read_only", false}});
+    out.push_back({{"name", "game"},
+                   {"description", "Unified game analysis, exploit discovery, engine helpers, and overlay control. Actions: aob_generate(addr,len) auto-wildcard pattern gen; crypto_scan scans all modules for AES/SHA/CRC constants; binary_map(base,size) entropy heatmap; find_timers scans for cooldown/reload floats; find_exploit(type=ammo|cooldown|health|recoil|firerate) guided exploit discovery; find_code_caves(min_size) executable slack space; test_authority(addr) checks if server validates a value; tick_rate analyzes server update frequency; find_position/find_speed scan for world coords and movement multipliers; world_to_screen(x,y,z,mode=ue|rowmajor|transposed) 3D projection; read_tarray(addr) UE TArray reader; dump_deobfuscated(base,path) full runtime PE dump with import reconstruction; overlay_connect/disconnect/draw/clear Discord overlay rendering. All memory ops use the kernel phys path."},
+                   {"inputSchema", json::parse(game_schema)}, {"read_only", false}});
     out.push_back({{"name", "frida"},
                    {"description", "Instrument live processes with embedded frida-core 17.x. Start with status/devices; choose device, enumerate with ps/applications/find_process, then attach(pid) to obtain a session handle. Create and optionally auto-load JavaScript with script_create(session,source,runtime,load), or compile source with compile_script(session,source) and pass its b64 back as script_create bytecode_b64 (compile_script needs a live session from attach; the standalone project compiler is the separate compile action needing entrypoint, no session). drain send()/console output with messages(script,limit), call rpc.exports with rpc(script,method,args,timeout_ms), and destroy scripts/detach sessions when finished. script_unload is terminal and removes its handle. spawn returns a suspended pid unless resumed; spawn/resume/kill/input and spawn/child gating support launch workflows. remote_add connects frida-server devices. Handles are returned by prior calls; do not substitute OS pids for session or script handles."},
                    {"inputSchema", json::parse(frida_schema)}, {"read_only", false}});
@@ -8401,6 +8622,7 @@ nlohmann::json call_tool(const std::string& name, const nlohmann::json& args,
         else if (name == "types")    out = tool_types(args);
         else if (name == "notes")    out = tool_notes(args);
         else if (name == "devirt")   out = tool_devirt(args);
+        else if (name == "game")     out = tool_game(args);
         else found = false;
         if (!found) {
             is_error = true;

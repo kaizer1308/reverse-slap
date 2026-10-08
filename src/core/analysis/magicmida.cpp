@@ -79,7 +79,7 @@ fs::path default_root() {
 
     const std::string local = env_value("LOCALAPPDATA");
     if (!local.empty())
-        return fs::path(local) / "reverse-slop" / "tools" / "magicmida" / kVersion;
+        return fs::path(local) / "engine" / "tools" / "magicmida" / kVersion;
     return bundled;
 }
 

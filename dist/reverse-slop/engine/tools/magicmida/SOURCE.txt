@@ -1,0 +1,7 @@
+Magicmida 2026-05-14 is GPLv3 software maintained at:
+https://github.com/Hendi48/Magicmida
+
+The downloaded x64 package contains ScyllaHide components:
+https://github.com/x64dbg/ScyllaHide
+
+Use the corresponding tagged source when redistributing these binaries.

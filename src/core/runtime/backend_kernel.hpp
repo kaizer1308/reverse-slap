@@ -5,6 +5,7 @@
 // a few ops still fall back to a lazy user handle
 
 #include "core/runtime/backend.hpp"
+#include "core/runtime/xorstr.hpp"
 #include "core/runtime/backend_usermode.hpp"
 
 #include <memory>

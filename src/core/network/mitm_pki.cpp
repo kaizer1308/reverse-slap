@@ -14,13 +14,13 @@ namespace slop::core::network::mitm {
 
 namespace {
 
-constexpr wchar_t kCaKeyContainer[] = L"reverse-slop-ca-key";
-constexpr const char* kCaSubject = "CN=reverse-slop Local CA";
+constexpr wchar_t kCaKeyContainer[] = L"local-ca-key";
+constexpr const char* kCaSubject = "CN=Local Development CA";
 
 std::wstring cache_dir_w() {
     char base[MAX_PATH]{};
     const DWORD n = GetEnvironmentVariableA("LOCALAPPDATA", base, MAX_PATH);
-    std::string dir = n ? std::string(base) + "\\reverse-slop\\certs"
+    std::string dir = n ? std::string(base) + "\\appdata\\certs"
                         : ".\\certs";
     CreateDirectoryA(dir.c_str(), nullptr);
     return std::wstring(dir.begin(), dir.end());
@@ -35,7 +35,7 @@ PCCERT_CONTEXT find_ca_in_my() {
         char subj[256] = {};
         CertGetNameStringA(it, CERT_NAME_SIMPLE_DISPLAY_TYPE, 0, nullptr,
                            subj, sizeof(subj));
-        if (std::string(subj).find("reverse-slop Local CA") !=
+        if (std::string(subj).find("Local Development CA") !=
             std::string::npos) {
             found = CertDuplicateCertificateContext(it);
             break;
@@ -112,7 +112,7 @@ bool generate_ca(const std::string& /*ca_name*/, std::string* error) {
     // Export .cer next to the cache for inspection / other-tool import
     if (ok) {
         const std::wstring cer_path =
-            cache_dir_w() + L"\\reverse-slop-ca.cer";
+            cache_dir_w() + L"\\local-ca.cer";
         HANDLE f = CreateFileW(cer_path.c_str(), GENERIC_WRITE, 0, nullptr,
                                CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL,
                                nullptr);
@@ -160,7 +160,7 @@ std::optional<std::string> issue_host_cert(const std::string& host,
 
     // Host signing key comes from its own container
     const std::wstring host_container =
-        L"reverse-slop-host-" +
+        L"local-host-" +
         std::wstring(host.begin(), host.end());
     HCRYPTPROV host_prov = 0;
     if (!CryptAcquireContextW(&host_prov, host_container.c_str(), nullptr,
@@ -263,7 +263,7 @@ std::optional<std::string> issue_host_cert(const std::string& host,
     const DWORD n_narrow =
         GetEnvironmentVariableA("LOCALAPPDATA", base_narrow, MAX_PATH);
     std::string cert_dir =
-        n_narrow ? std::string(base_narrow) + "\\reverse-slop\\certs"
+        n_narrow ? std::string(base_narrow) + "\\appdata\\certs"
                  : ".\\certs";
     CreateDirectoryA(cert_dir.c_str(), nullptr);
     const std::string out_path = cert_dir + "\\" + host + ".cer";

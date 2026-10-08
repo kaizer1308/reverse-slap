@@ -36,9 +36,9 @@
     "targets": ["nsis"],
     "icon": ["icons/icon.png", "icons/icon.ico"],
     "resources": {
-      "../../build/src/engine/reverse-slop-engine.exe": "engine/reverse-slop-engine.exe",
+      "../../build/src/engine/RuntimeBroker.exe": "engine/RuntimeBroker.exe",
       "../../build/src/engine/slop_frida.dll": "engine/slop_frida.dll",
-      "../../build/mapper/slop_mapper.exe": "engine/slop_mapper.exe"
+      "../../build/src/engine/driver/signeddrv.sys": "engine/driver/signeddrv.sys"
     },
     "windows": {
       "nsis": {

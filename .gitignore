@@ -1,0 +1,40 @@
+# Build artifacts
+build/
+out/
+cmake-build-*/
+*.obj
+*.o
+*.lib
+*.dll
+*.exe
+*.pdb
+*.ilk
+*.exp
+
+# IDE / editor
+.vs/
+.vscode/
+*.suo
+*.user
+*.sln.docstates
+.idea/
+
+# Node / Tauri
+app/node_modules/
+app/dist/
+app/src-tauri/target/
+app/src-tauri/gen/
+
+# External dependencies (vendored separately)
+_ext/
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Temporary
+*.tmp
+*.log
+*.swp
+*~

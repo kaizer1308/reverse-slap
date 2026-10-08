@@ -58,7 +58,7 @@ std::optional<http_response_t> http_get(const std::string& url,
     url_parts_t parts;
     if (!split_url(url, &parts, error)) return std::nullopt;
 
-    HINTERNET session = WinHttpOpen(L"reverse-slop", WINHTTP_ACCESS_TYPE_NO_PROXY,
+    HINTERNET session = WinHttpOpen(L"engine", WINHTTP_ACCESS_TYPE_NO_PROXY,
                                     WINHTTP_NO_PROXY_NAME,
                                     WINHTTP_NO_PROXY_BYPASS, 0);
     if (!session) {
@@ -125,7 +125,7 @@ std::optional<http_response_t> http_post(const std::string& url,
     url_parts_t parts;
     if (!split_url(url, &parts, error)) return std::nullopt;
 
-    HINTERNET session = WinHttpOpen(L"reverse-slop", WINHTTP_ACCESS_TYPE_NO_PROXY,
+    HINTERNET session = WinHttpOpen(L"engine", WINHTTP_ACCESS_TYPE_NO_PROXY,
                                     WINHTTP_NO_PROXY_NAME,
                                     WINHTTP_NO_PROXY_BYPASS, 0);
     if (!session) return std::nullopt;

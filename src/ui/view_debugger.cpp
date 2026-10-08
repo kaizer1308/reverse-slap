@@ -75,10 +75,12 @@ void Draw() {
         const bool kernel_live = runtime::active_kind() == runtime::backend_kind_t::kernel;
         ImGui::Text("backend:");
         ImGui::SameLine();
-        if (kernel_live)
-            ImGui::TextColored(ImVec4(0.95f, 0.65f, 0.25f, 1.0f), "KERNEL (slopdrvr)");
-        else
+        if (kernel_live) {
+            const char* badge = runtime::active_badge();
+            ImGui::TextColored(ImVec4(0.95f, 0.65f, 0.25f, 1.0f), "KERNEL (%s)", badge);
+        } else {
             ImGui::TextDisabled("USER-MODE");
+        }
         ImGui::SameLine();
 
         if (ImGui::SmallButton(kernel_live ? "switch to USER" : "switch to KERNEL")) {
@@ -90,7 +92,7 @@ void Draw() {
         }
         if (!kernel_live) {
             ImGui::SameLine();
-            ImGui::TextDisabled("load: slop_mapper.exe load build\\driver\\slopdrvr.sys");
+            ImGui::TextDisabled("place signeddrv.sys in driver/ next to the engine");
         }
         ImGui::Separator();
     }
