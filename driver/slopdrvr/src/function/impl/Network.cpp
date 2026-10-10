@@ -4,6 +4,7 @@
 #include "../CoreSecurity.h"
 #include "../Struct.h"
 #include "../KernelLayout.h"
+#include "../KernelDebugCapture.h"
 #include "../MalwareSafe.h"
 #include <ndis.h>
 #include <ndis/nbl.h>
@@ -3507,6 +3508,9 @@ namespace net_capture {
     void unregister_wfp();
 
     static NTSTATUS abort_register_wfp(const char* step, NTSTATUS status) {
+        // Boot failures happen before a client can enable verbose logging.
+        dbg_capture::write_immediate_formatted("[SD-EARLY] net_capture::register_wfp FAILED step=%s status=0x%08X\n",
+            step ? step : "", static_cast<ULONG>(status));
         NTSTATUS abort_status = STATUS_SUCCESS;
         if (g_engine_handle && _FwpmTransactionAbort0)
             abort_status = _FwpmTransactionAbort0(g_engine_handle);
@@ -3562,11 +3566,23 @@ namespace net_capture {
             status, status_to_win32(status));
         if (!NT_SUCCESS(status)) {
             NET_ERR("register_wfp: orphan cleanup FAILED 0x%08x", status);
+            dbg_capture::write_immediate_formatted("[SD-EARLY] net_capture::register_wfp FAILED step=orphan_cleanup status=0x%08X\n",
+                static_cast<ULONG>(status));
             _FwpmEngineClose0(g_engine_handle);
             g_engine_handle = nullptr;
             return status;
         }
 
+        // Legacy objects require a non-dynamic cleanup session. New objects belong
+        // to a dynamic session and are removed automatically when it closes.
+        status = _FwpmEngineClose0(g_engine_handle);
+        g_engine_handle = nullptr;
+        if (!NT_SUCCESS(status)) return status;
+        FWPM_SESSION0 session = {};
+        session.flags = FWPM_SESSION_FLAG_DYNAMIC;
+        status = _FwpmEngineOpen0(nullptr, WFP_BFE_AUTH_SERVICE,
+            nullptr, &session, &g_engine_handle);
+        if (!NT_SUCCESS(status)) return status;
 
         status = _FwpmTransactionBegin0(g_engine_handle, 0);
         NET_DBG("register_wfp: FwpmTransactionBegin0 status=0x%08x", status);
@@ -4147,6 +4163,9 @@ namespace net_capture {
                 ExFreePoolWithTag(g_dns_ring, 'dnNW');
                 g_dns_ring = nullptr;
             }
+            // abort_register_wfp clears this pointer; keep the live device for
+            // the existing explicit-capture lazy retry, never mark WFP ready.
+            g_device_object = devObj;
             _InterlockedExchange(&g_wfp_degraded, 0);
             _InterlockedExchange(&g_wfp_initialized, 0);
             return status;
@@ -5776,7 +5795,7 @@ NTSTATUS functions::handle_net_cap_ctrl(p_net_cap_ctrl request) {
                 SD_LOG("net_capture::ctrl FAIL step=lazy_reinit status=0x%08X state=%ld",
                     reinit_status,
                     net_capture::g_wfp_initialized);
-                return STATUS_DEVICE_NOT_READY;
+                return reinit_status;
             }
             NET_DBG("handle_net_cap_ctrl: lazy WFP re-init OK");
         } else {

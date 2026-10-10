@@ -1614,7 +1614,7 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     LOG("CopyFileW target_ok");
-    LOG("Source target driver retained until post-load cleanup path=%ls", driverArg.c_str());
+    LOG("Source target driver retained as reusable package artifact path=%ls", driverArg.c_str());
 
 
     LOG("Self-signing target driver...");
@@ -1648,7 +1648,7 @@ int main(int argc, char* argv[]) {
             return 1;
         }
         LOG("CopyFileW shadowfs_ok");
-        LOG("Source shadowfs driver retained until post-load cleanup path=%ls", shadowFsArg.c_str());
+        LOG("Source shadowfs driver retained as reusable package artifact path=%ls", shadowFsArg.c_str());
 
         LOG("Self-signing shadowfs driver...");
         if (!SignedMemory::SelfSignDriver(shadowFsFilePath.c_str())) {
@@ -1673,9 +1673,8 @@ int main(int argc, char* argv[]) {
     }
 
     LOG("Cleaning up temp files...");
-    Utils::ForceDeleteOrRename(driverArg.c_str());
-    if (!shadowFsArg.empty())
-        Utils::ForceDeleteOrRename(shadowFsArg.c_str());
+    // Only runtime copies are disposable. Keep caller-owned package inputs for
+    // the next launch, including when this load failed.
     Utils::ForceDeleteOrRename(loaderFilePath.c_str());
     if (NT_SUCCESS(status)) {
         Utils::HideLoadedImagePath(driverFilePath.c_str());

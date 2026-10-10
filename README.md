@@ -246,9 +246,8 @@ exist and the mapper link configuration is updated consistently:
 powershell -File tools/build_slopdrvr.ps1 -WdkVersion 10.0.26100.0
 ```
 
-The driver script currently assumes Visual Studio at `E:\PRODUCT VS22`, while
-the main build script also supports normal `vswhere` discovery. Adjust
-`$vsRoot` in `tools/build_slopdrvr.ps1` if Visual Studio is elsewhere.
+Both build scripts support `vswhere` discovery and a `PRODUCT VS22` installation
+on the repository's drive (with `E:\PRODUCT VS22` as a legacy fallback).
 
 On startup, an elevated shell searches for mapper and driver artifacts beside
 the executable or in the build-tree layout. It loads `slopdrvr`, probes
@@ -256,6 +255,14 @@ the executable or in the build-tree layout. It loads `slopdrvr`, probes
 user mode on failure. Normal shutdown quiesces and unloads the driver and
 removes its service key. Avoid force-killing the process while kernel work is
 active.
+
+The mapper preserves bundled driver inputs; only its runtime copies are cleaned
+up, so a failed load does not remove `engine\slopdrvr.sys` from the portable app.
+A duplicate WFP object (`0xC0220009`) defers network capture without aborting the
+independent kernel bridge. Capture retries on explicit use and reports the WFP
+error until the conflicting callout is released. WFP registration objects use a
+dynamic session; early registration failures log their exact step to
+`C:\Users\Public\Desktop\slop_kernel.log` even at the default log level.
 
 ### Magicmida Themida sidecars
 

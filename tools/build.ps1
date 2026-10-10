@@ -29,7 +29,7 @@ if (-not $FrontendOnly) {
 if (Test-Path -LiteralPath $vswhere) {
     $vsRoot = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
 }
-foreach ($candidate in @('E:\PRODUCT VS22')) {
+foreach ($candidate in @((Join-Path ([IO.Path]::GetPathRoot($repoRoot)) 'PRODUCT VS22'), 'E:\PRODUCT VS22')) {
     if (-not $vsRoot -and (Test-Path -LiteralPath (Join-Path $candidate 'VC\Auxiliary\Build\vcvars64.bat'))) {
         $vsRoot = $candidate
         break

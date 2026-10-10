@@ -2,6 +2,9 @@
 #include <imports/Defs.h>
 #include <function/Dispatcher.h>
 #include <function/KernelDebugCapture.h>
+#include <function/NetworkStartup.h>
+
+static_assert(!net_capture::startup_is_fatal(static_cast<ULONG>(STATUS_FWP_ALREADY_EXISTS)));
 
 namespace net_capture {
     NTSTATUS initialize(PDEVICE_OBJECT devObj);
@@ -327,7 +330,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
     dbg_capture::write_immediate_formatted("[SD-EARLY] net_capture::initialize exit status=0x%08lx elapsed_us=%lu\n",
         static_cast<ULONG>(status),
         sd_elapsed_us(entry_start, entry_freq));
-    if (!NT_SUCCESS(status)) {
+    if (net_capture::startup_is_fatal(static_cast<ULONG>(status))) {
         SD_LOG("DriverEntry: net_capture::initialize FAILED status=0x%08lx device_object=%p elapsed_us=%lu",
             status,
             deviceObject,
@@ -338,9 +341,16 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
         return status;
     }
 
-    SD_LOG("DriverEntry: net_capture initialized elapsed_us=%lu", sd_elapsed_us(entry_start, entry_freq));
-    dbg_capture::write_immediate_formatted("[SD-EARLY] net_capture initialized elapsed_us=%lu\n",
-        sd_elapsed_us(entry_start, entry_freq));
+    if (status == STATUS_FWP_ALREADY_EXISTS) {
+        // A resident network callout must not prevent the independent kernel bridge
+        // from loading. Capture remains uninitialized and retries on explicit use.
+        dbg_capture::write_immediate_formatted("[SD-EARLY] net_capture deferred status=0x%08lx reason=WFP_ALREADY_EXISTS kernel_bridge=available capture=unavailable retry=on_request\n",
+            static_cast<ULONG>(status));
+    } else {
+        SD_LOG("DriverEntry: net_capture initialized elapsed_us=%lu", sd_elapsed_us(entry_start, entry_freq));
+        dbg_capture::write_immediate_formatted("[SD-EARLY] net_capture initialized elapsed_us=%lu\n",
+            sd_elapsed_us(entry_start, entry_freq));
+    }
 
     NTSTATUS dbe_status = debug_events::initialize();
     SD_LOG("DriverEntry: debug_events::initialize returned 0x%08lx elapsed_us=%lu", dbe_status, sd_elapsed_us(entry_start, entry_freq));

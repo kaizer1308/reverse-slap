@@ -26,6 +26,7 @@ add_executable(slop_tests
     test_dotnet.cpp
     test_detect_fs.cpp
     test_autoload.cpp
+    test_network_startup.cpp
     test_xray.cpp
     test_magicmida.cpp
     test_driver.cpp
