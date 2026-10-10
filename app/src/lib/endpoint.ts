@@ -3,34 +3,26 @@
 // plain browser dev
 
 import { setEndpoint, type Endpoint, health } from "./rpc";
+import { invoke, isTauri as inTauri } from "@tauri-apps/api/core";
 
 const kDefaultPort = 8765;
 
-type TauriGlobal = {
-  core?: { invoke?: (cmd: string) => Promise<unknown> };
-};
-
-function tauriInvoke(): ((cmd: string) => Promise<unknown>) | null {
-  const t = (window as unknown as { __TAURI__?: TauriGlobal }).__TAURI__;
-  return t?.core?.invoke ?? null;
-}
-
-export const isTauri = (): boolean => tauriInvoke() !== null;
+export const isTauri = (): boolean => typeof window !== "undefined" && inTauri();
 
 export async function resolveEndpoint(): Promise<Endpoint> {
-  const invoke = tauriInvoke();
-  if (invoke) {
-    try {
-      const ep = (await invoke("engine_endpoint")) as Partial<Endpoint>;
-      if (typeof ep?.port === "number" && ep.port > 0) {
-        const resolved: Endpoint = { port: ep.port, token: ep.token ?? "" };
-        setEndpoint(resolved);
-        return resolved;
-      }
-    } catch {
-      // Fall through to the default port: the engine may already be up from a
-      // previous run and advertising itself on the well-known port
+  if (isTauri()) {
+    // SDK IPC is available even when withGlobalTauri is disabled. Native
+    // failures must not silently connect to an unrelated default-port engine.
+    const ep = await invoke<Partial<Endpoint>>("engine_endpoint");
+    const port = ep?.port;
+    const token = ep?.token;
+    if (typeof port !== "number" || !Number.isInteger(port) || port < 1 || port > 65535 ||
+        typeof token !== "string") {
+      throw new Error("invalid engine endpoint from native bridge");
     }
+    const resolved: Endpoint = { port, token };
+    setEndpoint(resolved);
+    return resolved;
   }
 
   const fallback: Endpoint = { port: kDefaultPort, token: "" };

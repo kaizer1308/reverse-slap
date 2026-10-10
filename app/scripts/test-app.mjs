@@ -151,6 +151,79 @@ try {
     assert.equal(useDotnet.getState().namespaces.length,0);
   }
 
+  // Release builds omit window.__TAURI__. The SDK bridge must still wait for
+  // the native handshake and preserve its port/token rather than use 8765.
+  {
+    const {resolveEndpoint} = await server.ssrLoadModule('/src/lib/endpoint.ts');
+    const {getEndpoint} = await server.ssrLoadModule('/src/lib/rpc.ts');
+    let reply;
+    let invokes = 0;
+    globalThis.window = {isTauri:true,__TAURI_INTERNALS__:{invoke:async(cmd)=>{
+      assert.equal(cmd,'engine_endpoint');
+      invokes++;
+      return new Promise((resolve)=>{reply=resolve;});
+    }}};
+    const pending = resolveEndpoint();
+    assert.equal(invokes,1);
+    reply({port:43123,token:'handshake-test'});
+    assert.deepEqual(await pending,{port:43123,token:'handshake-test'});
+    assert.deepEqual(getEndpoint(),{port:43123,token:'handshake-test'});
+    for(const invalid of [null,{port:0,token:''},{port:65536,token:''},{port:1.5,token:''},{port:43123,token:null}]) {
+      window.__TAURI_INTERNALS__.invoke = async()=>invalid;
+      await assert.rejects(resolveEndpoint(),/invalid engine endpoint/);
+      assert.deepEqual(getEndpoint(),{port:43123,token:'handshake-test'});
+    }
+    window.__TAURI_INTERNALS__.invoke = async()=>{throw new Error('native bridge failed');};
+    await assert.rejects(resolveEndpoint(),/native bridge failed/);
+    globalThis.window = {};
+    assert.deepEqual(await resolveEndpoint(),{port:8765,token:''});
+  }
+
+  // A failed initial snapshot must not leave stage 0/user forever after the
+  // stream connects. Reconnects also re-seed state missed while disconnected.
+  {
+    const {useEngine} = await server.ssrLoadModule('/src/store/engine.ts');
+    const priorSource = FakeSource.current;
+    globalThis.window = {isTauri:true,__TAURI_INTERNALS__:{invoke:async()=>{throw new Error('native bridge failed');}}};
+    await useEngine.getState().start();
+    assert.equal(useEngine.getState().startupError,'native bridge failed');
+    assert.equal(useEngine.getState().connected,false);
+    assert.equal(FakeSource.current,priorSource);
+    globalThis.window = {};
+    let available = false;
+    let backend = 'kernel';
+    let statusReads = 0;
+    globalThis.fetch = async (url,opts)=>{
+      const {tool,action} = JSON.parse(opts.body);
+      assert.equal(tool,'app');
+      assert.equal(action,'status');
+      statusReads++;
+      if (!available) throw new Error('startup snapshot failed');
+      return {ok:true,json:async()=>({ok:true,data:{backend,target:{attached:false}}})};
+    };
+    await useEngine.getState().start();
+    assert.equal(useEngine.getState().boot.done,false);
+    assert.equal(useEngine.getState().startupError,null);
+    assert.equal(statusReads,0);
+    FakeSource.current.onopen();
+    for(let i=0;i<50 && !useEngine.getState().startupError;i++) await new Promise((r)=>setTimeout(r,0));
+    assert.equal(useEngine.getState().startupError,'startup snapshot failed');
+    available = true;
+    FakeSource.current.onopen();
+    for(let i=0;i<50 && !useEngine.getState().boot.done;i++) await new Promise((r)=>setTimeout(r,0));
+    assert.equal(useEngine.getState().connected,true);
+    assert.equal(useEngine.getState().boot.done,true);
+    assert.deepEqual(useEngine.getState().backend,{badge:'kernel',kernel:true});
+    assert.equal(useEngine.getState().startupError,null);
+    backend = 'user';
+    FakeSource.current.onopen();
+    for(let i=0;i<50 && useEngine.getState().backend.kernel;i++) await new Promise((r)=>setTimeout(r,0));
+    assert.deepEqual(useEngine.getState().backend,{badge:'user',kernel:false});
+    send('boot.stage',{stage:6,total:6,label:'ready',done:true});
+    assert.equal(useEngine.getState().boot.done,true);
+    delete globalThis.window;
+  }
+
   events.disconnect();
-  console.log('PASS: bounded output, duplicate frames, output/watch teardown and remount, dotnet function-list refresh on analysis-complete, dotnet explorer tree/lazy-load/select');
+  console.log('PASS: bounded output, duplicate frames, output/watch teardown and remount, dotnet function-list refresh on analysis-complete, dotnet explorer tree/lazy-load/select, native endpoint handshake and validation, startup snapshot recovery and reconnect');
 } finally {await server.close();}

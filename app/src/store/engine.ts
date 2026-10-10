@@ -34,6 +34,7 @@ type EngineStore = {
   target: TargetState;
   hype: HypeState;
   quitting: string | null;
+  startupError: string | null;
   start: () => Promise<void>;
 };
 
@@ -56,11 +57,31 @@ export const useEngine = create<EngineStore>((set) => ({
   target: { attached: false },
   hype: kInitialHype,
   quitting: null,
+  startupError: null,
 
   start: () => starting ??= (async () => {
+    set({ startupError: null });
     await resolveEndpoint();
 
-    events.onConnectionChange((connected) => set({ connected }));
+    const refreshStatus = async () => {
+      try {
+        const status = await call<{ backend: string; target: TargetState }>("app", "status");
+        set({
+          backend: { badge: status.backend, kernel: status.backend === "kernel" },
+          target: status.target,
+          boot: { stage: 6, total: 6, label: "ready", done: true },
+          startupError: null,
+        });
+      } catch (error) {
+        set({ startupError: error instanceof Error ? error.message : String(error) });
+      }
+    };
+    // Boot/backend events can precede subscription. Snapshot after each stream
+    // open, not before the engine accepts connections, and again on reconnect.
+    events.onConnectionChange((connected) => {
+      set({ connected });
+      if (connected) void refreshStatus();
+    });
     events.on("boot.stage", (boot) => set({ boot }));
     events.on("backend.changed", (backend) => set({ backend }));
     events.on("target.changed", (target) => set({ target }));
@@ -74,21 +95,8 @@ export const useEngine = create<EngineStore>((set) => ({
     events.on("app.quitting", ({ reason }) => set({ quitting: reason }));
     events.connect();
 
-    // The stream only carries changes from here on, so seed from a status read
-    // A boot already finished before we connected would otherwise leave the
-    // splash up forever waiting for a boot.stage event that never comes
-    try {
-      const status = await call<{
-        backend: string;
-        target: { attached: boolean; pid?: number; name?: string };
-      }>("app", "status");
-      set({
-        backend: { badge: status.backend, kernel: status.backend === "kernel" },
-        target: status.target,
-        boot: { stage: 6, total: 6, label: "ready", done: true },
-      });
-    } catch {
-      // Engine not up yet; the SSE retry loop and boot.stage events cover it
-    }
-  })().catch((error: unknown) => { starting = undefined; throw error; }),
+  })().catch((error: unknown) => {
+    starting = undefined;
+    set({ startupError: error instanceof Error ? error.message : String(error) });
+  }),
 }));

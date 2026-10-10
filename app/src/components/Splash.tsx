@@ -15,7 +15,7 @@ const kStageLabels = [
 ];
 
 export default function Splash() {
-  const { boot, connected } = useEngine();
+  const { boot, connected, startupError } = useEngine();
   const lines = useOutput((s) => s.lines);
   const tail = lines.slice(-4);
 
@@ -57,7 +57,9 @@ export default function Splash() {
           />
         </div>
         <div className="empty-hint" style={{ marginTop: "var(--pad-sm)" }}>
-          {connected
+          {startupError ? (
+            <span role="alert">Startup failed: {startupError}</span>
+          ) : connected
             ? "first launch: windows asks for administrator consent so the kernel bridge can load"
             : "waiting for the engine to accept connections…"}
         </div>
