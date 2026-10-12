@@ -14,7 +14,6 @@
 #include <Zydis/Zydis.h>
 
 #include <algorithm>
-#include <chrono>
 #include <cstdio>
 #include <cstring>
 
@@ -77,6 +76,7 @@ struct run_ctx_t {
     uint64_t instructions = 0;
     bool     until_hit    = false;
     bool     return_hit   = false;
+    bool     cancelled    = false;
 
     std::vector<run_result_t::trace_entry_t> trace;
     std::vector<run_result_t::write_entry_t> writes;
@@ -94,6 +94,14 @@ void hook_code(uc_engine* uc, uint64_t address, uint32_t size, void* user_data) 
 
     if (c->taint_on) c->taint.boundary();
 
+    // Caller cancellation (MCP notifications/cancelled) must stop the run now,
+    // not after the full timeout budget
+    if (c->req->cancel.cancelled()) {
+        c->cancelled = true;
+        uc_emu_stop(uc);
+        return;
+    }
+
     if (c->req->until_addr && address == c->req->until_addr) {
         c->until_hit = true;
         uc_emu_stop(uc);
@@ -107,6 +115,11 @@ void hook_code(uc_engine* uc, uint64_t address, uint32_t size, void* user_data) 
 
     ++c->instructions;
     c->cur_ip = address;
+
+    // Instruction text and operands only feed the trace and taint; skip the
+    // per-instruction read + decode + format when neither wants them
+    const bool want_trace = c->req->trace && c->trace.size() < c->req->trace_max;
+    if (!want_trace && !c->taint_on) return;
     c->cur_text.clear();
 
     // If the bytes are unreadable (unmapped callee after a CALL outside the
@@ -124,7 +137,7 @@ void hook_code(uc_engine* uc, uint64_t address, uint32_t size, void* user_data) 
     } else {
         c->cur_text = "<unmapped>";
     }
-    if (c->req->trace && c->trace.size() < c->req->trace_max)
+    if (want_trace)
         c->trace.push_back({address, c->cur_text});
 
     if (!c->taint_on || n == 0 || !readable) return;
@@ -293,8 +306,10 @@ run_result_t emulate_run(const run_request_t& req) {
     uc_hook h_code = 0, h_read = 0, h_write = 0, h_bad = 0;
     uc_hook_add(uc.handle(), &h_code, UC_HOOK_CODE,
                 reinterpret_cast<void*>(hook_code), &ctx, 1, 0);
-    uc_hook_add(uc.handle(), &h_read, UC_HOOK_MEM_READ,
-                reinterpret_cast<void*>(hook_mem_read), &ctx, 1, 0);
+    // Read hooks force unicorn's slow path on every load; only taint uses them
+    if (ctx.taint_on)
+        uc_hook_add(uc.handle(), &h_read, UC_HOOK_MEM_READ,
+                    reinterpret_cast<void*>(hook_mem_read), &ctx, 1, 0);
     uc_hook_add(uc.handle(), &h_write, UC_HOOK_MEM_WRITE,
                 reinterpret_cast<void*>(hook_mem_write), &ctx, 1, 0);
     uc_hook_add(uc.handle(), &h_bad, UC_HOOK_MEM_INVALID,
@@ -307,13 +322,14 @@ run_result_t emulate_run(const run_request_t& req) {
     const uint64_t until = req.until_addr ? req.until_addr : kReturnPage;
     const uint64_t count = req.max_instructions ? req.max_instructions : 100000;
     const uint32_t timeout_ms = std::min<uint32_t>(
-        req.timeout_ms ? req.timeout_ms : 5000, 60000);
-    const auto started = std::chrono::steady_clock::now();
+        req.timeout_ms ? req.timeout_ms : 5000, kMaxTimeoutMs);
     const uc_err err = uc_emu_start(uc.handle(), entry_va, until,
                                     static_cast<uint64_t>(timeout_ms) * 1000ull,
                                     count);
-    const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::steady_clock::now() - started).count();
+    // unicorn returns UC_ERR_OK on timeout; its own timer flag is the only
+    // reliable signal (wall-clock guesses misfire on loaded hosts)
+    size_t timed_out = 0;
+    uc_query(uc.handle(), UC_QUERY_TIMEOUT, &timed_out);
 
     // Final register snapshot
     uint64_t final_rip = 0;
@@ -332,10 +348,9 @@ run_result_t emulate_run(const run_request_t& req) {
 
     if (ctx.return_hit)          res.stopped_reason = "return";
     else if (ctx.until_hit)      res.stopped_reason = "until";
+    else if (ctx.cancelled)      res.stopped_reason = "cancelled";
     else if (ctx.fault)          res.stopped_reason = std::string("invalid_mem_") + ctx.fault->access;
-    else if (elapsed_ms >= static_cast<int64_t>(timeout_ms) - 50 &&
-             ctx.instructions < count)
-        res.stopped_reason = "timeout";   // unicorn returns OK on timeout
+    else if (timed_out)          res.stopped_reason = "timeout";
     else if (err == UC_ERR_OK || err == UC_ERR_FETCH_UNMAPPED ||
              err == UC_ERR_INSN_INVALID) {
         if (err == UC_ERR_FETCH_UNMAPPED && !res.fault)

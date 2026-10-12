@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "core/emu/taint.hpp"
+#include "core/infra/cancel.hpp"
 
 namespace slop::core::emu {
 
@@ -35,7 +36,8 @@ struct run_request_t {
 
     uint64_t until_addr        = 0;            // stop-before address (0 = none)
     uint64_t max_instructions  = 100000;
-    uint32_t timeout_ms        = 5000;
+    uint32_t timeout_ms        = 5000;         // clamped to kMaxTimeoutMs
+    infra::cancel_token_t cancel;              // polled per instruction, stops with "cancelled"
 
     bool     trace             = false;
     size_t   trace_max         = 4096;
@@ -51,7 +53,7 @@ struct run_request_t {
 struct run_result_t {
     bool        ok = false;
     std::string error;
-    std::string stopped_reason;   // return|until|count|timeout|invalid_mem|invalid_insn|cpu_exception
+    std::string stopped_reason;   // return|until|count|timeout|cancelled|invalid_mem_*|invalid_insn|cpu_exception
 
     uint64_t instructions = 0;
     std::map<std::string, uint64_t> regs;
@@ -71,6 +73,10 @@ struct run_result_t {
     std::vector<taint_event_t> taint_events;
     bool output_tainted = false;
 };
+
+// Budget ceiling for one run. MCP clients commonly abort requests at 60 s,
+// so a run plus result serialization has to finish well inside that window.
+inline constexpr uint32_t kMaxTimeoutMs = 30000;
 
 run_result_t emulate_run(const run_request_t& req);
 

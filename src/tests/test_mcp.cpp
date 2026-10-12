@@ -15,6 +15,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <fstream>
 #include <iterator>
@@ -871,6 +872,63 @@ TEST_CASE(mcp_emulate_rejects_bad_input) {
     REQUIRE(is_error);                       // no code source
     payload = fx.call("emulate", {{"action", "explode"}}, is_error);
     REQUIRE(is_error);                       // unknown action
+}
+
+TEST_CASE(mcp_emulate_runs_unlocked_and_honors_cancel) {
+    using clock = std::chrono::steady_clock;
+    auto ms_since = [](clock::time_point t) {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(clock::now() - t).count();
+    };
+    server_fixture_t fx;
+
+    // jmp $ with a 20 s budget on its own connection, request id 777
+    json emu_reply;
+    std::atomic<bool> emu_done{false};
+    std::thread runner([&] {
+        httplib::Client cli("127.0.0.1", fx.port());
+        cli.set_read_timeout(std::chrono::seconds(40));
+        const json req = {
+            {"jsonrpc", "2.0"}, {"id", 777}, {"method", "tools/call"},
+            {"params", {{"name", "emulate"},
+                        {"arguments", {{"action", "run"}, {"hex", "EBFE"},
+                                       {"count", 1ull << 40}, {"timeout_ms", 20000}}}}}};
+        if (auto res = cli.Post("/mcp", req.dump(), "application/json");
+            res && res->status == 200)
+            emu_reply = json::parse(res->body, nullptr, false);
+        emu_done = true;
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+    // Another tool must answer while the emulation is still running
+    const json status_req = {{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                             {"params", {{"name", "target"},
+                                         {"arguments", {{"action", "status"}}}}}};
+    const auto status_t0 = clock::now();
+    auto status_res = fx.cli_->Post("/mcp", status_req.dump(), "application/json");
+    const auto status_ms = ms_since(status_t0);
+    const bool status_ok = status_res && status_res->status == 200;
+    const bool emu_running_during_status = !emu_done.load();
+
+    // notifications/cancelled for id 777 must stop the run early; resend until
+    // it lands so a slow registration on the runner thread cannot race the test
+    const json cancel = {{"jsonrpc", "2.0"}, {"method", "notifications/cancelled"},
+                         {"params", {{"requestId", 777}, {"reason", "test"}}}};
+    const auto cancel_t0 = clock::now();
+    while (!emu_done.load() && ms_since(cancel_t0) < 10000) {
+        fx.cli_->Post("/mcp", cancel.dump(), "application/json");
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    runner.join();
+    const auto cancel_ms = ms_since(cancel_t0);
+
+    REQUIRE(status_ok);
+    REQUIRE(emu_running_during_status);
+    REQUIRE_LT(status_ms, 2000);
+    REQUIRE(emu_reply.is_object() && emu_reply.contains("result"));
+    const json payload = json::parse(
+        emu_reply.at("result").at("content").at(0).at("text").get<std::string>());
+    REQUIRE_STR_EQ(payload.value("stopped_reason", "").c_str(), "cancelled");
+    REQUIRE_LT(cancel_ms, 5000);
 }
 
 TEST_CASE(mcp_analyze_packer_on_loaded_image) {

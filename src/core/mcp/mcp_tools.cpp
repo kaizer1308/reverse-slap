@@ -797,7 +797,7 @@ const char* hint_for_tool_action(const std::string& tool, const std::string& act
         if (action == "signatures") return "signatures[] are crypto-constant hits (offset is file offset); named_functions[] are analyzer names (RTTI/vtable/thunk included, NOT FLIRT-verified).";
         if (action == "diff") return "count is non-identical functions shown (cap 500); totals{added,removed,modified,identical} cover the full pair. similarity is 0-1.";
     } else if (tool == "emulate") {
-        return "stopped_reason names the halt (return/timeout/count/fault). regs echo final state; trace[] is bounded by trace_max. Maps are extra regions beyond the code window; imports/IAT are NOT mapped.";
+        return "stopped_reason names the halt (return/until/count/timeout/cancelled/invalid_mem_*/invalid_insn/cpu_exception). timeout_ms caps at 30000. regs echo final state; trace[] is bounded by trace_max. Maps are extra regions beyond the code window; imports/IAT are NOT mapped.";
     } else if (tool == "patch") {
         if (action == "journal") return "patches[] carry va + before/after hex blobs. total is patch records; indexes_dirty=true means static tools rebuild on next call.";
         if (action == "full_pass") return "scores are 0-100 obfuscation ratings; score_reduction=pre-post. steps[] show per-pass success/note. dry_run=true previews without writing.";
@@ -4016,11 +4016,25 @@ json tool_inject(const json& args) {
 
 // tool: emulate
 
-json tool_emulate(const json& args) {
+json tool_emulate(const json& args, infra::cancel_token_t cancel) {
     const std::string action = require_action(args);
     if (action != "run") fail("emulate: unknown action");
 
+    // Input bounds: these all run before unicorn's timer starts (stack commit,
+    // per-byte taint marking, trace growth), so an unbounded value hangs the
+    // request regardless of timeout_ms
+    constexpr size_t   kMaxStackSize = 64u << 20;
+    constexpr size_t   kMaxTaintLen  = 1u << 20;
+    constexpr size_t   kMaxTraceMax  = 16384;
+
     emu::run_request_t req;
+    req.cancel = cancel;
+
+    // Building the request reads the shared image / attached session, so it
+    // runs under g_tool_mu. The run itself owns a private unicorn instance and
+    // must not hold it, or every other tool (and initialize) queues behind the
+    // emulation until the client times out
+    std::unique_lock tool_lk(g_tool_mu);
 
     // hex wins over file_addr wins over target_addr, code runs at its real va unless base says otherwise
     bool have_code = false;
@@ -4069,7 +4083,12 @@ json tool_emulate(const json& args) {
     req.entry          = start_va;
 
     if (args.contains("stack_base")) req.stack_base = parse_addr(args, "stack_base");
-    if (args.contains("stack_size")) req.stack_size = static_cast<size_t>(parse_addr(args, "stack_size"));
+    if (args.contains("stack_size")) {
+        const uint64_t ss = parse_addr(args, "stack_size");
+        if (ss < 0x1000 || ss > kMaxStackSize)
+            fail("stack_size must be 0x1000..0x4000000 (64 MiB)");
+        req.stack_size = static_cast<size_t>(ss);
+    }
     if (args.contains("sp")) { req.sp_set = true; req.sp = parse_addr(args, "sp"); }
 
     if (auto it = args.find("regs"); it != args.end() && it->is_object()) {
@@ -4100,25 +4119,36 @@ json tool_emulate(const json& args) {
 
     if (args.contains("until"))       req.until_addr       = parse_addr(args, "until");
     if (args.contains("count"))       req.max_instructions = parse_addr(args, "count");
-    if (args.contains("timeout_ms"))  req.timeout_ms       = static_cast<uint32_t>(parse_addr(args, "timeout_ms"));
+    if (args.contains("timeout_ms"))
+        req.timeout_ms = static_cast<uint32_t>(
+            std::min<uint64_t>(parse_addr(args, "timeout_ms"), emu::kMaxTimeoutMs));
     if (args.contains("trace"))       req.trace            = args.value("trace", false);
-    if (args.contains("trace_max"))   req.trace_max        = static_cast<size_t>(parse_addr(args, "trace_max"));
+    if (args.contains("trace_max"))
+        req.trace_max = static_cast<size_t>(
+            std::min<uint64_t>(parse_addr(args, "trace_max"), kMaxTraceMax));
 
     if (auto it = args.find("taint"); it != args.end() && it->is_array()) {
+        uint64_t taint_total = 0;
         for (const auto& t : *it) {
             if (!t.contains("addr") || !t.contains("len"))
                 fail("taint entries need addr + len");
             emu::run_request_t::taint_source_t s;
             s.addr = parse_addr(t, "addr");
-            s.len  = static_cast<size_t>(parse_addr(t, "len"));
-            if (s.len == 0) fail("taint len must be > 0");
+            const uint64_t len = parse_addr(t, "len");
+            if (len == 0) fail("taint len must be > 0");
+            taint_total += len;
+            if (len > kMaxTaintLen || taint_total > kMaxTaintLen)
+                fail("taint ranges must total <= 1048576 bytes");
+            s.len = static_cast<size_t>(len);
             req.taint_sources.push_back(s);
         }
     }
     if (args.contains("watch_addr") && args.contains("watch_len")) {
         req.watch_addr = parse_addr(args, "watch_addr");
         req.watch_len  = static_cast<size_t>(parse_addr(args, "watch_len"));
+        if (req.watch_len > kMaxTaintLen) fail("watch_len must be <= 1048576");
     }
+    tool_lk.unlock();
 
     auto r = emu::emulate_run(req);
     if (!r.ok && !r.error.empty()) fail(r.error);
@@ -7270,6 +7300,15 @@ json tool_notes(const json& args) {
 
 // tool: devirt
 
+// Seeded emulation runs for recover_cfg / prove_predicates / invariants. Each
+// run builds a fresh unicorn instance and maps the data sections while this
+// tool holds g_tool_mu and the binary lock, so the count must stay bounded
+size_t devirt_runs(const json& args) {
+    constexpr int64_t kMaxRuns = 64;
+    return static_cast<size_t>(
+        std::clamp<int64_t>(args.value("runs", int64_t{4}), 1, kMaxRuns));
+}
+
 json tool_devirt(const json& args) {
     const std::string action = require_action(args);
 
@@ -7373,7 +7412,7 @@ json tool_devirt(const json& args) {
 
     if (action == "recover_cfg") {
         const uint64_t fn_va = parse_addr_alias(args, {"addr", "entry", "va", "start", "address"});
-        const size_t runs = static_cast<size_t>(args.value("runs", 4));
+        const size_t runs = devirt_runs(args);
         auto r = recover::recover_flattened(img, fn_va, runs);
         if (!r.ok) fail(r.error);
         out["flattened"] = r.flattened;
@@ -7395,7 +7434,7 @@ json tool_devirt(const json& args) {
 
     if (action == "prove_predicates") {
         const uint64_t fn_va = parse_addr_alias(args, {"addr", "entry", "va", "start", "address"});
-        const size_t runs = static_cast<size_t>(args.value("runs", 4));
+        const size_t runs = devirt_runs(args);
         auto batch = recover::prove_predicates_ex(img, fn_va, runs);
         json arr = json::array();
         for (const auto& p : batch.proofs)
@@ -7425,7 +7464,7 @@ json tool_devirt(const json& args) {
 
     if (action == "invariants") {
         const uint64_t fn_va = parse_addr_alias(args, {"addr", "entry", "va", "start", "address"});
-        const size_t runs = static_cast<size_t>(args.value("runs", 4));
+        const size_t runs = devirt_runs(args);
         auto r = recover::observe_invariants(img, fn_va, runs);
         if (!r.ok) fail(r.error);
         out["instructions_executed"] = r.instructions_executed;
@@ -8227,7 +8266,7 @@ void list_tools(json& out) {
     const char* notes_schema =
         R"({"type":"object","properties":{"action":{"type":"string","enum":["set_comment","get_comment","comments","bookmark_toggle","bookmarks"]},"addr":{"type":"integer"},"text":{"type":"string"}},"required":["action"]})";
     const char* emulate_schema =
-        R"({"type":"object","properties":{"action":{"type":"string","enum":["run"]},"hex":{"type":"string"},"file_addr":{"type":"integer"},"target_addr":{"type":"integer"},"code_len":{"type":"integer"},"base":{"type":"integer"},"entry":{"type":"integer"},"stack_base":{"type":"integer"},"stack_size":{"type":"integer"},"sp":{"type":"integer"},"regs":{"type":"object"},"maps":{"type":"array"},"until":{"type":"integer"},"count":{"type":"integer"},"timeout_ms":{"type":"integer"},"trace":{"type":"boolean"},"trace_max":{"type":"integer"},"taint":{"type":"array"},"watch_addr":{"type":"integer"},"watch_len":{"type":"integer"}},"required":["action"]})";
+        R"({"type":"object","properties":{"action":{"type":"string","enum":["run"]},"hex":{"type":"string"},"file_addr":{"type":"integer"},"target_addr":{"type":"integer"},"code_len":{"type":"integer","minimum":1,"maximum":1048576},"base":{"type":"integer"},"entry":{"type":"integer"},"stack_base":{"type":"integer"},"stack_size":{"type":"integer","minimum":4096,"maximum":67108864},"sp":{"type":"integer"},"regs":{"type":"object"},"maps":{"type":"array"},"until":{"type":"integer"},"count":{"type":"integer"},"timeout_ms":{"type":"integer","minimum":1,"maximum":30000},"trace":{"type":"boolean"},"trace_max":{"type":"integer","minimum":0,"maximum":16384},"taint":{"type":"array"},"watch_addr":{"type":"integer"},"watch_len":{"type":"integer","minimum":0,"maximum":1048576}},"required":["action"]})";
     const char* analyze_schema =
         R"({"type":"object","properties":{"action":{"type":"string","enum":["packer","signatures","diff","diff_start","diff_job","diff_cancel"]},"path":{"type":"string"},"path_a":{"type":"string"},"path_b":{"type":"string"},"limit":{"type":"integer"},"timeout_ms":{"type":"integer"},"max_pairs":{"type":"integer"},"id":{"type":"integer"}},"required":["action"]})";
     const char* network_schema =
@@ -8289,7 +8328,7 @@ void list_tools(json& out) {
                    {"description", "Read and edit analyst annotations for the currently loaded binary. set_comment(addr,text), get_comment(addr), and comments manage per-VA comments; bookmark_toggle(addr) and bookmarks manage navigation marks. Data persists by binary hash alongside user symbols and is immediately shared with the UI. Requires a loaded image. set_comment with empty text clears the comment (response cleared=true)."},
                    {"inputSchema", json::parse(notes_schema)}, {"read_only", false}});
     out.push_back({{"name", "emulate"},
-                   {"description", "Emulate x86-64 code in an isolated Unicorn VM. action='run' accepts exactly one practical code source: hex bytes, file_addr from the shared image, or target_addr from attached-process memory; code_len bounds file/live reads. Set base/entry, registers, stack, and extra maps as needed. Stop with until, count, or timeout_ms. trace enables bounded instruction history; taint entries mark source byte ranges, and watch_addr/watch_len selects the output window for byte-granular propagation results. Emulation does not modify the loaded image or live target."},
+                   {"description", "Emulate x86-64 code in an isolated Unicorn VM. action='run' accepts exactly one practical code source: hex bytes, file_addr from the shared image, or target_addr from attached-process memory; code_len bounds file/live reads. Set base/entry, registers, stack, and extra maps as needed. Stop with until, count (default 100000), or timeout_ms (default 5000, capped at 30000); MCP notifications/cancelled stops a run early with stopped_reason='cancelled'. Runs do not block other tools. trace enables bounded instruction history (trace_max <= 16384); taint entries mark source byte ranges (<= 1 MiB total), and watch_addr/watch_len selects the output window for byte-granular propagation results. Emulation does not modify the loaded image or live target."},
                    {"inputSchema", json::parse(emulate_schema)}, {"read_only", true}});
     out.push_back({{"name", "analyze"},
                    {"description", "Run whole-binary read-only analysis. packer uses the shared image or path and reports protector names, entry signatures, entropy, import anomalies, W+X sections, TLS, overlay, crypto constants, and the shared Hyperion verdict when available. signatures requires the analyzed shared session and returns analyzer-derived names in named_functions; names may come from RTTI, vtables, thunks, or signature candidates and are not provenance-verified as FLIRT. diff(path_a,path_b) performs two full Hyperion analyses and reports added, removed, and modified functions with similarity scores, so expect a longer call; for huge binaries use async diff_start(path_a,path_b) then poll diff_job(id) for stage/progress and stop with diff_cancel(id). Check disasm.loaded before shared-session actions."},
@@ -8369,6 +8408,16 @@ nlohmann::json call_tool(const std::string& name, const nlohmann::json& args,
                 return out;
             }
         }
+        // emulate owns a private unicorn instance; it takes g_tool_mu itself
+        // only while reading the shared image / attached target, then runs
+        // unlocked so a long run never stalls other tools or initialize
+        if (name == "emulate") {
+            json out = tool_emulate(args, cancel);
+            try {
+                enrich_payload(name, args, out);
+            } catch (...) {}
+            return out;
+        }
         // NOTE: decomp.function stays under g_tool_mu on purpose: the patch
         // tool can reanalyze() the session (replacing the analyzer mid-lift),
         // so decompile must stay serialized with it. Wedges are fixed at the
@@ -8384,7 +8433,6 @@ nlohmann::json call_tool(const std::string& name, const nlohmann::json& args,
         else if (name == "debugger") out = tool_debugger(args);
         else if (name == "driver")   out = tool_driver(args);
         else if (name == "inject")   out = tool_inject(args);
-        else if (name == "emulate")  out = tool_emulate(args);
         else if (name == "analyze")  out = tool_analyze(args, cancel);
         else if (name == "network")  out = tool_network(args);
         else if (name == "proxy")    out = tool_proxy(args);
@@ -8450,8 +8498,14 @@ void shutdown_tools() {
 }
 
 json session_state() {
-    std::lock_guard lk(g_tool_mu);
-    return app_state_unlocked();
+    // initialize must answer immediately: a client that reconnects while a
+    // long tool holds g_tool_mu would otherwise time out the handshake
+    std::unique_lock lk(g_tool_mu, std::try_to_lock);
+    if (lk.owns_lock()) return app_state_unlocked();
+    return {{"backend", runtime::active_badge()},
+            {"target", attached_target_json()},
+            {"busy", true},
+            {"note", "another tool call is running; call disasm.loaded for image state"}};
 }
 
 } // namespace slop::core::mcp

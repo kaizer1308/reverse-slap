@@ -11,6 +11,8 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
+#include <thread>
 #include <vector>
 
 using namespace slop::core::emu;
@@ -205,5 +207,39 @@ TEST_CASE(emu_trace_captures_instruction_text) {
     }
     REQUIRE(saw_inc);
     REQUIRE(saw_dec);
+}
+
+TEST_CASE(emu_timeout_reports_timeout_reason) {
+    // jmp $ with an instruction budget it can never reach
+    auto req = base_req({0xEB, 0xFE});
+    req.max_instructions = 1ull << 40;
+    req.timeout_ms = 200;
+    auto r = emulate_run(req);
+    REQUIRE(r.ok);
+    REQUIRE_STR_EQ(r.stopped_reason.c_str(), "timeout");
+    REQUIRE_GT(r.instructions, 0u);
+}
+
+TEST_CASE(emu_cancel_token_stops_running_loop) {
+    // jmp $ with a 20 s budget; cancellation must end it long before that
+    auto req = base_req({0xEB, 0xFE});
+    req.max_instructions = 1ull << 40;
+    req.timeout_ms = 20000;
+    slop::core::infra::cancel_source_t source;
+    req.cancel = source.token();
+
+    const auto started = std::chrono::steady_clock::now();
+    std::thread canceller([&source] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        source.request();
+    });
+    auto r = emulate_run(req);
+    canceller.join();
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - started).count();
+
+    REQUIRE(r.ok);
+    REQUIRE_STR_EQ(r.stopped_reason.c_str(), "cancelled");
+    REQUIRE_LT(elapsed, 5000);
 }
 
