@@ -2,6 +2,8 @@
 #include "disasm_accuracy.hpp"
 #include "core/disasm/xrefs.hpp"
 
+#include <algorithm>
+
 namespace {
 void require_exact(const disasm_accuracy::result& report) {
     for (const auto& [field, count] : report.mismatches)
@@ -122,4 +124,48 @@ TEST_CASE(disasm_accuracy_iret_terminates_cfg) {
     REQUIRE(function.blocks.size() == 1);
     CHECK(function.blocks.begin()->second.succs.empty());
     CHECK(function.blocks.begin()->second.end == image.entry + 2);
+}
+
+TEST_CASE(disasm_accuracy_nested_loops_terminate_with_dominator_back_edges) {
+    // Entry jumps into an outer loop whose body jumps into a self-looping
+    // inner block: both headers have a pred outside the loop plus a latch,
+    // the shape detect_loops used to spin on forever inside intersect().
+    // Headers are only reached by jumps (never by fallthrough) so the CFG
+    // builder's blocks don't overlap and each header is a single block
+    hype::PEImage image{};
+    image.arch = hype::Arch::X64;
+    image.base = 0x400000;
+    image.entry = 0x401000;
+    hype::Segment text{};
+    text.name = ".text";
+    text.va = image.entry;
+    text.flags = 0x60000020;
+    static constexpr hype::u8 kText[] = {
+        0x31, 0xC9,         // +00 xor ecx, ecx
+        0xEB, 0x0F,         // +02 jmp +13
+        0xFF, 0xC2,         // +04 inc edx        inner header + latch
+        0x83, 0xFA, 0x04,   // +06 cmp edx, 4
+        0x75, 0xF9,         // +09 jne +04
+        0xFF, 0xC1,         // +0B inc ecx        outer latch
+        0x83, 0xF9, 0x04,   // +0D cmp ecx, 4
+        0x75, 0x01,         // +10 jne +13
+        0xC3,               // +12 ret
+        0x31, 0xD2,         // +13 xor edx, edx   outer header
+        0xEB, 0xED,         // +15 jmp +04
+    };
+    text.data = kText;
+    text.size = text.file_sz = text.data.size();
+    image.segments.push_back(std::move(text));
+    hype::WorkerPool pool(1);
+    hype::Analyzer analyzer(image, pool);
+    analyzer.run();
+
+    auto loops = analyzer.db().funcs.at(image.entry).loops;
+    REQUIRE_EQ(loops.size(), 2u);
+    std::sort(loops.begin(), loops.end(),
+              [](const hype::LoopInfo& a, const hype::LoopInfo& b) { return a.header < b.header; });
+    CHECK(loops[0].header == image.entry + 0x04);
+    CHECK(loops[0].back_edge_src == image.entry + 0x04);
+    CHECK(loops[1].header == image.entry + 0x13);
+    CHECK(loops[1].back_edge_src == image.entry + 0x0B);
 }

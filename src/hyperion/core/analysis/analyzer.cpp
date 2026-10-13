@@ -1285,34 +1285,47 @@ void Analyzer::detect_loops() {
         // Cooper-Harvey-Kennedy dominators over a reverse-postorder index:
         // near-linear, replacing the former per-block dominator *sets* whose
         // set intersections made large functions quadratic.
-        std::vector<va_t> order;
-        order.reserve(func.blocks.size());
-        for (const auto& [addr, block] : func.blocks) order.push_back(addr);
-        std::sort(order.begin(), order.end());
-
-        // DFS from entry to get reachable blocks + postorder.
-        std::vector<int> postorder;
-        std::unordered_set<va_t> visited;
-        std::vector<va_t> stack{entry};
-        while (!stack.empty()) {
-            const va_t current = stack.back();
-            stack.pop_back();
-            if (!visited.insert(current).second) continue;
-            auto bit = func.blocks.find(current);
-            if (bit == func.blocks.end()) continue;
-            for (va_t succ : bit->second.succs)
-                if (func.blocks.count(succ) && !visited.count(succ)) stack.push_back(succ);
-            postorder.push_back(current);
-        }
-        std::vector<va_t> rpo(postorder.rbegin(), postorder.rend());
+        //
+        // The order has to be a true postorder (a block is emitted only once
+        // every successor is finished) so entry lands at RPO index 0 and each
+        // idom sits at a smaller index than the block it dominates. A
+        // pop-and-emit walk gives preorder instead, which put entry last;
+        // intersect() then spun forever on entry's self-idom as soon as two
+        // fingers met there, i.e. on most functions with a loop.
+        struct frame_t {
+            va_t              addr;
+            const BasicBlock* block;
+            size_t            next_succ;
+        };
+        std::vector<const BasicBlock*> postorder;
+        postorder.reserve(func.blocks.size());
+        // Doubles as the DFS visited set: -1 while on the stack, postorder
+        // number once finished, rewritten to the RPO index below.
         std::unordered_map<va_t, int> rpo_index;
-        for (size_t i = 0; i < rpo.size(); ++i) rpo_index[rpo[i]] = static_cast<int>(i);
+        rpo_index.reserve(func.blocks.size());
+        std::vector<frame_t> stack;
+        rpo_index.emplace(entry, -1);
+        stack.push_back({entry, &func.blocks.at(entry), 0});
+        while (!stack.empty()) {
+            frame_t& top = stack.back();
+            if (top.next_succ < top.block->succs.size()) {
+                const va_t succ = top.block->succs[top.next_succ++];
+                const auto sit = func.blocks.find(succ);
+                if (sit != func.blocks.end() && rpo_index.emplace(succ, -1).second)
+                    stack.push_back({succ, &sit->second, 0});
+                continue;
+            }
+            rpo_index[top.addr] = static_cast<int>(postorder.size());
+            postorder.push_back(top.block);
+            stack.pop_back();
+        }
+        const int count_rpo = static_cast<int>(postorder.size());
+        for (auto& [addr, index] : rpo_index) index = count_rpo - 1 - index;
+        const std::vector<const BasicBlock*> rpo(postorder.rbegin(), postorder.rend());
 
         const int kNoDom = -1;
-        std::vector<int> idom(order.size(), kNoDom);
-        const int entry_idx = rpo_index.count(entry) ? rpo_index[entry] : kNoDom;
-        if (entry_idx == kNoDom) return;
-        idom[entry_idx] = entry_idx;
+        std::vector<int> idom(rpo.size(), kNoDom);
+        idom[0] = 0;
 
         const auto intersect = [&](int a, int b) {
             while (a != b) {
@@ -1325,11 +1338,9 @@ void Analyzer::detect_loops() {
         bool changed = true;
         while (changed) {
             changed = false;
-            for (size_t ri = 1; ri < rpo.size(); ++ri) {
-                const va_t addr = rpo[ri];
-                const auto& block = func.blocks.at(addr);
+            for (int ri = 1; ri < count_rpo; ++ri) {
                 int new_idom = kNoDom;
-                for (va_t pred : block.preds) {
+                for (va_t pred : rpo[ri]->preds) {
                     auto pit = rpo_index.find(pred);
                     if (pit == rpo_index.end() || idom[pit->second] == kNoDom) continue;
                     new_idom = new_idom == kNoDom ? pit->second
@@ -1342,38 +1353,39 @@ void Analyzer::detect_loops() {
             }
         }
 
-        // A back edge is an edge whose target dominates its source.
-        for (auto& [ba, bb] : func.blocks) {
-            auto sit = rpo_index.find(ba);
-            if (sit == rpo_index.end()) continue;
+        // A back edge is an edge whose target dominates its source. idom
+        // indices strictly decrease toward entry, so the walk stops as soon
+        // as it drops below the target.
+        for (int si = 0; si < count_rpo; ++si) {
+            const BasicBlock& bb = *rpo[si];
             for (va_t succ : bb.succs) {
                 auto tit = rpo_index.find(succ);
                 if (tit == rpo_index.end()) continue;
-                int runner = sit->second;
-                bool dominates = false;
-                while (runner != kNoDom) {
-                    if (runner == tit->second) { dominates = true; break; }
-                    if (runner == idom[runner]) break;
-                    runner = idom[runner];
-                }
-                if (!dominates) continue;
+                const int target = tit->second;
+                int runner = si;
+                while (runner > target) runner = idom[runner];
+                if (runner != target) continue;
 
                 LoopInfo loop;
                 loop.header = succ;
-                loop.back_edge_src = ba;
+                loop.back_edge_src = bb.start;
 
-                std::unordered_set<va_t> loop_blocks{succ, ba};
+                // Natural loop body: reachable blocks that reach the latch
+                // without passing through the header. Lookups stay at()/find():
+                // operator[] could insert into func.blocks and rehash it mid-walk.
+                std::unordered_set<va_t> loop_blocks{succ, bb.start};
                 std::queue<va_t> worklist;
-                worklist.push(ba);
+                if (bb.start != succ) worklist.push(bb.start);
                 while (!worklist.empty()) {
                     const va_t current = worklist.front();
                     worklist.pop();
-                    for (va_t pred : func.blocks[current].preds)
-                        if (loop_blocks.insert(pred).second && pred != succ) worklist.push(pred);
+                    for (va_t pred : func.blocks.at(current).preds)
+                        if (rpo_index.count(pred) && loop_blocks.insert(pred).second)
+                            worklist.push(pred);
                 }
 
                 for (va_t loop_block : loop_blocks) {
-                    for (const auto& insn : func.blocks[loop_block].insns) {
+                    for (const auto& insn : func.blocks.at(loop_block).insns) {
                         if (insn.type == InsnType::Inc && insn.op_count > 0 &&
                             insn.ops[0].type == OpType::Reg) {
                             loop.induction_reg = insn.ops[0].reg;
