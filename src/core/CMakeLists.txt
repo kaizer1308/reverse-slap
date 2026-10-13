@@ -111,6 +111,8 @@ add_library(slop_core STATIC
     infra/deferred.cpp
     util/fs_tools.hpp
     util/fs_tools.cpp
+    util/zip_reader.hpp
+    util/zip_reader.cpp
     network/web_fetch.hpp
     network/web_fetch.cpp
     network/mitm_pki.hpp
@@ -135,6 +137,10 @@ add_library(slop_core STATIC
     disasm/engine.cpp
     disasm/pe_parser.hpp
     disasm/pe_parser.cpp
+    disasm/ipa.hpp
+    disasm/ipa.cpp
+    disasm/image_open.hpp
+    disasm/image_open.cpp
     disasm/strings.hpp
     disasm/strings.cpp
     disasm/function_index.hpp

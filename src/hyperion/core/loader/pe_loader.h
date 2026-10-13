@@ -19,6 +19,10 @@ struct PEImage {
     std::vector<Import>        imports;
     std::vector<Export>        exports;
     std::vector<RuntimeFunc>   runtime_funcs;
+    std::vector<Symbol>        symbols;
+    // Code bytes are encrypted on disk (Mach-O LC_ENCRYPTION_INFO cryptid != 0,
+    // a FairPlay-protected App Store binary): decoded instructions are noise
+    bool                       encrypted = false;
     // Whole file bytes. load_buffer() borrows the caller's buffer, which must
     // outlive the image; load() and the ELF/Mach-O loaders keep what they read,
     // plus any zero-extended segment tails, alive in `storage`

@@ -1,9 +1,10 @@
 // app/src/store/pe.ts
-// Static PE headers for the loaded image, backs the PE Browser tab
-// (src/ui/view_pe.cpp)
+// Static image metadata: native PE headers or the synthesized Mach-O section,
+// import and export map used by the image browser (src/ui/view_pe.cpp).
 
 import { create } from "zustand";
 import { call } from "@/lib/rpc";
+import type { ImageArch, ImageFormat } from "@/store/disasm";
 
 export type Section = {
   name: string;
@@ -20,6 +21,8 @@ export type ExportEntry = { name: string; rva: number; ordinal: number };
 
 export type PeInfo = {
   image?: string;
+  format?: ImageFormat;
+  arch?: ImageArch;
   pe32plus?: boolean;
   image_base?: number;
   entry_rva?: number;

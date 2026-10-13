@@ -380,6 +380,11 @@ int l_analyze_packer(lua_State* L) {
     if (!need_image(L)) return 0;
     ds::binary_lock_t lock;
     auto& bin = ds::get();
+    // section-name and PE-header heuristics, meaningless on a Mach-O
+    if (bin.format != disasm::image_format_t::pe)
+        return lua_fail(L, (std::string("analyze.packer requires a PE image; the loaded image is ") +
+                            disasm::image_arch_name(bin.arch) + " (" +
+                            disasm::image_format_name(bin.format) + ")").c_str());
     auto v = analysis::packer_analyze(bin.pe, bin.file);
     lua_createtable(L, 0, 4);
     lua_pushboolean(L, v.packed);          lua_setfield(L, -2, "packed");
@@ -399,7 +404,8 @@ int l_image_load(lua_State* L) {
     const char* path = luaL_checklstring(L, 1, &plen);
     const uint64_t base = lua_gettop(L) >= 2 ? to_addr(L, 2) : 0;
     if (!ds::load_file(std::string(path, plen), base))
-        return lua_fail(L, ("failed to load: " + std::string(path, plen)).c_str());
+        return lua_fail(L, ("failed to load " + std::string(path, plen) + ": " +
+                            ds::last_load_error()).c_str());
     return l_image_status(L);
 }
 
@@ -426,6 +432,15 @@ int l_image_status(lua_State* L) {
     lua_setfield(L, -2, "base");
     if (!bin.ready) return 1;
 
+    lua_pushstring(L, disasm::image_format_name(bin.format));
+    lua_setfield(L, -2, "format");
+    lua_pushstring(L, disasm::image_arch_name(bin.arch));
+    lua_setfield(L, -2, "arch");
+    lua_pushboolean(L, bin.encrypted);      lua_setfield(L, -2, "encrypted");
+    if (bin.bundle) {
+        lua_pushstring(L, bin.bundle->bundle_id.c_str());
+        lua_setfield(L, -2, "bundle_id");
+    }
     lua_pushinteger(L, static_cast<lua_Integer>(bin.base + bin.pe.entry_rva));
     lua_setfield(L, -2, "entry");
     lua_pushinteger(L, static_cast<lua_Integer>(bin.pe.image_base));
@@ -816,7 +831,11 @@ int l_disasm_pe(lua_State* L) {
     if (!need_image(L)) return 0;
     ds::binary_lock_t lock;
     auto& bin = ds::get();
-    lua_createtable(L, 0, 8);
+    lua_createtable(L, 0, 10);
+    lua_pushstring(L, disasm::image_format_name(bin.format));
+    lua_setfield(L, -2, "format");
+    lua_pushstring(L, disasm::image_arch_name(bin.arch));
+    lua_setfield(L, -2, "arch");
     lua_pushboolean(L, bin.pe.pe32plus);      lua_setfield(L, -2, "pe32plus");
     lua_pushinteger(L, static_cast<lua_Integer>(bin.pe.image_base));
     lua_setfield(L, -2, "image_base");

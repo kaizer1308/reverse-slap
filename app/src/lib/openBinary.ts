@@ -13,7 +13,9 @@ export async function openBinary(): Promise<void> {
       directory: false,
       title: "Open binary for analysis",
       filters: [
+        { name: "Binaries and iOS apps", extensions: ["exe", "dll", "sys", "efi", "bin", "ipa"] },
         { name: "Executables", extensions: ["exe", "dll", "sys", "efi", "bin"] },
+        { name: "iOS apps", extensions: ["ipa"] },
         { name: "All files", extensions: ["*"] },
       ],
     });

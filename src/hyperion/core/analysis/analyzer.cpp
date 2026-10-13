@@ -263,6 +263,8 @@ void Analyzer::recursive_descent() {
     roots.push_back(img_.entry);
     for (auto& exp : img_.exports)
         if (!exp.forwarded && is_code_addr(exp.addr)) roots.push_back(exp.addr);
+    for (auto& sym : img_.symbols)
+        if (is_code_addr(sym.addr)) roots.push_back(sym.addr);
     for (auto& runtime : img_.runtime_funcs)
         roots.push_back(runtime.start);
 
@@ -374,6 +376,8 @@ void Analyzer::detect_functions() {
     entries.insert(img_.entry);
     for (auto& exp : img_.exports)
         if (!exp.forwarded && is_code_addr(exp.addr)) entries.insert(exp.addr);
+    for (auto& sym : img_.symbols)
+        if (is_code_addr(sym.addr)) entries.insert(sym.addr);
 
     // .pdata runtime functions — most reliable source for x64. Once the budget
     // has bitten, most of them have no decoded body behind them, and a few
@@ -980,6 +984,13 @@ void Analyzer::apply_names() {
         std::string demangled = demangle(exp.name);
         db_.set_name(exp.addr, demangled);
         auto fit = db_.funcs.find(exp.addr);
+        if (fit != db_.funcs.end())
+            fit->second.name = demangled;
+    }
+    for (auto& sym : img_.symbols) {
+        std::string demangled = demangle(sym.name);
+        db_.set_name(sym.addr, demangled);
+        auto fit = db_.funcs.find(sym.addr);
         if (fit != db_.funcs.end())
             fit->second.name = demangled;
     }

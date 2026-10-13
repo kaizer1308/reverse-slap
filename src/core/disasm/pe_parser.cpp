@@ -46,7 +46,8 @@ std::optional<size_t> pe_image_t::rva_to_offset(uint32_t rva) const {
 }
 
 std::optional<size_t> pe_image_t::va_to_offset(uint64_t va) const {
-    if (image_base == 0) return std::nullopt;
+    // a Mach-O dylib/bundle legitimately maps __TEXT at 0, so gate on ok
+    if (!ok) return std::nullopt;
     if (va < image_base || va - image_base > 0xFFFFFFFFull) return std::nullopt;
     return rva_to_offset(static_cast<uint32_t>(va - image_base));
 }

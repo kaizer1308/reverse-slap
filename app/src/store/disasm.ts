@@ -24,8 +24,25 @@ export type Insn = {
   rip_rel?: number;
 };
 
+export type ImageFormat = "pe" | "macho";
+export type ImageArch = "x86" | "x64" | "arm" | "arm64";
+
 export type LoadedImage = {
   ready: boolean;
+  // Optional for engines predating Mach-O and IPA support.
+  format?: ImageFormat;
+  arch?: ImageArch;
+  encrypted?: boolean;
+  warning?: string;
+  bundle?: {
+    app_dir: string;
+    executable: string;
+    executable_path: string;
+    bundle_id: string;
+    version: string;
+    build: string;
+    min_os: string;
+  };
   name?: string;
   path?: string;
   base?: number;

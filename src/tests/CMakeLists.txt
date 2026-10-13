@@ -32,6 +32,7 @@ add_executable(slop_tests
     test_driver.cpp
     test_driver_abi.cpp
     test_injector.cpp
+    test_ipa.cpp
 )
 
 # Real-world PE fixture: the built SlopTarget.exe itself
@@ -76,7 +77,7 @@ set_target_properties(slop_tests PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
 )
 
-foreach(filter IN ITEMS decomp hyperion dotnet disasm_accuracy mcp driver abi inject app_perf)
+foreach(filter IN ITEMS decomp hyperion dotnet disasm_accuracy mcp driver abi inject app_perf ipa)
     add_test(NAME "slop_tests_${filter}" COMMAND slop_tests)
     set_tests_properties("slop_tests_${filter}" PROPERTIES
         ENVIRONMENT "SLOP_TEST_FILTER=${filter}"

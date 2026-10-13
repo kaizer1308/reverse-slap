@@ -60,6 +60,7 @@ struct session_t {
     hype::AnalysisDB&        db_mut();         // annotation merges (persist.hype_load)
     const hype::RTTIParser&  rtti() const;     // analyzer_->rtti_parser()
     const hype::PEImage&     image() const { return img_; }
+    hype::Arch               arch() const { return img_.arch; }   // set by begin()
     const hype::SignatureMatcher& signatures() const;
 
     // Managed (.NET/CLI) view. is_dotnet() is only true after ready() on a CLI
@@ -82,12 +83,18 @@ struct session_t {
     void queue_names(const std::unordered_map<uint64_t, std::string>& names);
 
     // hyperion decode through the slop insn abi, lossless for everything
-    // consumers read, operand flags are heuristic
+    // consumers read, operand flags are heuristic. x86/x64 only: the insn_t
+    // mnemonic and register fields are Zydis enums
     static insn_t convert(const hype::Insn& in);
 
-    // One-shot decode of a raw buffer through the hyperion engine (x64)
+    // One-shot decode of a raw buffer. X86/X64 go through hyperion's Zydis
+    // core (convert() above). ARM/ARM64 decode with Capstone: text is
+    // "<MNEMONIC> <op_str>", flow comes from the instruction type,
+    // rel_target is the last immediate of a direct branch (b.cond/cbz/tbz
+    // put the target after the tested operands), mnemonic and ops stay empty
+    // because insn_t carries Zydis enums
     static bool decode(uint64_t va, const uint8_t* buf, size_t len,
-                       insn_t& out);
+                       insn_t& out, hype::Arch arch = hype::Arch::X64);
     // Decode `count` instructions starting at va with 1-byte resync on bad
     // bytes (same contract as the old engine-based MCP path)
     static std::vector<insn_t> decode_range(uint64_t va, const uint8_t* buf,

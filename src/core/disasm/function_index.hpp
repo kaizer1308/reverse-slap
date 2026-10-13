@@ -34,6 +34,13 @@ public:
                size_t max_functions = 100'000,
                const std::function<void(float)>& progress = {});
 
+    // No decoding: functions straight from the image's own bounds data
+    // (runtime_funcs, e.g. Mach-O LC_FUNCTION_STARTS) plus entry and exports,
+    // each extending to the next start. For images the x86 engine cannot
+    // decode; the hyperion DB supplies the rest once its analysis completes
+    bool build_from_bounds(const pe_image_t& pe, const std::vector<uint8_t>& file,
+                           uint64_t base, size_t max_functions = 100'000);
+
     const std::vector<function_t>& functions() const noexcept { return fns_; }
     std::optional<uint64_t> containing(uint64_t va) const;   // innermost fn start
     const function_stats_t& stats() const noexcept { return stats_; }

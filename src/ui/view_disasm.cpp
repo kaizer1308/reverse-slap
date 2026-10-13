@@ -1,5 +1,5 @@
 // src/ui/view_disasm.cpp
-// disassembly view, function list and virtualized code view with xref jumps
+// architecture-aware disassembly, function list and virtualized code view with xref jumps
 
 #include <windows.h>
 #include <commdlg.h>
@@ -14,6 +14,7 @@
 
 #include "imgui.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <string>
 
@@ -64,13 +65,13 @@ void Draw() {
         char file[MAX_PATH]{};
         ofn.lStructSize = sizeof(ofn);
         ofn.hwndOwner   = GetActiveWindow();
-        ofn.lpstrFilter = "Executables\0*.exe;*.dll;*.sys\0All files\0*.*\0";
+        ofn.lpstrFilter = "Executables\0*.exe;*.dll;*.sys;*.ipa\0All files\0*.*\0";
         ofn.lpstrFile   = file;
         ofn.nMaxFile    = MAX_PATH;
         ofn.Flags       = OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR;
         if (GetOpenFileNameA(&ofn)) {
             if (!ds::load_file(file))
-                panels::AppendBootLog(std::string("failed to parse: ") + file);
+                panels::AppendBootLog(std::string("failed to load: ") + file + ": " + ds::last_load_error());
         }
     }
     ImGui::SameLine();
@@ -97,11 +98,22 @@ void Draw() {
     }
 
     ImGui::SameLine();
-    ImGui::TextDisabled("%s, %d fns / %d xrefs / %d strings",
-                        b.name.c_str(),
-                        static_cast<int>(b.fns.functions().size()),
-                        static_cast<int>(b.xrefs.total()),
-                        static_cast<int>(b.strings.size()));
+    if (b.is_x86()) {
+        ImGui::TextDisabled("%s, %d fns / %d xrefs / %d strings",
+                            b.name.c_str(),
+                            static_cast<int>(b.fns.functions().size()),
+                            static_cast<int>(b.xrefs.total()),
+                            static_cast<int>(b.strings.size()));
+    } else {
+        ImGui::TextDisabled("%s (%s), %d fns / %d strings",
+                            b.name.c_str(), disasm::image_arch_name(b.arch),
+                            static_cast<int>(b.fns.functions().size()),
+                            static_cast<int>(b.strings.size()));
+        // ARM xrefs live in hyperion, not the legacy x86/x64 index.
+        ImGui::TextDisabled("xref counts in this view are x86/x64-only; use hyperion xrefs for ARM.");
+    }
+    if (b.encrypted)
+        ImGui::TextWrapped("warning: encrypted image; on-disk code is protected and disassembly may be invalid.");
     ImGui::Separator();
 
     const auto& fns = b.fns.functions();
@@ -149,7 +161,7 @@ void Draw() {
     for (const auto& f : fns)
         if (f.va == g_selected_fn) { fn = &f; break; }
 
-    if (!fn || !b.eng.ok()) {
+    if (!fn) {
         ImGui::TextDisabled("select a function.");
     } else {
         const auto off_opt = b.offset_of(fn->va);
@@ -165,9 +177,15 @@ void Draw() {
             uint64_t va = fn->va;
             size_t off = *off_opt;
             const size_t end = std::min(*off_opt + fn->size, b.file.size());
+            const size_t invalid_step = b.is_x86() ? 1 : 4;
             while (off < end && static_cast<int>(rows.size()) < kMaxInsnRows) {
-                auto insn = b.eng.decode(va, b.file.data() + off, end - off);
-                if (!insn) { ++off; ++va; continue; }
+                auto insn = ds::decode_insn(b, va, b.file.data() + off, end - off);
+                if (!insn) {
+                    const size_t step = std::min(invalid_step, end - off);
+                    off += step;
+                    va += step;
+                    continue;
+                }
                 rows.push_back({va, *insn});
                 off += insn->length;
                 va  += insn->length;
@@ -201,8 +219,8 @@ void Draw() {
                         g_selected_va = r.va;
                     ImGui::PopID();
 
-                    // Xref count annotation for branch/data targets
-                    if ((r.insn.has_rel_target || r.insn.has_rip_rel)) {
+                    // The legacy branch/data xref index is populated only for x86/x64.
+                    if (b.is_x86() && (r.insn.has_rel_target || r.insn.has_rip_rel)) {
                         const uint64_t target = r.insn.has_rel_target
                             ? r.insn.rel_target : r.insn.rip_rel_target;
                         const auto& refs = b.xrefs.refs_to(target);
@@ -234,12 +252,16 @@ void Draw() {
                     const uint64_t target = sel->has_rel_target ? sel->rel_target
                                           : sel->has_rip_rel    ? sel->rip_rel_target : 0;
                     if (target) {
-                        const auto& refs = b.xrefs.refs_to(target);
                         char tline[96];
-                        std::snprintf(tline, sizeof(tline),
-                            "target %011llX (%d xrefs)", 
-                            static_cast<unsigned long long>(target),
-                            static_cast<int>(refs.size()));
+                        if (b.is_x86()) {
+                            std::snprintf(tline, sizeof(tline),
+                                "target %011llX (%d xrefs)",
+                                static_cast<unsigned long long>(target),
+                                static_cast<int>(b.xrefs.refs_to(target).size()));
+                        } else {
+                            std::snprintf(tline, sizeof(tline), "target %011llX",
+                                static_cast<unsigned long long>(target));
+                        }
                         if (ImGui::Selectable(tline))
                             g_selected_fn = b.fns.containing(target).value_or(target);
                     }

@@ -5,7 +5,9 @@
 
 #include "core/disasm/hyperion_session.hpp"
 
+#include "core/disasm/capstone_disasm.h"
 #include "core/infra/diag.hpp"
+#include "core/loader/macho_loader.h"
 
 #include <algorithm>
 #include <cctype>
@@ -47,12 +49,63 @@ size_t analysis_insn_budget() {
 namespace {
 
 std::mutex g_decoder_mu;
+std::mutex g_capstone_mu;
 
 std::string upper_mnemonic(const char* s) {
     std::string out(s);
     for (char& c : out)
         c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
     return out;
+}
+
+// Capstone handles carry decode state: one per arch, used under g_capstone_mu
+hype::CapstoneDisasm& capstone_for(hype::Arch arch) {
+    struct handles_t {
+        hype::CapstoneDisasm arm64;
+        hype::CapstoneDisasm arm;
+        handles_t() {
+            arm64.set_arch(hype::Arch::ARM64);
+            arm.set_arch(hype::Arch::ARM);
+        }
+    };
+    static handles_t handles;
+    return arch == hype::Arch::ARM ? handles.arm : handles.arm64;
+}
+
+insn_t convert_arm(const hype::Insn& in) {
+    insn_t out;
+    out.va     = in.addr;
+    out.length = in.len < ZYDIS_MAX_INSTRUCTION_LENGTH ? in.len
+                                                        : ZYDIS_MAX_INSTRUCTION_LENGTH;
+    std::memcpy(out.bytes, in.bytes, out.length);
+    out.text = upper_mnemonic(in.mnemonic);
+    if (in.op_str[0] != '\0') out.text += " ", out.text += in.op_str;
+
+    switch (in.type) {
+    case hype::InsnType::Call: out.flow = flow_t::call; break;
+    case hype::InsnType::Jmp:  out.flow = flow_t::jmp;  break;
+    case hype::InsnType::Jcc:  out.flow = flow_t::jcc;  break;
+    case hype::InsnType::Ret:  out.flow = flow_t::ret;  break;
+    default:                   out.flow = flow_t::none; break;
+    }
+
+    // b/bl/b.cond carry only the target; cbz/cbnz test a register first and
+    // tbz/tbnz a register and a bit number, so the target is the last imm.
+    // Register branches (br/blr/ret) have no immediate at all
+    if (out.flow == flow_t::call || out.flow == flow_t::jmp ||
+        out.flow == flow_t::jcc) {
+        for (uint8_t i = in.op_count; i-- > 0;) {
+            if (in.ops[i].type != hype::OpType::Imm) continue;
+            out.has_rel_target = true;
+            out.rel_target     = in.ops[i].val;
+            break;
+        }
+    }
+    return out;
+}
+
+bool is_arm(hype::Arch arch) {
+    return arch == hype::Arch::ARM || arch == hype::Arch::ARM64;
 }
 
 } // namespace
@@ -134,10 +187,16 @@ insn_t session_t::convert(const hype::Insn& in) {
 }
 
 bool session_t::decode(uint64_t va, const uint8_t* buf, size_t len,
-                       insn_t& out) {
+                       insn_t& out, hype::Arch arch) {
     if (!buf || len == 0) return false;
-    std::lock_guard lk(g_decoder_mu);
     hype::Insn in;
+    if (is_arm(arch)) {
+        std::lock_guard lk(g_capstone_mu);
+        if (!capstone_for(arch).decode(va, buf, len, in)) return false;
+        out = convert_arm(in);
+        return true;
+    }
+    std::lock_guard lk(g_decoder_mu);
     if (!shared_decoder().decode(va, buf, len, in)) return false;
     out = convert(in);
     return true;
@@ -197,10 +256,19 @@ bool session_t::begin(const uint8_t* bytes, size_t len, uint64_t base_override) 
         err_.clear();
     }
 
-    hype::PELoader loader;
-    auto parsed = loader.load_buffer(bytes, len);
+    // thin or FAT Mach-O (an .ipa was already reduced to its executable by
+    // image_open), anything else must be a PE
+    const bool macho = hype::MachOLoader::is_macho(bytes, len);
+    std::optional<hype::PEImage> parsed;
+    if (macho) {
+        hype::MachOLoader loader;
+        parsed = loader.load_buffer(bytes, len);
+    } else {
+        hype::PELoader loader;
+        parsed = loader.load_buffer(bytes, len);
+    }
     if (!parsed) {
-        set_error("hyperion: PE parse failed");
+        set_error(macho ? "hyperion: Mach-O parse failed" : "hyperion: PE parse failed");
         return false;
     }
     img_ = std::move(*parsed);
@@ -213,6 +281,7 @@ bool session_t::begin(const uint8_t* bytes, size_t len, uint64_t base_override) 
         for (auto& seg : img_.segments) seg.va += delta;
         for (auto& imp : img_.imports)   imp.iat_addr += delta;
         for (auto& ex : img_.exports)    ex.addr += delta;
+        for (auto& sym : img_.symbols)   sym.addr += delta;
         for (auto& rf : img_.runtime_funcs) { rf.start += delta; rf.end += delta; }
     }
 

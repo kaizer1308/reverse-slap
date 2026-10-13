@@ -1,6 +1,5 @@
 // app/src/components/panels/WorkspacePanel.tsx
-// The tabbed centre area. Disassembly is ported; the remaining tabs keep their
-// empty states until each view lands
+// The tabbed centre area, shared across PE, Mach-O and live-target views.
 
 import { useEffect, useMemo, useState } from "react";
 import { FolderOpen, Plus, ScanSearch, X } from "lucide-react";
@@ -131,6 +130,10 @@ export default function WorkspacePanel() {
     }
   };
 
+  const warning = image.warning || (image.encrypted === true
+    ? "Encrypted image: on-disk code is protected; disassembly may be invalid."
+    : undefined);
+
   return (
     <div className="panel">
       <div className="tabs">
@@ -141,7 +144,7 @@ export default function WorkspacePanel() {
             data-active={active === t.id}
             onClick={() => setActive(t.id)}
           >
-            {t.label}
+            {t.id === "pe" && image.format === "macho" ? "Mach-O Browser" : t.label}
           </button>
         ))}
         <button className="tab" data-tip="Add view">
@@ -154,6 +157,8 @@ export default function WorkspacePanel() {
             style={{ alignSelf: "center", fontSize: "var(--type-small)", marginRight: 8 }}
           >
             {image.name}
+            {image.format !== undefined ? ` · ${image.format === "macho" ? "Mach-O" : "PE"}` : ""}
+            {image.arch !== undefined ? ` · ${image.arch}` : ""}
             {hype.running ? ` · analyzing ${Math.round(hype.progress * 100)}%` : ""}
           </span>
         )}
@@ -166,6 +171,15 @@ export default function WorkspacePanel() {
           {image.ready ? <X size={14} /> : <FolderOpen size={14} />}
         </button>
       </div>
+      {image.ready && warning !== undefined && (
+        <div
+          className="empty-hint"
+          role="alert"
+          style={{ padding: "var(--pad-sm) var(--pad-md)", color: "var(--warning)" }}
+        >
+          {warning}
+        </div>
+      )}
       <div className="panel-body" style={{ overflow: "hidden" }}>
         {/* Keyed on the active tab so the enter animation replays on every
             switch rather than only on first mount. */}

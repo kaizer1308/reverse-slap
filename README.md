@@ -42,9 +42,10 @@ The strings view with search, UTF-16 flagging and xref counts:
 - **Live process analysis:** processes, modules, threads, regions, handles,
   module dumping, memory scans, watchlists, snapshots, pointer scans, and AOB
   searches.
-- **Static analysis:** PE parsing, x86/x64 assembly and disassembly, function and
-  cross-reference indexes, strings, globals, vtables, RTTI, signatures, binary
-  diffing, packer detection, and security-focused reconnaissance.
+- **Static analysis:** PE, Mach-O and iOS `.ipa` loading, x86/x64 assembly and
+  x86/x64/ARM64 disassembly, function and cross-reference indexes, strings,
+  globals, vtables, RTTI, signatures, binary diffing, packer detection, and
+  security-focused reconnaissance.
 - **Decompiler:** Hyperion p-code lifting, SSA, dead-code elimination, type
   inference, control-flow structuring, and C-like output with source addresses.
 - **Managed .NET support:** ECMA-335 metadata parsing, CIL disassembly, an
@@ -402,9 +403,23 @@ output, inspector, theme/motion settings, and backend selection.
 - Fast synchronous Zydis function, xref, string, and PE indexes.
 - Background Hyperion recursive analysis with CFGs, globals, vtables, RTTI,
   names, PDB/FLIRT support, and progress/cancellation state.
-- x86/x64 disassembly and assembly; Hyperion also contains Capstone decoders and
-  loaders for additional architectures/formats, but the current shared app load
-  path is PE-based.
+- x86/x64 disassembly and assembly.
+- iOS apps and Mach-O: `disasm.load`, `slop.image.load` and both Disassembly
+  open dialogs accept an `.ipa`, a thin Mach-O or a FAT Mach-O, detected by
+  content. For an `.ipa` the main executable is the `Payload/<Name>.app/`
+  entry named by `Info.plist` `CFBundleExecutable` (XML or binary plist,
+  falling back to the bundle stem); a FAT binary is reduced to its arm64 slice
+  (else x86_64, arm, x86). The image gets a section map (`__TEXT.__text`,
+  `__TEXT.__cstring`, ...), imports from the GOT/lazy pointers grouped by
+  dylib, `__stubs` and local symbols as names, and function bounds from
+  `LC_FUNCTION_STARTS`. ARM64 code decodes with Capstone and decompiles
+  through the Hyperion ARM64 lifter; xrefs come from the Hyperion DB.
+  `disasm.loaded` reports `format`, `arch`, `bundle` (id, version, build,
+  minimum iOS) and `encrypted`. App Store copies are FairPlay-encrypted
+  (`cryptid != 0`): load a decrypted dump, or the code is noise. Tools that
+  decode x86 (`xray` except `entropy`/`apihash`, `emulate`, `devirt`,
+  code-rewriting `patch` actions, `disasm.assemble`) or parse PE structures
+  (`analyze.packer`, `re.rtti_scan`) refuse Mach-O/ARM64 images with an error.
 - Structured decompilation pipeline: instruction lifting to p-code, SSA,
   propagation, dead-code elimination, type inference, control-flow structuring,
   and C-like emission.

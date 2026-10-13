@@ -48,7 +48,7 @@ export default function InspectorPanel() {
       </div>
 
       <div className="panel-body">
-        {!target.attached ? (
+        {!target.attached && !image.ready ? (
           <div className="empty">
             <div className="empty-glyph">
               <Search size={28} strokeWidth={1.5} />
@@ -58,14 +58,25 @@ export default function InspectorPanel() {
           </div>
         ) : (
           <div style={{ padding: "var(--pad-sm) 0" }}>
-            <Row k="process" v={target.name ?? "?"} />
-            <Row k="pid" v={String(target.pid ?? 0)} />
-            <Row k="backend" v={backend.badge} />
-            <Row k="modules" v={String(modules.length)} />
+            {target.attached && (
+              <>
+                <Row k="process" v={target.name ?? "?"} />
+                <Row k="pid" v={String(target.pid ?? 0)} />
+                <Row k="backend" v={backend.badge} />
+                <Row k="modules" v={String(modules.length)} />
+              </>
+            )}
             {image.ready && (
               <>
-                <div className="menu-sep" />
+                {target.attached && <div className="menu-sep" />}
                 <Row k="image" v={image.name ?? "?"} />
+                {image.format !== undefined && (
+                  <Row k="format" v={image.format === "macho" ? "Mach-O" : "PE"} />
+                )}
+                {image.arch !== undefined && <Row k="arch" v={image.arch} />}
+                {image.encrypted !== undefined && (
+                  <Row k="encrypted" v={image.encrypted ? "yes" : "no"} />
+                )}
                 <Row k="base" v={image.base !== undefined ? hexAddr(image.base) : "n/a"} />
                 <Row k="functions" v={String(image.functions ?? 0)} />
                 <Row
@@ -78,6 +89,18 @@ export default function InspectorPanel() {
                         : hype.error || "idle"
                   }
                 />
+                {image.bundle !== undefined && (
+                  <>
+                    <div className="menu-sep" />
+                    <Row k="app directory" v={image.bundle.app_dir} />
+                    <Row k="executable" v={image.bundle.executable} />
+                    <Row k="archive path" v={image.bundle.executable_path} />
+                    {image.bundle.bundle_id !== "" && <Row k="bundle id" v={image.bundle.bundle_id} />}
+                    {image.bundle.version !== "" && <Row k="version" v={image.bundle.version} />}
+                    {image.bundle.build !== "" && <Row k="build" v={image.bundle.build} />}
+                    {image.bundle.min_os !== "" && <Row k="min iOS" v={image.bundle.min_os} />}
+                  </>
+                )}
               </>
             )}
           </div>

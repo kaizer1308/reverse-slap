@@ -15,6 +15,7 @@
 
 #include "core/disasm/engine.hpp"
 #include "core/disasm/function_index.hpp"
+#include "core/disasm/image_open.hpp"
 #include "core/disasm/pe_parser.hpp"
 #include "core/disasm/strings.hpp"
 #include "core/disasm/xrefs.hpp"
@@ -38,8 +39,17 @@ struct binary_t {
     // and every rename/comment/bookmark writes that store back, so rehashing
     // a few hundred megabytes per keystroke is not an option
     uint64_t                 file_hash = 0;
-    disasm::pe_image_t       pe;
+    disasm::pe_image_t       pe;      // synthesized section map for Mach-O
     uint64_t                 base   = 0;      // VA base used everywhere
+    // what `file` holds: a PE, or the thin Mach-O slice (also when opened
+    // from a FAT binary or an .ipa)
+    disasm::image_format_t   format    = disasm::image_format_t::pe;
+    disasm::image_arch_t     arch      = disasm::image_arch_t::x64;
+    bool                     encrypted = false;   // FairPlay-encrypted Mach-O code
+    std::optional<disasm::ipa::bundle_t> bundle;  // set when loaded from an .ipa
+    // x86/x64 only: Zydis engine and the decode-built legacy indexes. Other
+    // arches leave eng uninitialized, build fns from the image's bounds data
+    // and leave xrefs empty (the hyperion DB is their xref source)
     disasm::engine_t         eng;
     disasm::function_index_t fns;
     disasm::xref_index_t     xrefs;
@@ -72,13 +82,31 @@ struct binary_t {
 
     // file offset for a va when backed
     std::optional<size_t> offset_of(uint64_t va) const;
+
+    bool is_x86() const noexcept {
+        return arch == disasm::image_arch_t::x86 || arch == disasm::image_arch_t::x64;
+    }
 };
 
 // shared instance, render thread convenience
 binary_t& get();
 
-// load a file, base_override rebases everything so static vas match live ones
+// load a file, base_override rebases everything so static vas match live ones.
+// accepts a PE, a thin or FAT Mach-O, or an .ipa (its main executable),
+// detected by content
 bool load_file(const std::string& path, uint64_t base_override = 0);
+// why the last load_file failed ("" after a successful load), e.g. the .ipa
+// had no main executable or the bytes are no PE/Mach-O
+std::string last_load_error();
+
+// One instruction in the loaded image's architecture: Zydis (b.eng) for
+// x86/x64, Capstone for ARM. Does not take the state mutex
+std::optional<disasm::insn_t> decode_insn(const binary_t& b, uint64_t va,
+                                          const uint8_t* buf, size_t len);
+
+// After byte patches: rebuild fns/xrefs/strings for the image's arch and
+// restart hyperion on the patched bytes. Caller holds state_mutex()
+void rebuild_indexes_locked(binary_t& b);
 
 // load the main module of the attached target
 bool load_from_target();

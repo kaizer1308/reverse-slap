@@ -1,5 +1,5 @@
 // app/src/components/panels/PeView.tsx
-// PE Browser: headers, sections, imports, exports. Port of src/ui/view_pe.cpp
+// Image browser: PE/Mach-O sections, imports and exports. Port of src/ui/view_pe.cpp
 
 import { useEffect, useState } from "react";
 import { hex, useDisasm } from "@/store/disasm";
@@ -17,6 +17,9 @@ export default function PeView() {
   }, [load, image.name]);
 
   const base = pe.image_base ?? image.base ?? 0;
+  const format = image.format ?? pe.format;
+  const arch = image.arch ?? pe.arch;
+  const isPe = format !== "macho";
 
   return (
     <div className="stack">
@@ -35,7 +38,8 @@ export default function PeView() {
         ))}
         <div className="spacer" />
         <span className="faint mono" style={{ fontSize: 11 }}>
-          {pe.pe32plus === true ? "PE32+" : "PE32"} · base {hex(base)} · entry{" "}
+          {isPe ? (pe.pe32plus === true ? "PE32+" : "PE32") : "Mach-O"}
+          {arch !== undefined ? ` · ${arch}` : ""} · base {hex(base)} · entry{" "}
           {hex(base + (pe.entry_rva ?? 0))}
         </span>
       </div>
@@ -46,7 +50,7 @@ export default function PeView() {
             {error}
           </div>
         )}
-        {loading && <div className="empty-hint" style={{ padding: "var(--pad-md)" }}>reading headers…</div>}
+        {loading && <div className="empty-hint" style={{ padding: "var(--pad-md)" }}>reading image metadata…</div>}
 
         {sub === "sections" && (
           <table className="table">
@@ -75,9 +79,11 @@ export default function PeView() {
                   <td>
                     {s.exec && <span className="pill">exec</span>}{" "}
                     {s.writable && <span className="pill">write</span>}{" "}
-                    <span className="faint mono" style={{ fontSize: 11 }}>
-                      0x{s.characteristics.toString(16).toUpperCase()}
-                    </span>
+                    {isPe && (
+                      <span className="faint mono" style={{ fontSize: 11 }}>
+                        0x{s.characteristics.toString(16).toUpperCase()}
+                      </span>
+                    )}
                   </td>
                 </tr>
               ))}
@@ -90,7 +96,7 @@ export default function PeView() {
             {pe.imports.map((d) => (
               <details key={d.dll} className="tree">
                 <summary>
-                  <span className="mono">{d.dll}</span>
+                  <span className="mono">{!isPe && d.dll === "" ? "(self / dynamic lookup)" : d.dll}</span>
                   <span className="faint">{d.functions.length}</span>
                 </summary>
                 {d.functions.map((fn, i) => (
@@ -112,7 +118,7 @@ export default function PeView() {
           <table className="table">
             <thead>
               <tr>
-                <th style={{ width: 70 }}>Ordinal</th>
+                {isPe && <th style={{ width: 70 }}>Ordinal</th>}
                 <th style={{ width: 130 }}>VA</th>
                 <th>Name</th>
               </tr>
@@ -120,7 +126,7 @@ export default function PeView() {
             <tbody>
               {pe.exports.map((e, i) => (
                 <tr key={`${e.name}-${i}`}>
-                  <td className="mono faint">{e.ordinal}</td>
+                  {isPe && <td className="mono faint">{e.ordinal}</td>}
                   <td>
                     <button className="mono link" onClick={() => void gotoAddress(base + e.rva)}>
                       {hex(base + e.rva)}

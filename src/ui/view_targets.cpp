@@ -164,7 +164,8 @@ void Draw() {
                             panels::AppendBootLog("module dump failed: " + result.error);
                         } else if (analyze &&
                                    !slop::core::disasm::binary_state::load_file(path, module.base)) {
-                            panels::AppendBootLog("module dumped but analysis load failed: " + path);
+                            panels::AppendBootLog("module dumped but analysis load failed: " + path + ": " +
+                                slop::core::disasm::binary_state::last_load_error());
                         } else {
                             panels::AppendBootLog("dumped " + module.name + " to " + path);
                         }

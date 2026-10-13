@@ -1,5 +1,5 @@
 // src/ui/view_strings.cpp
-// strings table with filters and xref counts
+// format-neutral strings table with filters and legacy x86/x64 xref counts
 
 #include "ui/views_core.hpp"
 #include "core/disasm/binary_state.hpp"
@@ -39,6 +39,8 @@ void Draw() {
     ImGui::InputTextWithHint("##strfilter", "filter", g_str_filter, sizeof(g_str_filter));
     ImGui::SameLine();
     ImGui::TextDisabled("%d strings", static_cast<int>(b.strings.size()));
+    if (!b.is_x86())
+        ImGui::TextDisabled("xref counts in this view are x86/x64-only; use hyperion xrefs for ARM.");
 
     if (ImGui::BeginTable("strings", 3,
                           ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
@@ -67,11 +69,15 @@ void Draw() {
             ImGui::TableNextColumn();
             ImGui::TextDisabled("%s", s.utf16 ? "utf16" : "ascii");
             ImGui::TableNextColumn();
-            const auto& refs = b.xrefs.refs_to(s.va);
-            const std::string label = refs.empty()
-                ? s.text
-                : s.text + "  (" + std::to_string(refs.size()) + " xrefs)";
-            ImGui::TextUnformatted(label.c_str());
+            if (b.is_x86()) {
+                const auto& refs = b.xrefs.refs_to(s.va);
+                if (!refs.empty()) {
+                    const std::string label = s.text + "  (" + std::to_string(refs.size()) + " xrefs)";
+                    ImGui::TextUnformatted(label.c_str());
+                    continue;
+                }
+            }
+            ImGui::TextUnformatted(s.text.c_str());
         }
         ImGui::EndTable();
     }

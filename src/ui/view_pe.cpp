@@ -1,5 +1,5 @@
 // src/ui/view_pe.cpp
-// pe header browser, sections, directories, imports, exports
+// image browser: shared section/import/export maps, with PE-only header fields gated
 
 #include "ui/views_core.hpp"
 #include "core/disasm/binary_state.hpp"
@@ -12,7 +12,8 @@
 
 namespace slop::ui {
 
-namespace ds = slop::core::disasm::binary_state;
+namespace disasm = slop::core::disasm;
+namespace ds = disasm::binary_state;
 
 namespace pe_view {
 
@@ -29,18 +30,30 @@ void Draw() {
     }
 
     const auto& pe = b.pe;
+    const bool is_pe = b.format == disasm::image_format_t::pe;
 
     // Summary
     if (ImGui::CollapsingHeader("image", ImGuiTreeNodeFlags_DefaultOpen)) {
         char line[160];
-        std::snprintf(line, sizeof(line),
-            "base %012llX  entry-rva %08X  machine %04X  %s  subsystem %u",
-            static_cast<unsigned long long>(pe.image_base),
-            static_cast<unsigned>(pe.entry_rva),
-            static_cast<unsigned>(pe.machine),
-            pe.pe32plus ? "PE32+" : "PE32",
-            static_cast<unsigned>(pe.subsystem));
+        if (is_pe) {
+            std::snprintf(line, sizeof(line),
+                "base %012llX  entry-rva %08X  machine %04X  %s (%s)  subsystem %u",
+                static_cast<unsigned long long>(pe.image_base),
+                static_cast<unsigned>(pe.entry_rva),
+                static_cast<unsigned>(pe.machine),
+                pe.pe32plus ? "PE32+" : "PE32", disasm::image_arch_name(b.arch),
+                static_cast<unsigned>(pe.subsystem));
+        } else {
+            std::snprintf(line, sizeof(line), "Mach-O (%s)  base %012llX  entry %012llX",
+                disasm::image_arch_name(b.arch),
+                static_cast<unsigned long long>(pe.image_base),
+                static_cast<unsigned long long>(pe.image_base + pe.entry_rva));
+        }
         ImGui::TextUnformatted(line);
+        if (!is_pe)
+            ImGui::TextDisabled("PE machine/subsystem fields, data directories and export ordinals do not apply.");
+        if (b.encrypted)
+            ImGui::TextWrapped("warning: encrypted image; on-disk code is protected and disassembly may be invalid.");
     }
 
     // Sections
@@ -49,7 +62,7 @@ void Draw() {
                               ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
                                   ImGuiTableFlags_ScrollY)) {
             ImGui::TableSetupScrollFreeze(0, 1);
-            ImGui::TableSetupColumn("name", ImGuiTableColumnFlags_WidthFixed, 80.0f);
+            ImGui::TableSetupColumn("name", ImGuiTableColumnFlags_WidthFixed, is_pe ? 80.0f : 180.0f);
             ImGui::TableSetupColumn("rva", ImGuiTableColumnFlags_WidthFixed, 100.0f);
             ImGui::TableSetupColumn("vsize", ImGuiTableColumnFlags_WidthFixed, 90.0f);
             ImGui::TableSetupColumn("rawoff", ImGuiTableColumnFlags_WidthFixed, 90.0f);
@@ -74,8 +87,8 @@ void Draw() {
         }
     }
 
-    // Data directories
-    if (ImGui::CollapsingHeader("data directories")) {
+    // Mach-O uses load commands, not PE data directories.
+    if (is_pe && ImGui::CollapsingHeader("data directories")) {
         static constexpr const char* kNames[16] = {
             "export", "import", "resource", "exception", "security", "reloc",
             "debug", "arch", "globalptr", "tls", "loadcfg", "bound-import",
@@ -93,8 +106,9 @@ void Draw() {
     // Imports
     if (ImGui::CollapsingHeader("imports")) {
         for (const auto& dll : pe.imports) {
+            const char* library = !is_pe && dll.dll.empty() ? "(self / dynamic lookup)" : dll.dll.c_str();
             if (!ImGui::TreeNode(dll.dll.c_str(), "%s (%d)",
-                                 dll.dll.c_str(),
+                                 library,
                                  static_cast<int>(dll.functions.size())))
                 continue;
             for (const auto& f : dll.functions) {
@@ -108,15 +122,17 @@ void Draw() {
     // Exports
     if (ImGui::CollapsingHeader("exports")) {
         if (pe.exports.empty()) ImGui::TextDisabled("(none)");
-        else if (ImGui::BeginTable("exps", 3,
+        else if (ImGui::BeginTable("exps", is_pe ? 3 : 2,
                                    ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg)) {
-            ImGui::TableSetupColumn("ordinal", ImGuiTableColumnFlags_WidthFixed, 80.0f);
+            if (is_pe) ImGui::TableSetupColumn("ordinal", ImGuiTableColumnFlags_WidthFixed, 80.0f);
             ImGui::TableSetupColumn("rva", ImGuiTableColumnFlags_WidthFixed, 110.0f);
             ImGui::TableSetupColumn("name");
             ImGui::TableHeadersRow();
             for (const auto& e : pe.exports) {
                 ImGui::TableNextRow();
-                ImGui::TableNextColumn(); ImGui::Text("%u", e.ordinal);
+                if (is_pe) {
+                    ImGui::TableNextColumn(); ImGui::Text("%u", e.ordinal);
+                }
                 ImGui::TableNextColumn(); ImGui::Text("%08X", e.rva);
                 ImGui::TableNextColumn(); ImGui::TextUnformatted(e.name.c_str());
             }

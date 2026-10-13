@@ -1,6 +1,7 @@
 #pragma once
 
-// dependency free pe32+ parser over in memory file images
+// dependency free pe32+ parser over in memory file images. pe_image_t doubles
+// as the format-neutral section map for Mach-O images (see image_open.hpp)
 
 #include <cstdint>
 #include <optional>
@@ -10,7 +11,8 @@
 namespace slop::core::disasm {
 
 struct pe_section_t {
-    char     name[9]     = {};   // NUL-padded
+    // NUL-padded; PE names use 8 chars, Mach-O ones are "<seg>.<sect>"
+    char     name[34]    = {};
     uint32_t rva         = 0;
     uint32_t virtual_size = 0;
     uint32_t raw_offset  = 0;

@@ -27,6 +27,7 @@
 #include "core/analysis/devirt.hpp"
 #include "core/analysis/magicmida.hpp"
 #include "core/disasm/hyperion_session.hpp"
+#include "core/disasm/image_open.hpp"
 #include "core/dotnet/dotnet_decompiler.h"
 #include "core/re/type_catalog.hpp"
 
@@ -73,6 +74,7 @@
 #include "core/runtime/scan_bridge.hpp"
 #include "core/runtime/session.hpp"
 
+#include <capstone/capstone.h>
 #include <algorithm>
 #include <cctype>
 #include <chrono>
@@ -84,6 +86,7 @@
 #include <mutex>
 #include <optional>
 #include <sstream>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -139,6 +142,8 @@ struct image_cache_t {
     std::string                     path;
     std::vector<uint8_t>            file;
     disasm::pe_image_t              pe;
+    disasm::image_format_t          format = disasm::image_format_t::pe;
+    disasm::image_arch_t            arch   = disasm::image_arch_t::x64;
     disasm::function_index_t        fidx;
     disasm::xref_index_t            xidx;
     bool                            fidx_ok = false;
@@ -162,6 +167,28 @@ network::http_proxy_t    g_proxy;
 // helpers
 
 [[noreturn]] void fail(std::string msg) { throw std::runtime_error(std::move(msg)); }
+
+void require_x86_image(disasm::image_arch_t arch, disasm::image_format_t format,
+                       std::string_view action, bool path_image = false) {
+    if (arch == disasm::image_arch_t::x86 || arch == disasm::image_arch_t::x64)
+        return;
+    if (path_image)
+        fail(fmt::format("{} is x86/x64 only for 'path' images; the image is {} ({}); "
+                         "load it with disasm.load to use the hyperion analyzer",
+                         action, disasm::image_arch_name(arch),
+                         disasm::image_format_name(format)));
+    fail(fmt::format("{} supports x86/x64 only; the loaded image is {} ({})",
+                     action, disasm::image_arch_name(arch),
+                     disasm::image_format_name(format)));
+}
+
+void require_pe_image(disasm::image_arch_t arch, disasm::image_format_t format,
+                      std::string_view action, bool path_image = false) {
+    if (format == disasm::image_format_t::pe) return;
+    fail(fmt::format("{} requires a PE image; the {} image is {} ({})",
+                     action, path_image ? "'path'" : "loaded",
+                     disasm::image_arch_name(arch), disasm::image_format_name(format)));
+}
 
 const char* debugger_state_name(debugger::dbg_state_t s) {
     switch (s) {
@@ -761,11 +788,11 @@ const char* hint_for_tool_action(const std::string& tool, const std::string& act
         if (action == "functions") return "Pass a function-start va (see va_hex) to decomp.function, xray.cfg, or disasm.xrefs. total is the full index; returned==limit means truncated, raise limit to 10000.";
         if (action == "xrefs") return "from is the referencing instruction VA (see from_hex). kind call>jump>write>read>offset. Verify callers by disassembling from.";
         if (action == "strings") return "total_scanned is bytes scanned, not hits; truncated=true means limit was hit. Set include_exec=true to also scan code sections.";
-        if (action == "disassemble") return "Live memory wins when attached, else the file image. count is decoded instructions; engine=hyperion uses the same Zydis core as the index.";
+        if (action == "disassemble") return "Live memory wins when attached, else the file image. count is decoded instructions; engine=hyperion uses Zydis for x86/x64 and Capstone for ARM/ARM64.";
         if (action == "pe") return "rva fields are file-relative: VA = image_base + rva (see image_base_hex). exec/writable decode characteristics.";
         if (action == "blocks") return "entry is the function start; succs/preds are block-start VAs (see *_hex). Loops list header/back_edge_src for cycle analysis.";
         if (action == "symbols") return "User renames only; analyzer names live in functions[].name. Rename with symbol_set (empty name clears).";
-        if (action == "load") return "Poll disasm.loaded until hype.ready=true before decomp/xray/re calls.";
+        if (action == "load") return "Loads PE, Mach-O (thin/FAT), or an .ipa main executable. Poll disasm.loaded until hype.ready=true before decomp/DB queries; encrypted images must be decrypted first.";
     } else if (tool == "debugger") {
         if (action == "status") return "state idle|running|paused. Only paused state allows regs/callstack/seh/set_register. hwbp_supported=false means hw breakpoints will refuse.";
         if (action == "bp_set") return "After continue/step actions, call wait_halt(timeout_ms) then regs/callstack. type 0=exec 1=write 3=read_write (see type_str).";
@@ -1106,8 +1133,13 @@ image_cache_t& load_image(const std::string& path) {
     fclose(f);
     if (rd != c.file.size()) fail("short read on image file");
 
-    c.pe = disasm::pe_parse(c.file.data(), c.file.size());
-    if (!c.pe.ok) fail("not a valid PE image");
+    auto opened = disasm::open_image(std::move(c.file));
+    if (!opened.ok) fail(opened.error);
+    if (opened.file.size() > (256u << 20)) fail("analyzed image too large (>256 MiB)");
+    c.file = std::move(opened.file);
+    c.pe = std::move(opened.pe);
+    c.format = opened.format;
+    c.arch = opened.arch;
 
     g_image = std::move(c);
     g_image.path = path;
@@ -1137,6 +1169,22 @@ json loaded_image_json() {
     if (!bin.ready) return out;
     out["name"]          = bin.name;
     out["path"]          = bin.path;
+    out["format"]        = disasm::image_format_name(bin.format);
+    out["arch"]          = disasm::image_arch_name(bin.arch);
+    out["encrypted"]     = bin.encrypted;
+    if (bin.encrypted)
+        out["warning"] = "FairPlay-encrypted executable: decrypt first (for example, "
+                         "use a dumped/decrypted IPA); analysis of encrypted code is noise";
+    if (bin.bundle) {
+        const auto& bundle = *bin.bundle;
+        out["bundle"] = {{"app_dir", bundle.app_dir},
+                         {"executable", bundle.executable},
+                         {"executable_path", bundle.executable_path},
+                         {"bundle_id", bundle.bundle_id},
+                         {"version", bundle.version},
+                         {"build", bundle.build},
+                         {"min_os", bundle.min_os}};
+    }
     out["base"]          = bin.base;
     out["entry_va"]      = bin.base + bin.pe.entry_rva;
     out["size_of_image"] = bin.pe.size_of_image;
@@ -2162,14 +2210,13 @@ json tool_disasm(const json& args) {
                  "xrefs|strings|symbols|symbol_set|blocks|globals|vtables|load|unload|"
                  "analyze_stop)");
     }
-    auto& eng = shared_engine();
-    if (!eng.ok() && !eng.init()) fail("zydis engine init failed");
 
     if (action == "disassemble") {
         const uint64_t addr = parse_addr(args, "addr");
         const size_t count = std::min<size_t>(args.value("count", 32u), 512u);
         std::vector<uint8_t> buf(count * 16 + 16);
         size_t have = 0;
+        hype::Arch arch = hype::Arch::X64;
 
         // live target first, else the loaded file so you can read with nothing attached
         if (auto s = process::active_session(); s && s->valid()) {
@@ -2180,35 +2227,43 @@ json tool_disasm(const json& args) {
             std::lock_guard lk(ds::state_mutex());
             auto& bin = ds::get();
             if (!bin.ready) fail("no target attached and no image loaded in reverse-slop");
+            arch = disasm::hype_arch(bin.arch);
             auto off = bin.pe.va_to_offset(addr);
             if (!off) fail("address not mapped in loaded image (base may differ)");
             have = std::min(buf.size(), bin.file.size() - *off);
             std::memcpy(buf.data(), bin.file.data() + *off, have);
         }
 
-        // hyperion decode is the same zydis core with richer operand records
+        // match the loaded image architecture; live targets keep the x86/x64 path
+        const size_t resync_step = (arch == hype::Arch::X86 || arch == hype::Arch::X64)
+            ? 1 : 4;
         json arr = json::array();
         size_t off = 0;
         size_t resync_skip = 0;
         disasm::insn_t insn;
         for (size_t i = 0; i < count && off + 1 < have; ++i) {
             if (!hs::session_t::decode(addr + off, buf.data() + off,
-                                       have - off, insn)) {
-                ++off;
-                ++resync_skip;
+                                       have - off, insn, arch)) {
+                off += resync_step;
+                resync_skip += resync_step;
                 if (resync_skip >= 64) break;  // too much garbage, bail
                 --i;  // resync bytes arent instructions
                 continue;
             }
             resync_skip = 0;
             arr.push_back(insn_to_json(insn));
-            off += insn.length ? insn.length : 1;
+            off += insn.length ? insn.length : resync_step;
         }
         return {{"instructions", arr}, {"count", arr.size()},
                 {"engine", "hyperion"}};
     }
 
     if (action == "assemble") {
+        {
+            std::lock_guard lk(ds::state_mutex());
+            const auto& bin = ds::get();
+            if (bin.ready) require_x86_image(bin.arch, bin.format, "disasm.assemble");
+        }
         // one or more instructions, separated by ';' or newlines:
         // "xor eax, eax; ret"
         if (!args.contains("text") || !args.at("text").is_string())
@@ -2330,7 +2385,8 @@ json tool_disasm(const json& args) {
         if (!args.contains("path") || !args.at("path").is_string())
             fail("missing path");
         const std::string path = args.at("path").get<std::string>();
-        if (!ds::load_file(path)) fail("failed to load: " + path);
+        if (!ds::load_file(path))
+            fail("failed to load " + path + ": " + ds::last_load_error());
         json out                = loaded_image_json();
         out["ok"]               = true;
         out["hype_wait_hint"]   = "poll disasm.loaded -> hype.ready for the "
@@ -2379,10 +2435,16 @@ json tool_disasm(const json& args) {
     bool*                           xidx_ok = nullptr;
     const std::unordered_map<uint64_t, std::string>* syms = nullptr;
     uint64_t default_base = 0;
+    disasm::image_format_t format = disasm::image_format_t::pe;
+    disasm::image_arch_t arch = disasm::image_arch_t::x64;
     std::string                     img_name, img_path;
 
     if (have_path) {
         auto& img = load_image(args.at("path").get<std::string>());
+        if (action == "functions" || action == "xrefs")
+            require_x86_image(img.arch, img.format, "disasm." + action, true);
+        format = img.format;
+        arch = img.arch;
         pe = &img.pe; file = &img.file; fidx = &img.fidx; xidx = &img.xidx;
         fidx_ok = &img.fidx_ok; xidx_ok = &img.xidx_ok;
         img_path = img.path;
@@ -2397,32 +2459,17 @@ json tool_disasm(const json& args) {
         // patches dirty the indexes so rebuild them lazily
         if (bin.indexes_dirty &&
             (action == "functions" || action == "xrefs" || action == "strings")) {
-            if (!bin.eng.init()) fail("zydis engine init failed");
-            bin.fns.build(bin.pe, bin.file, bin.eng, bin.base);
-            bin.xrefs.build(bin.pe, bin.file, bin.eng, bin.base);
-            bin.strings.clear();
-            for (const auto& sec : bin.pe.sections) {
-                if (sec.is_executable() || sec.raw_size == 0) continue;
-                auto soff = bin.pe.rva_to_offset(sec.rva);
-                if (!soff || static_cast<size_t>(sec.raw_offset) + sec.raw_size > bin.file.size())
-                    continue;
-                auto part = disasm::extract_strings(
-                    bin.file.data() + sec.raw_offset, sec.raw_size,
-                    bin.base + sec.rva, 4, 200'000);
-                bin.strings.insert(bin.strings.end(),
-                                   std::make_move_iterator(part.begin()),
-                                   std::make_move_iterator(part.end()));
-            }
-            bin.indexes_dirty = false;
-
-            // reanalyze the patched bytes in the background
-            if (bin.hype) bin.hype->reanalyze(bin.file);
+            ds::rebuild_indexes_locked(bin);
         }
         pe = &bin.pe; file = &bin.file; fidx = &bin.fns; xidx = &bin.xrefs;
+        format = bin.format;
+        arch = bin.arch;
         syms = &bin.symbols;
         img_name = bin.name; img_path = bin.path;
         default_base = bin.base;   // VA base the whole session was built with
     }
+    const bool is_x86 = arch == disasm::image_arch_t::x86 ||
+                        arch == disasm::image_arch_t::x64;
 
     const uint64_t base = args.contains("base")
         ? parse_addr(args, "base")
@@ -2448,6 +2495,8 @@ json tool_disasm(const json& args) {
         for (const auto& e : pe->exports)
             exps.push_back({{"name", e.name}, {"rva", e.rva}, {"ordinal", e.ordinal}});
         return {{"ok", true}, {"image", img_name}, {"pe32plus", pe->pe32plus},
+                {"format", disasm::image_format_name(format)},
+                {"arch", disasm::image_arch_name(arch)},
                 {"image_base", pe->image_base}, {"entry_rva", pe->entry_rva},
                 {"size_of_image", pe->size_of_image},
                 {"sections", secs}, {"imports", imps}, {"exports", exps}};
@@ -2455,6 +2504,8 @@ json tool_disasm(const json& args) {
 
     if (action == "functions") {
         if (fidx_ok && !*fidx_ok) {
+            auto& eng = shared_engine();
+            if (!eng.ok() && !eng.init()) fail("zydis engine init failed");
             if (!fidx->build(*pe, *file, eng, base)) fail("function index build failed");
             *fidx_ok = true;
         }
@@ -2540,9 +2591,8 @@ json tool_disasm(const json& args) {
                                return bin.hype ? bin.hype->rtti().classes().size() : 0;
                            }()}};
             if (fns.size() == 0 && !hdb->funcs.empty())
-                out["note"] = "recursive-descent index found no functions "
-                              "(stripped/packed headers); rows below with "
-                              "source=hyperion come from the analyzer DB";
+                out["note"] = "function-start index found no functions; rows below "
+                              "with source=hyperion come from the analyzer DB";
         }
         if (arr.size() >= limit &&
             fns.size() + (hdb ? hdb->funcs.size() : 0) > arr.size())
@@ -2553,12 +2603,12 @@ json tool_disasm(const json& args) {
     if (action == "xrefs") {
         const uint64_t addr = parse_addr_alias(args, {"addr", "base", "va", "address"});
         const size_t limit = std::min<size_t>(args.value("limit", 500u), 10000u);
+        auto& eng = shared_engine();
+        if (is_x86 && !eng.ok() && !eng.init()) fail("zydis engine init failed");
 
-        // Union of every source: hyperion DB (code + modeled-data refs),
-        // legacy linear index, and a targeted RIP-relative LEA sweep.
-        // Hyperion only records DataOffset for recognized strings, so plain
-        // LEA-to-data refs can be missing there; the legacy index skips
-        // high-entropy sections, so packed code can be missing there.
+        // hyperion DB is the source on every architecture. For x86/x64, augment
+        // it with the legacy index and a RIP-relative LEA sweep: the DB models
+        // recognized data, and the legacy index skips high-entropy sections.
         std::map<uint64_t, std::pair<int, std::string>> best; // from -> rank, kind
         std::string engines;
         auto note_engine = [&](const char* e) {
@@ -2596,11 +2646,11 @@ json tool_disasm(const json& args) {
             }
         }
 
-        if (xidx_ok && !*xidx_ok) {
+        if (is_x86 && xidx_ok && !*xidx_ok) {
             if (!xidx->build(*pe, *file, eng, base)) fail("xref index build failed");
             *xidx_ok = true;
         }
-        {
+        if (is_x86) {
             bool any = false;
             for (const auto& r : xidx->refs_to(addr)) {
                 any = true;
@@ -2620,7 +2670,7 @@ json tool_disasm(const json& args) {
         // string/data refs both indexes can miss (unrecognized strings,
         // entropy-skipped packed code). Bounded: 32MB scan, stops at limit.
         size_t scan_hits = 0;
-        if (best.size() < limit) {
+        if (is_x86 && best.size() < limit) {
             size_t scanned = 0;
             constexpr size_t kMaxScan = 32u << 20;
             for (const auto& sec : pe->sections) {
@@ -2660,9 +2710,11 @@ json tool_disasm(const json& args) {
                     {"total", best.size()}};
         if (best.size() > arr.size()) out["truncated"] = true;
         if (best.empty())
-            out["note"] = "no refs from hyperion, linear index, or LEA sweep; "
-                          "the address may be unreferenced, in an unscanned "
-                          "region, or reached only indirectly (register)";
+            out["note"] = is_x86
+                ? "no refs from hyperion, linear index, or LEA sweep; the address may "
+                  "be unreferenced, in an unscanned region, or reached only indirectly (register)"
+                : "no refs in the hyperion DB; wait for disasm.loaded hype.ready, or the "
+                  "address may be unreferenced or reached only indirectly (register)";
         return out;
     }
 
@@ -4046,6 +4098,7 @@ json tool_emulate(const json& args, infra::cancel_token_t cancel) {
         std::lock_guard lk(ds::state_mutex());
         auto& bin = ds::get();
         if (!bin.ready) fail("no image loaded in reverse-slop (see disasm.loaded)");
+        require_x86_image(bin.arch, bin.format, "emulate.run");
         const uint64_t addr = parse_addr(args, "file_addr");
         uint64_t len = args.contains("code_len") ? parse_addr(args, "code_len") : 64;
         if (len == 0 || len > (1ull << 20)) fail("bad code_len");
@@ -4238,7 +4291,11 @@ json run_diff_core(const std::string& pa, const std::string& pb,
         std::vector<uint8_t> bytes(static_cast<size_t>(sz));
         f.read(reinterpret_cast<char*>(bytes.data()), sz);
         if (!f) fail("short read on " + path);
-        return bytes;
+        auto opened = disasm::open_image(std::move(bytes));
+        if (!opened.ok) fail("cannot open " + path + ": " + opened.error);
+        if (opened.file.size() > (256u << 20))
+            fail("analyzed image too large for diff (>256 MiB): " + path);
+        return std::move(opened.file);
     };
 
     report("loading", -1.0f);
@@ -4479,6 +4536,10 @@ json tool_analyze(const json& args,
 
     if (args.contains("path") && args.at("path").is_string()) {
         auto& img = load_image(args.at("path").get<std::string>());
+        if (action == "packer") {
+            require_x86_image(img.arch, img.format, "analyze.packer", true);
+            require_pe_image(img.arch, img.format, "analyze.packer", true);
+        }
         pe = &img.pe; file = &img.file;
         const size_t slash = img.path.find_last_of("\\/");
         img_name = (slash == std::string::npos) ? img.path : img.path.substr(slash + 1);
@@ -4488,6 +4549,10 @@ json tool_analyze(const json& args,
         if (!bin.ready)
             fail("no image: pass 'path' or load a binary in reverse-slop "
                  "(see disasm.loaded)");
+        if (action == "packer") {
+            require_x86_image(bin.arch, bin.format, "analyze.packer");
+            require_pe_image(bin.arch, bin.format, "analyze.packer");
+        }
         pe = &bin.pe; file = &bin.file;
         img_name = bin.name;
     }
@@ -4530,7 +4595,7 @@ json tool_analyze(const json& args,
 
     const size_t limit = std::min<size_t>(args.value("limit", 256u), 1000u);
 
-    // flirt style matches from the analyzer, about a hundred msvc crt patterns
+    // raw crypto constants plus analyzer-derived names when available
     if (!args.contains("path")) {
         auto& bin = ds::get();
         if (bin.ready && bin.hype && bin.hype->ready()) {
@@ -5761,6 +5826,7 @@ void dotnet_wait_ready() {
             std::lock_guard lk(ds::state_mutex());
             auto& bin0 = ds::get();
             if (!bin0.ready) fail("no image loaded in reverse-slop (see disasm.loaded)");
+            if (bin0.format != disasm::image_format_t::pe) return;
             if (!bin0.hype)  fail("hyperion engine unavailable for this image");
             if (bin0.hype->ready()) break;
             const std::string herr = bin0.hype->error();
@@ -5808,6 +5874,12 @@ json tool_dotnet(const json& args) {
     std::lock_guard lk(ds::state_mutex());
     auto& bin = ds::get();
     if (!bin.ready) fail("no image loaded in reverse-slop (see disasm.loaded)");
+    if (bin.format != disasm::image_format_t::pe) {
+        if (action == "status")
+            return {{"managed", false},
+                    {"note", "the loaded Mach-O image is not a managed (.NET/CLI) PE assembly"}};
+        require_pe_image(bin.arch, bin.format, "dotnet." + action);
+    }
     if (!bin.hype)  fail("hyperion engine unavailable for this image");
 
     if (!bin.hype->is_dotnet()) {
@@ -6098,13 +6170,15 @@ json tool_decomp(const json& args) {
             for (uint8_t i = 0; i < in.op_count; ++i) {
                 const auto& op = in.ops[i];
                 if (op.type != hype::OpType::Mem) continue;
-                const auto base = static_cast<ZydisRegister>(op.mem.base);
-                if (base != ZYDIS_REGISTER_RSP && base != ZYDIS_REGISTER_RBP)
-                    continue;
+                const bool x86_stack = bin.is_x86() &&
+                    (op.mem.base == ZYDIS_REGISTER_RSP || op.mem.base == ZYDIS_REGISTER_RBP);
+                const bool arm64_stack = bin.arch == disasm::image_arch_t::arm64 &&
+                    (op.mem.base == ARM64_REG_SP || op.mem.base == ARM64_REG_X29);
+                if (!x86_stack && !arm64_stack) continue;
                 const auto it = vars.find(op.mem.disp);
                 if (it == vars.end()) {
-                    const bool arg = (base == ZYDIS_REGISTER_RSP &&
-                                      op.mem.disp > 0);
+                    const bool arg = x86_stack && op.mem.base == ZYDIS_REGISTER_RSP &&
+                                     op.mem.disp > 0;
                     vars.emplace(op.mem.disp, var_rec{
                         op.mem.disp,
                         (arg ? "arg_" : "var_") +
@@ -6329,35 +6403,50 @@ json tool_re(const json& args) {
     disasm::xref_index_t*       xidx = nullptr;
     uint64_t                    session_base = 0;   // VA base of the source
     const hype::AnalysisDB*     hdb  = nullptr;     // hyperion DB when analyzed
+    disasm::image_format_t format = disasm::image_format_t::pe;
+    disasm::image_arch_t arch = disasm::image_arch_t::x64;
+    const bool have_path = args.contains("path") && args.at("path").is_string();
 
-    if (args.contains("path") && args.at("path").is_string()) {
+    if (have_path) {
         auto& img = load_image(args.at("path").get<std::string>());
+        format = img.format;
+        arch = img.arch;
+        if (action == "danger")
+            require_x86_image(arch, format, "re.danger", true);
         pe = &img.pe; file = &img.file; fidx = &img.fidx; xidx = &img.xidx;
         session_base = pe->image_base;
-        // build the indexes lazily for explicit paths
-        if (action == "danger" || action == "libsig") {
-            auto& eng = shared_engine();
-            if (!eng.ok() && !eng.init()) fail("zydis engine init failed");
-            if (!img.fidx_ok) {
+        // signature matching needs bounds, not decoding; import callsites
+        // need the legacy x86 xref index when there is no hyperion session
+        if (action == "libsig" && !img.fidx_ok) {
+            if (arch == disasm::image_arch_t::x86 || arch == disasm::image_arch_t::x64) {
+                auto& eng = shared_engine();
+                if (!eng.ok() && !eng.init()) fail("zydis engine init failed");
                 if (!fidx->build(*pe, *file, eng, session_base))
                     fail("function index build failed");
-                img.fidx_ok = true;
+            } else if (!fidx->build_from_bounds(*pe, *file, session_base)) {
+                fail("function bounds index build failed");
             }
-            if (!img.xidx_ok) {
-                if (!xidx->build(*pe, *file, eng, session_base))
-                    fail("xref index build failed");
-                img.xidx_ok = true;
-            }
+            img.fidx_ok = true;
+        }
+        if (action == "danger" && !img.xidx_ok) {
+            auto& eng = shared_engine();
+            if (!eng.ok() && !eng.init()) fail("zydis engine init failed");
+            if (!xidx->build(*pe, *file, eng, session_base))
+                fail("xref index build failed");
+            img.xidx_ok = true;
         }
     } else {
         shared_lock.emplace();
         auto& bin = ds::get();
         if (!bin.ready)
             fail("no image: pass 'path' or load a binary in reverse-slop");
+        format = bin.format;
+        arch = bin.arch;
+        if (bin.indexes_dirty && (action == "danger" || action == "libsig"))
+            ds::rebuild_indexes_locked(bin);
         pe = &bin.pe; file = &bin.file; fidx = &bin.fns; xidx = &bin.xrefs;
         session_base = bin.base;
         if (bin.hype && bin.hype->ready()) hdb = &bin.hype->db();
-        // legacy indexes go stale after patches until rebuilt, hyperion is fine
     }
     const uint64_t base = args.contains("base")
         ? parse_addr(args, "base")
@@ -6365,6 +6454,8 @@ json tool_re(const json& args) {
     (void)base;
 
     if (action == "rtti_scan") {
+        require_x86_image(arch, format, "re.rtti_scan", have_path);
+        require_pe_image(arch, format, "re.rtti_scan", have_path);
         // Case-insensitive substring filter over mangled + demangled names,
         // plus limit/total so 600-class dumps stop truncating the session.
         const std::string filter = args.value("filter", std::string{});
@@ -6469,6 +6560,9 @@ json tool_re(const json& args) {
                 {"count", arr.size()}};
     }
     if (action == "danger") {
+        if (arch != disasm::image_arch_t::x86 && arch != disasm::image_arch_t::x64 && !hdb)
+            fail("re.danger requires completed hyperion analysis for this image; "
+                 "wait for disasm.loaded hype.ready");
         // hyperion knows the iat refs, the legacy index covers explicit paths
         auto hits = analysis::danger_scan(
             *pe,
@@ -6525,6 +6619,8 @@ json tool_re(const json& args) {
 
 json tool_xray(const json& args) {
     const std::string action = require_action(args);
+    const bool needs_x86 = action != "entropy" && action != "apihash";
+    const bool needs_pe = action == "syscalls" || action == "anti_analysis";
 
     // explicit path or the app loaded binary
     std::optional<ds::binary_lock_t> shared_lock;
@@ -6536,26 +6632,28 @@ json tool_xray(const json& args) {
 
     if (args.contains("path") && args.at("path").is_string()) {
         auto& cache = load_image(args.at("path").get<std::string>());
+        if (needs_x86) require_x86_image(cache.arch, cache.format, "xray." + action, true);
+        if (needs_pe) require_pe_image(cache.arch, cache.format, "xray." + action, true);
         pe = &cache.pe; file = &cache.file;
         default_base = cache.pe.image_base;
         const size_t slash = cache.path.find_last_of("\\/");
         img_name = (slash == std::string::npos) ? cache.path : cache.path.substr(slash + 1);
-        // path images get a function index too since the per function analyses need bounds
-        static disasm::function_index_t path_fns;   // guarded by g_tool_mu
-        static std::string             path_fns_for;
-        if (path_fns_for != cache.path) {
+        // reuse the path cache; byte-only queries never build an x86 index
+        if (needs_x86 && !cache.fidx_ok) {
             auto& eng = shared_engine();
             if (!eng.ok() && !eng.init()) fail("zydis engine init failed");
-            if (!path_fns.build(cache.pe, cache.file, eng, default_base))
+            if (!cache.fidx.build(cache.pe, cache.file, eng, default_base))
                 fail("function index build failed");
-            path_fns_for = cache.path;
+            cache.fidx_ok = true;
         }
-        img.fns = &path_fns;
+        img.fns = &cache.fidx;
     } else {
         shared_lock.emplace();
         auto& bin = ds::get();
         if (!bin.ready)
             fail("no image: pass 'path' or load a binary in reverse-slop");
+        if (needs_x86) require_x86_image(bin.arch, bin.format, "xray." + action);
+        if (needs_pe) require_pe_image(bin.arch, bin.format, "xray." + action);
         pe = &bin.pe; file = &bin.file;
         default_base = bin.base;
         img_name = bin.name;
@@ -6563,9 +6661,11 @@ json tool_xray(const json& args) {
     }
     img.pe = pe; img.file = file; img.base = default_base;
 
-    auto& engine = shared_engine();
-    if (!engine.ok() && !engine.init()) fail("zydis engine init failed");
-    img.eng = &engine;
+    if (needs_x86) {
+        auto& engine = shared_engine();
+        if (!engine.ok() && !engine.init()) fail("zydis engine init failed");
+        img.eng = &engine;
+    }
 
     const uint64_t base = args.contains("base")
         ? parse_addr(args, "base") : default_base;
@@ -6930,6 +7030,12 @@ json tool_patch(const json& args) {
 
     ds::binary_lock_t lk;
     auto& bin = ds::get();
+    if (action == "nop_junk" || action == "resolve_opaque" ||
+        action == "patch_antidebug" || action == "decode_strings" ||
+        action == "full_pass" || action == "rebuild")
+        require_x86_image(bin.arch, bin.format, "patch." + action);
+    if (action == "patch_antidebug" || action == "full_pass")
+        require_pe_image(bin.arch, bin.format, "patch." + action);
 
     imgpatch::op_result_t r;
 
@@ -6955,12 +7061,15 @@ json tool_patch(const json& args) {
                                        args.value("dry_run", false));
         if (defaulted_addr) r.note = "no addr given: scanned entry-point function";
     } else if (action == "unpack_xor") {
+        const std::string method = args.value("method", std::string{"auto"});
+        if (method == "auto")
+            require_x86_image(bin.arch, bin.format, "patch.unpack_xor (method=auto)");
         const uint64_t va = parse_addr(args, "addr");
         size_t size = args.contains("size")
             ? static_cast<size_t>(parse_addr(args, "size"))
             : 4096;
         r = imgpatch::unpack_xor(bin, va, size,
-                                 args.value("method", std::string{"auto"}),
+                                 method,
                                  args.value("key_hex", std::string{}));
     } else if (action == "decode_strings") {
         r = imgpatch::decode_strings(bin, parse_addr(args, "addr"));
@@ -7387,6 +7496,7 @@ json tool_devirt(const json& args) {
 
     if (args.contains("path") && args.at("path").is_string()) {
         auto& cache = load_image(args.at("path").get<std::string>());
+        require_x86_image(cache.arch, cache.format, "devirt." + action, true);
         img.pe = &cache.pe; img.file = &cache.file;
         img.base = cache.pe.image_base;
         const size_t slash = cache.path.find_last_of("\\/");
@@ -7396,6 +7506,7 @@ json tool_devirt(const json& args) {
         auto& bin = ds::get();
         if (!bin.ready)
             fail("no image: pass 'path' or load a binary in reverse-slop");
+        require_x86_image(bin.arch, bin.format, "devirt." + action);
         img.pe = &bin.pe; img.file = &bin.file;
         img.base = bin.base;
         img_name = bin.name;
@@ -8301,7 +8412,7 @@ void list_tools(json& out) {
                    {"description", "Read, search, compare, and modify memory in the process attached by target. Most actions require target.status attached=true; the active user/kernel backend is chosen automatically. Core actions: read/write bytes, protect/alloc/free pages, AOB pattern search, pointer scan, signature generation, and live crypto-constant search. CE-style scan creates per-PID scan state; follow it with rescan, inspect it with scan_state, and release it with scan_reset. snapshot returns an id; compare two ids with diff using a and b, list with snapshots, and release with snapshot_free. Scan filters cover numeric width/comparison/rounding, region type and protection, address bounds, alignment/tail, workers, chunks, and result caps. Kernel mode uses slopdrvr DTB reads and driver region enumeration."},
                    {"inputSchema", json::parse(memory_schema)}, {"read_only", false}});
     out.push_back({{"name", "disasm"},
-                   {"description", "Primary static-analysis and instruction tool for the shared binary session. Call action='loaded' first: image.ready means a PE is loaded; image.hype.ready means background Hyperion analysis is complete; image.hype.progress/error explain pending or failed analysis. Use load(path) and unload to manage the same session as the UI, and analyze_stop to cancel analysis. pe/functions/xrefs/strings/symbols use the shared image or an explicit path; blocks/globals/vtables require hype.ready. disassemble reads attached-process memory first and otherwise the loaded file image. assemble converts x86/x64 text to bytes. symbol_set renames a VA persistently (empty name clears) and updates the UI. Strings paginate with limit and omit executable sections unless include_exec=true. Runtime-base loads make static and live VAs directly comparable."},
+                   {"description", "Primary static-analysis and instruction tool for the shared binary session. Call action='loaded' first: image.ready means a PE, Mach-O (thin/FAT), or .ipa executable is loaded; image.format/arch describe its code, and encrypted/warning identify FairPlay-encrypted code that must be decrypted before analysis. image.hype.ready means background Hyperion analysis is complete; image.hype.progress/error explain pending or failed analysis. Use load(path) for PE, Mach-O (thin/FAT), or .ipa and unload to manage the same session as the UI, and analyze_stop to cancel analysis. pe/strings support the shared image or an explicit path; functions/xrefs with path support x86/x64 only, so load ARM images first. symbols use the shared image; blocks/globals/vtables require hype.ready. disassemble reads attached-process memory first and otherwise decodes the loaded file's architecture. assemble converts x86/x64 text to bytes. symbol_set renames a VA persistently (empty name clears) and updates the UI. Strings paginate with limit and omit executable sections unless include_exec=true. Runtime-base loads make static and live VAs directly comparable."},
                    {"inputSchema", json::parse(disasm_schema)}, {"read_only", false}});
     out.push_back({{"name", "debugger"},
                    {"description", "Control a live debugging session. Call status first; attach(pid) starts kernel-stealth VEH debugging when slopdrvr is available, otherwise the classic Win32 debug loop. Set software or hardware breakpoints with bp_set(addr, hw); optional condition, log, auto_continue, and one_shot fields create conditional stops or tracepoints. After continue or a step action, use wait_halt(timeout_ms), then inspect regs, events, callstack, or seh; set_register mutates paused state. watchpoint_set/clear/list manage page-guard access watches, and trace_run records a bounded instruction trace. suspend_all/resume_all freeze or thaw target threads. Hardware DR0-DR3 breakpoints and handle-free thread control require the driver."},
@@ -8313,10 +8424,10 @@ void list_tools(json& out) {
                    {"description", "Kernel-assisted DLL injection over slopdrvr. Every touch on the target rides IOCTLs (kernel-side NtAllocateVirtualMemory via KeStackAttachProcess, DTB physical writes, thread-hijack execution with a spoofed return address), so the user-mode side never opens the target, never calls VirtualAllocEx/WriteProcessMemory, and never spawns a remote thread — none of the ObRegisterCallbacks / PsSetCreateThreadNotifyRoutine hooks a kernel anticheat subscribes to fire from us. Two modes: action='loadlibrary' resolves kernel32!LoadLibraryW in the target and hijacks a resident thread to call it (still fires PsSetLoadImageNotifyRoutine because it goes through LdrLoadDll — the callstack from the AC's view is a clean legitimate thread). action='manual_map' maps the DLL by hand — headers, sections, relocs, imports resolved against the target's already-loaded modules (LoadLibrary'ing missing deps recursively), TLS callbacks, then DllMain(DLL_PROCESS_ATTACH) — no LDR entry, no LoadImageNotify, and by default the PE header is zeroed and each section re-protected with its true RWX chars so scan-based ac won't spot a fresh RWX region with an MZ. dll_path OR dll_hex; dll_path is a host filesystem path (bytes read locally). find_module and resolve_export are helpers that walk the target's PEB LDR through the driver. unload frees a loadlibrary DLL via FreeLibrary or, for a manual-mapped base, calls DllMain(DETACH) then kernel-frees. Requires slopdrvr active; check inject.status first. Options: erase_pe_header (default true), protect_sections (default true), call_dllmain (default true), call_tls_callbacks (default true), unlink_peb (loadlibrary only, default false — unlinks from all three LDR lists so toolhelp snapshots and hidden-module walks miss it), timeout_ms (per-hijack call budget)."},
                    {"inputSchema", json::parse(inject_schema)}, {"read_only", false}});
     out.push_back({{"name", "xray"},
-                   {"description", "Run focused read-only static-analysis queries on the shared image or an explicit path. For cfg, complexity, cff, obfuscation, strings_recon, indirect_calls, and anti_analysis, pass addr as a function-start VA; known functions use indexed bounds and unknown addresses fall back to linear decode. Whole-image actions detect hooks, direct syscalls and SSNs, imported-API hashes, entropy windows, page classes, crypto constants, and ROP gadgets. apihash only searches imports of this image, including bare API and 'DLL!API' forms; it is not a global hash dictionary. Use disasm.loaded/functions first to establish image state and valid function VAs."},
+                   {"description", "Run focused read-only static-analysis queries on the shared image or an explicit PE, Mach-O, or .ipa path. entropy and apihash are architecture-neutral; all other actions require x86/x64, and Windows syscalls/anti_analysis require PE. For cfg, complexity, cff, obfuscation, strings_recon, indirect_calls, and anti_analysis, pass addr as a function-start VA; known functions use indexed bounds and unknown addresses fall back to linear decode. Whole-image actions detect hooks, direct syscalls and SSNs, imported-API hashes, entropy windows, page classes, crypto constants (including instruction immediates), and ROP gadgets. For raw crypto constants on ARM use analyze.signatures. apihash only searches imports of this image, including bare API and 'DLL!API' forms; it is not a global hash dictionary. Use disasm.loaded/functions first to establish image state and valid function VAs."},
                    {"inputSchema", json::parse(xray_schema)}, {"read_only", true}});
     out.push_back({{"name", "patch"},
-                    {"description", "Mutate the currently loaded file-image analysis session; this does not patch live target memory. Use journal to inspect recorded edits and revert_all to undo them. write_bytes performs an explicit VA/hex edit. nop_junk, resolve_opaque, patch_antidebug, unpack_xor, and decode_strings are per-function operations taking a function-start addr (patch_antidebug without addr scans the entry-point function); dry_run previews opaque-predicate changes. full_pass orchestrates multiple passes and reports before/after scores. rebuild(addr) re-decodes a patched function and invalidates affected indexes so later disasm/decomp results reflect changes. Requires disasm.loaded image.ready=true; use memory.write for live-process bytes."},
+                    {"description", "Mutate the currently loaded file-image analysis session; this does not patch live target memory. Use journal to inspect recorded edits and revert_all to undo them. write_bytes performs an explicit VA/hex edit on any architecture, as does unpack_xor with an explicit xor_single/xor_multi/xor_rolling key. Automatic XOR-key detection and code-rewriting/rebuild actions require x86/x64; patch_antidebug and full_pass also require PE. nop_junk, resolve_opaque, patch_antidebug, and decode_strings take a function-start addr (patch_antidebug without addr scans the entry-point function); dry_run previews opaque-predicate changes. full_pass orchestrates multiple passes and reports before/after scores. rebuild(addr) re-decodes a patched x86 function. Patched indexes and Hyperion refresh on the next disasm.functions/xrefs/strings query on any architecture. Requires disasm.loaded image.ready=true; use memory.write for live-process bytes."},
                    {"inputSchema", json::parse(patch_schema)}, {"read_only", false}});
     out.push_back({{"name", "devirt"},
                     {"description", "Deobfuscation, VM recovery, and Themida unpacking. Themida actions supervise the separate Magicmida debugger engine: call themida_status to discover x86/x64 sidecars, themida_start(path,output_path,timeout_ms,overwrite,load) to launch a cancellable job, then poll themida_job(id) or stop it with themida_cancel(id). Successful output is architecture-validated and can load into the shared analysis session. Static VM chain (each step needs the previous): identify(addr) reports likely_vm plus handler_table when found; handlers(table|addr) classifies the table; trace/lift/pseudocode(addr + handler_table|handlers) follow the bytecode -- trace/lift/pseudocode on a non-VM function fail with guidance, they never synthesize handlers. handlers also accepts addr= as a table alias. recover_cfg, prove_predicates, invariants, and iat_audit inspect the shared image without mutation."},

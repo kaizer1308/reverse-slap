@@ -163,6 +163,10 @@ void unload_locked() {
     g_bin.file_hash = 0;
     g_bin.pe = {};
     g_bin.base = 0;
+    g_bin.format = disasm::image_format_t::pe;
+    g_bin.arch = disasm::image_arch_t::x64;
+    g_bin.encrypted = false;
+    g_bin.bundle.reset();
     g_bin.name.clear();
     g_bin.path.clear();
     g_bin.fns = {};
@@ -176,6 +180,26 @@ void unload_locked() {
     g_bin.indexes_dirty = false;
     g_bin.ready = false;
 }
+
+// strings from the data sections, exec sections are skipped
+std::vector<disasm::string_hit_t> collect_strings(const disasm::pe_image_t& pe,
+                                                  const std::vector<uint8_t>& file,
+                                                  uint64_t base) {
+    std::vector<disasm::string_hit_t> hits;
+    for (const auto& s : pe.sections) {
+        if (s.is_executable() || s.raw_size == 0) continue;
+        if (static_cast<size_t>(s.raw_offset) + s.raw_size > file.size()) continue;
+        auto part = disasm::extract_strings(
+            file.data() + s.raw_offset, s.raw_size,
+            base + s.rva, 4, 200'000);
+        hits.insert(hits.end(),
+                    std::make_move_iterator(part.begin()),
+                    std::make_move_iterator(part.end()));
+    }
+    return hits;
+}
+
+std::string g_load_error;   // guarded by g_mu
 
 } // namespace
 
@@ -198,27 +222,42 @@ void unload() {
 
 namespace {
 
-// load_file body, caller holds g_mu
+// load_file body, caller holds g_mu. Failures leave the reason in g_load_error
 bool load_locked(const std::string& path, uint64_t base_override) {
     unload_locked();
+    g_load_error.clear();
+    const auto fail = [&](std::string why) {
+        unload_locked();
+        g_load_error = std::move(why);
+        return false;
+    };
 
     std::ifstream f(path, std::ios::binary);
-    if (!f) return false;
+    if (!f) return fail("cannot open file");
     // one sized read, not a byte-at-a-time streambuf iterator pair: on a few
     // hundred megabytes the iterator form costs seconds on its own
     f.seekg(0, std::ios::end);
     const std::streamoff size = f.tellg();
-    if (size < 1024) { unload_locked(); return false; }
+    if (size < 1024) return fail("file too small to be an image");
     f.seekg(0, std::ios::beg);
-    g_bin.file.resize(static_cast<size_t>(size));
-    f.read(reinterpret_cast<char*>(g_bin.file.data()), size);
-    if (!f) { unload_locked(); return false; }
-    g_bin.file.resize(static_cast<size_t>(f.gcount()));
-    if (g_bin.file.size() < 1024) { unload_locked(); return false; }
-    g_bin.file_hash = fnv1a(g_bin.file.data(), g_bin.file.size());
+    std::vector<uint8_t> raw(static_cast<size_t>(size));
+    f.read(reinterpret_cast<char*>(raw.data()), size);
+    if (!f) return fail("short read");
+    raw.resize(static_cast<size_t>(f.gcount()));
 
-    g_bin.pe = disasm::pe_parse(g_bin.file.data(), g_bin.file.size());
-    if (!g_bin.pe.ok || !g_bin.eng.init(g_bin.pe.pe32plus)) { unload_locked(); return false; }
+    // a PE stays as is; an .ipa or FAT Mach-O comes back as one thin Mach-O
+    // slice with a synthesized section map
+    auto opened = disasm::open_image(std::move(raw));
+    if (!opened.ok) return fail(std::move(opened.error));
+    g_bin.file      = std::move(opened.file);
+    g_bin.pe        = std::move(opened.pe);
+    g_bin.format    = opened.format;
+    g_bin.arch      = opened.arch;
+    g_bin.encrypted = opened.encrypted;
+    g_bin.bundle    = std::move(opened.bundle);
+    g_bin.file_hash = fnv1a(g_bin.file.data(), g_bin.file.size());
+    const bool x86  = g_bin.is_x86();
+    if (x86 && !g_bin.eng.init(g_bin.pe.pe32plus)) return fail("zydis engine init failed");
 
     // runtime base override so session vas match what the live process maps
     g_bin.base = base_override ? base_override : g_bin.pe.image_base;
@@ -226,6 +265,12 @@ bool load_locked(const std::string& path, uint64_t base_override) {
 
     const size_t slash = path.find_last_of("\\/");
     g_bin.name = (slash == std::string::npos) ? path : path.substr(slash + 1);
+    if (g_bin.bundle) g_bin.name += "!" + g_bin.bundle->executable;
+    if (g_bin.encrypted)
+        slop::core::infra::diag::warn(
+            "disasm", g_bin.name + " is FairPlay-encrypted (LC_ENCRYPTION_INFO "
+                      "cryptid != 0): code and pseudocode are noise until it is "
+                      "decrypted, load a decrypted dump instead");
 
     // stage timings: a slow open should name the index that is slow
     using clock_t_ = std::chrono::steady_clock;
@@ -272,33 +317,33 @@ bool load_locked(const std::string& path, uint64_t base_override) {
         auto fns_fut = std::async(std::launch::async, [&]() {
             const auto start = clock_t_::now();
             fns_result_t r;
-            disasm::engine_t eng;
-            r.ok = eng.init(pe.pe32plus) && r.index.build(pe, file, eng, base);
+            if (x86) {
+                disasm::engine_t eng;
+                r.ok = eng.init(pe.pe32plus) && r.index.build(pe, file, eng, base);
+            } else {
+                r.ok = r.index.build_from_bounds(pe, file, base);
+            }
             r.ms = std::chrono::duration<double, std::milli>(clock_t_::now() - start).count();
             return r;
         });
+        // the decode-built xref index is x86 only; other arches get theirs
+        // from the hyperion DB
         auto xrefs_fut = std::async(std::launch::async, [&]() {
             const auto start = clock_t_::now();
             xrefs_result_t r;
-            disasm::engine_t eng;
-            r.ok = eng.init(pe.pe32plus) && r.index.build(pe, file, eng, base);
+            if (x86) {
+                disasm::engine_t eng;
+                r.ok = eng.init(pe.pe32plus) && r.index.build(pe, file, eng, base);
+            } else {
+                r.ok = true;
+            }
             r.ms = std::chrono::duration<double, std::milli>(clock_t_::now() - start).count();
             return r;
         });
         auto strings_fut = std::async(std::launch::async, [&]() {
             const auto start = clock_t_::now();
             strings_result_t r;
-            // strings from the data sections, exec sections are skipped
-            for (const auto& s : pe.sections) {
-                if (s.is_executable() || s.raw_size == 0) continue;
-                if (static_cast<size_t>(s.raw_offset) + s.raw_size > file.size()) continue;
-                auto part = disasm::extract_strings(
-                    file.data() + s.raw_offset, s.raw_size,
-                    base + s.rva, 4, 200'000);
-                r.hits.insert(r.hits.end(),
-                              std::make_move_iterator(part.begin()),
-                              std::make_move_iterator(part.end()));
-            }
+            r.hits = collect_strings(pe, file, base);
             r.ms = std::chrono::duration<double, std::milli>(clock_t_::now() - start).count();
             return r;
         });
@@ -307,13 +352,11 @@ bool load_locked(const std::string& path, uint64_t base_override) {
         strings_res = strings_fut.get();
     } catch (...) {
         g_bin.hype.reset();
-        unload_locked();
-        return false;
+        return fail("index build threw");
     }
     if (!fns_res.ok || !xrefs_res.ok) {
         g_bin.hype.reset();
-        unload_locked();
-        return false;
+        return fail("index build failed");
     }
     g_bin.fns = std::move(fns_res.index);
     g_bin.xrefs = std::move(xrefs_res.index);
@@ -335,7 +378,9 @@ bool load_locked(const std::string& path, uint64_t base_override) {
     std::snprintf(timing, sizeof(timing),
                   " (functions %.0f ms, xrefs %.0f ms, strings %.0f ms)",
                   fns_ms, xrefs_ms, strings_ms);
-    slop::core::infra::diag::info("disasm", "loaded " + g_bin.name + ", " +
+    slop::core::infra::diag::info("disasm", "loaded " + g_bin.name + " (" +
+        disasm::image_format_name(g_bin.format) + ", " +
+        disasm::image_arch_name(g_bin.arch) + "), " +
         std::to_string(g_bin.fns.functions().size()) + " functions, " +
         std::to_string(g_bin.xrefs.total()) + " xrefs, " +
         std::to_string(g_bin.strings.size()) + " strings" + timing);
@@ -352,20 +397,66 @@ bool load_file(const std::string& path, uint64_t base_override) {
     // cheap check outside the lock before we tear down the current session
     {
         std::ifstream probe(path, std::ios::binary);
-        if (!probe) return false;
+        if (!probe) {
+            std::lock_guard lk(g_mu);
+            g_load_error = "cannot open file";
+            return false;
+        }
         probe.seekg(0, std::ios::end);
-        if (probe.tellg() < 1024) return false;
+        if (probe.tellg() < 1024) {
+            std::lock_guard lk(g_mu);
+            g_load_error = "file too small to be an image";
+            return false;
+        }
     }
 
     std::lock_guard lk(g_mu);
     try {
-        return load_locked(path, base_override);
+        const bool ok = load_locked(path, base_override);
+        if (!ok)
+            slop::core::infra::diag::warn("disasm", "cannot load " + path + ": " + g_load_error);
+        return ok;
     } catch (...) {
         // bad_alloc on an image bigger than the machine can hold: fail the
         // load instead of throwing across the lua, mcp and ui callers
         unload_locked();
+        g_load_error = "out of memory";
         return false;
     }
+}
+
+std::string last_load_error() {
+    std::lock_guard lk(g_mu);
+    return g_load_error;
+}
+
+std::optional<disasm::insn_t> decode_insn(const binary_t& b, uint64_t va,
+                                          const uint8_t* buf, size_t len) {
+    if (b.is_x86()) {
+        if (!b.eng.ok()) return std::nullopt;
+        return b.eng.decode(va, buf, len);
+    }
+    disasm::insn_t out;
+    if (!hyperion_session::session_t::decode(va, buf, len, out, disasm::hype_arch(b.arch)))
+        return std::nullopt;
+    return out;
+}
+
+void rebuild_indexes_locked(binary_t& b) {
+    if (b.is_x86()) {
+        if (b.eng.ok() || b.eng.init(b.pe.pe32plus)) {
+            b.fns.build(b.pe, b.file, b.eng, b.base);
+            b.xrefs.build(b.pe, b.file, b.eng, b.base);
+        }
+    } else {
+        b.fns.build_from_bounds(b.pe, b.file, b.base);
+        b.xrefs = {};
+    }
+    b.strings = collect_strings(b.pe, b.file, b.base);
+    b.indexes_dirty = false;
+
+    // reanalyze the patched bytes in the background
+    if (b.hype) b.hype->reanalyze(b.file);
 }
 
 bool load_from_target() {

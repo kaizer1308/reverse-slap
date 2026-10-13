@@ -52,4 +52,11 @@ struct Export {
     std::string forwarder;
 };
 
+// A named address that is neither an export nor an import slot: Mach-O
+// local symtab entries and __stubs entries named after the import they bind
+struct Symbol {
+    std::string name;
+    va_t        addr = 0;
+};
+
 }

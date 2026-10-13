@@ -73,7 +73,7 @@ void RegisterBuiltins() {
     add("pseudocode",    "Pseudocode",    "Workspace", "Ctrl+0", pseudocode_view::Draw);
     add("memory",        "Memory",        "Workspace", "Ctrl+4", memory_view::Draw);
     add("strings",       "Strings",       "Workspace", "Ctrl+7", strings_view::Draw);
-    add("pe_browser",    "PE Browser",    "Workspace", "Ctrl+8", pe_view::Draw);
+    add("pe_browser",    "Image Browser", "Workspace", "Ctrl+8", pe_view::Draw);
     add("scanner",       "Scanner",       "Workspace", "Ctrl+6", scanner_view::Draw);
     add("debugger",      "Debugger",      "Workspace", "Ctrl+9", debugger_view::Draw);
     add("unpacker",      "Unpacker",      "Workspace", "",       unpacker_view::Draw, false);

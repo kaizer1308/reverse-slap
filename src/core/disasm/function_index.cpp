@@ -247,6 +247,54 @@ bool function_index_t::build(const pe_image_t& pe, const std::vector<uint8_t>& f
     return true;
 }
 
+bool function_index_t::build_from_bounds(const pe_image_t& pe,
+                                         const std::vector<uint8_t>& file,
+                                         uint64_t base, size_t max_functions) {
+    fns_.clear();
+    stats_ = {};
+    if (!pe.ok) return false;
+
+    const auto ranges = exec_ranges(pe, base, file);
+
+    // start -> exclusive end, 0 when only the next start bounds it
+    std::unordered_map<uint64_t, uint64_t> known_end;
+    const auto add = [&](uint64_t start, uint64_t end) {
+        if (!range_for_va(ranges, start)) return;
+        auto [it, fresh] = known_end.try_emplace(start, end);
+        if (!fresh && end > it->second) it->second = end;
+    };
+    for (const auto& rf : pe.runtime_funcs)
+        if (rf.end_rva > rf.begin_rva) add(base + rf.begin_rva, base + rf.end_rva);
+    add(base + pe.entry_rva, 0);
+    for (const auto& e : pe.exports)
+        if (e.rva && !e.forwarded) add(base + e.rva, 0);
+    stats_.seeds = known_end.size();
+
+    std::vector<uint64_t> starts;
+    starts.reserve(known_end.size());
+    for (const auto& [start, end] : known_end) starts.push_back(start);
+    std::sort(starts.begin(), starts.end());
+    if (starts.size() > max_functions) {
+        starts.resize(max_functions);
+        stats_.truncated = true;
+    }
+
+    fns_.reserve(starts.size());
+    for (size_t i = 0; i < starts.size(); ++i) {
+        const uint64_t start = starts[i];
+        const exec_range_t* rng = range_for_va(ranges, start);
+        uint64_t end = rng->va + rng->len;
+        if (i + 1 < starts.size()) end = std::min(end, starts[i + 1]);
+        const uint64_t recorded = known_end[start];
+        if (recorded > start) end = std::min(end, recorded);
+        fns_.push_back({start, static_cast<size_t>(std::max<uint64_t>(end - start, 1))});
+    }
+
+    slop::core::infra::diag::info("fnindex", "indexed " + std::to_string(fns_.size()) +
+              " functions from image bounds data");
+    return true;
+}
+
 std::optional<uint64_t> function_index_t::containing(uint64_t va) const {
     // Binary search: greatest start <= va
     auto it = std::upper_bound(fns_.begin(), fns_.end(), va,
