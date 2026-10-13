@@ -306,8 +306,7 @@ run_result_t emulate_run(const run_request_t& req) {
     uc_hook h_code = 0, h_read = 0, h_write = 0, h_bad = 0;
     uc_hook_add(uc.handle(), &h_code, UC_HOOK_CODE,
                 reinterpret_cast<void*>(hook_code), &ctx, 1, 0);
-    // Read hooks force unicorn's slow path on every load; only taint uses them
-    if (ctx.taint_on)
+    if (ctx.taint_on)   // the read hook only feeds taint; skip the per-access callback otherwise
         uc_hook_add(uc.handle(), &h_read, UC_HOOK_MEM_READ,
                     reinterpret_cast<void*>(hook_mem_read), &ctx, 1, 0);
     uc_hook_add(uc.handle(), &h_write, UC_HOOK_MEM_WRITE,
@@ -326,8 +325,7 @@ run_result_t emulate_run(const run_request_t& req) {
     const uc_err err = uc_emu_start(uc.handle(), entry_va, until,
                                     static_cast<uint64_t>(timeout_ms) * 1000ull,
                                     count);
-    // unicorn returns UC_ERR_OK on timeout; its own timer flag is the only
-    // reliable signal (wall-clock guesses misfire on loaded hosts)
+    // unicorn returns OK on timeout; its timer thread records whether it fired
     size_t timed_out = 0;
     uc_query(uc.handle(), UC_QUERY_TIMEOUT, &timed_out);
 
@@ -346,9 +344,9 @@ run_result_t emulate_run(const run_request_t& req) {
     res.total_writes = ctx.total_writes;
     res.fault  = ctx.fault;
 
-    if (ctx.return_hit)          res.stopped_reason = "return";
+    if (ctx.cancelled)           res.stopped_reason = "cancelled";
+    else if (ctx.return_hit)     res.stopped_reason = "return";
     else if (ctx.until_hit)      res.stopped_reason = "until";
-    else if (ctx.cancelled)      res.stopped_reason = "cancelled";
     else if (ctx.fault)          res.stopped_reason = std::string("invalid_mem_") + ctx.fault->access;
     else if (timed_out)          res.stopped_reason = "timeout";
     else if (err == UC_ERR_OK || err == UC_ERR_FETCH_UNMAPPED ||
