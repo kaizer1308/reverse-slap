@@ -874,6 +874,76 @@ TEST_CASE(mcp_emulate_rejects_bad_input) {
     REQUIRE(is_error);                       // unknown action
 }
 
+TEST_CASE(mcp_emulate_file_addr_runs_past_the_slice_on_rebased_image) {
+    // Entry stub is sub rsp / call __security_init_cookie / add rsp / jmp:
+    // the old 64-byte window died on the first far branch. Rebased, the
+    // file_addr lookup has to use the session base and the pages need base
+    // relocations, so the run must match one at the preferred ImageBase
+    namespace ds = slop::core::disasm::binary_state;
+    server_fixture_t fx;
+    auto run_entry = [&](uint64_t base_override, const json& extra) {
+        REQUIRE(ds::load_file(SLOP_TARGET_EXE_PATH, base_override));
+        uint64_t base = 0, entry = 0, preferred = 0, size = 0;
+        {
+            std::lock_guard lk(ds::state_mutex());
+            base      = ds::get().base;
+            entry     = base + ds::get().pe.entry_rva;
+            preferred = ds::get().pe.image_base;
+            size      = ds::get().pe.size_of_image;
+        }
+        json args = {{"action", "run"}, {"file_addr", entry}, {"count", 20000},
+                     {"dump", json::array({json{{"addr", base}, {"len", 2}}})}};
+        args.update(extra);
+        bool is_error = true;
+        json payload = fx.call("emulate", args, is_error);
+        ds::unload();
+        REQUIRE(!is_error);
+        // an un-relocated pointer would send the run into the ImageBase copy
+        if (base != preferred && payload.contains("fault")) {
+            const uint64_t at = payload.at("fault").value("addr", 0ull);
+            REQUIRE(at < preferred || at >= preferred + size);
+        }
+        return std::make_pair(base, payload);
+    };
+
+    constexpr uint64_t kBase = 0x7FF612340000ull;
+    const auto [base, rebased] = run_entry(kBase, json::object());
+    REQUIRE_EQ(base, kBase);
+    REQUIRE_GT(rebased.value("instructions", 0u), 50u);
+    REQUIRE_GT(rebased.value("paged_in", 0u), 0u);
+    REQUIRE_GT(rebased.value("total_api_calls", 0u), 0u);
+    const auto& calls = rebased.at("api_calls");
+    REQUIRE(!calls.empty());
+    REQUIRE(calls.at(0).value("name", "").find('!') != std::string::npos);
+    REQUIRE_GE(calls.at(0).value("ip", 0ull), kBase);
+    REQUIRE(rebased.at("regs").contains("gs_base"));
+    // the headers page comes back through the image source
+    REQUIRE_STR_EQ(rebased.at("memory").at(0).value("hex", "").c_str(), "4d5a");
+
+    const auto [pref_base, preferred] = run_entry(0, json::object());
+    REQUIRE(pref_base != kBase);
+    REQUIRE_EQ(preferred.value("instructions", 0u), rebased.value("instructions", 1u));
+    REQUIRE_EQ(preferred.value("total_api_calls", 0u), rebased.value("total_api_calls", 1u));
+    REQUIRE_STR_EQ(preferred.value("stopped_reason", "").c_str(),
+                   rebased.value("stopped_reason", "?").c_str());
+
+    // per-import returns, unmatched keys reported back
+    const auto [b2, tuned] = run_entry(kBase, {{"api_returns",
+        {{"InitializeCriticalSectionAndSpinCount", 1}, {"nope.dll!Missing", -1}}}});
+    REQUIRE_EQ(tuned.at("api_returns_unmatched").size(), 1u);
+    REQUIRE_STR_EQ(tuned.at("api_returns_unmatched").at(0).get<std::string>().c_str(),
+                   "nope.dll!missing");
+    // with critical-section init succeeding the CRT goes on past its failure path
+    REQUIRE_GT(tuned.value("total_api_calls", 0u), rebased.value("total_api_calls", 0u));
+
+    // page_in=false keeps the old slice-only behavior
+    const auto [b3, slice] = run_entry(kBase, {{"code_len", 16}, {"page_in", false},
+                                               {"stub_imports", false}});
+    REQUIRE(!slice.contains("paged_in"));
+    REQUIRE(!slice.contains("api_calls"));
+    REQUIRE(slice.contains("fault"));
+}
+
 TEST_CASE(mcp_emulate_runs_unlocked_and_honors_cancel) {
     using clock = std::chrono::steady_clock;
     auto ms_since = [](clock::time_point t) {

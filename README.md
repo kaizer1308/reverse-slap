@@ -517,6 +517,11 @@ Embedded Frida Core supports:
 
 - Isolated x86-64 Unicorn execution from explicit bytes, loaded-file addresses,
   or attached-target addresses.
+- Demand paging from the loaded image (relocated when rebased) or the attached
+  process, so runs follow calls, jumps and global loads past the code slice.
+- IAT stubs that log every import call with its arguments and return a chosen
+  value per import, plus a TEB/PEB behind `gs`.
+- Final-memory dumps and a write log with stored values.
 - Custom register, stack, and memory-map initialization.
 - Instruction-count, target-address, and timeout stopping conditions.
 - Bounded instruction traces and byte-granular taint tracking.

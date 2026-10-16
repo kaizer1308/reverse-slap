@@ -12,6 +12,8 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <cstring>
+#include <map>
 #include <thread>
 #include <vector>
 
@@ -243,3 +245,180 @@ TEST_CASE(emu_cancel_token_stops_running_loop) {
     REQUIRE_LT(elapsed, 5000);
 }
 
+
+namespace {
+
+// Page source over a sparse fake image: page va -> bytes (zero padded)
+page_source_t fake_pages(std::map<uint64_t, std::vector<uint8_t>> pages) {
+    return [pages = std::move(pages)](uint64_t page, uint8_t* out) {
+        auto it = pages.find(page);
+        if (it == pages.end()) return false;
+        std::memset(out, 0, kPageSize);
+        std::memcpy(out, it->second.data(), std::min(it->second.size(), kPageSize));
+        return true;
+    };
+}
+
+} // namespace
+
+TEST_CASE(emu_page_in_follows_call_outside_slice) {
+    // call 0x401000 / ret ; the callee page is only in the source
+    auto req = base_req({0xE8, 0xFB, 0x0F, 0x00, 0x00,
+                         0xC3});
+    req.page_in = fake_pages({{0x401000, {0xB8, 0x34, 0x12, 0x00, 0x00,   // mov eax,0x1234
+                                          0xC3}}});                       // ret
+    auto r = emulate_run(req);
+    REQUIRE(r.ok);
+    REQUIRE_STR_EQ(r.stopped_reason.c_str(), "return");
+    REQUIRE_EQ(r.regs["rax"], 0x1234u);
+    REQUIRE_EQ(r.paged_in, 1u);
+    REQUIRE(!r.fault.has_value());
+}
+
+TEST_CASE(emu_page_in_completes_partial_code_page) {
+    // a 2-byte slice runs on into the source's bytes, not zero fill
+    auto req = base_req({0x90, 0x90});
+    req.page_in = fake_pages({{0x400000, {0x90, 0x90,
+                                          0xB8, 0x07, 0x00, 0x00, 0x00,   // mov eax,7
+                                          0xC3}}});
+    auto r = emulate_run(req);
+    REQUIRE(r.ok);
+    REQUIRE_STR_EQ(r.stopped_reason.c_str(), "return");
+    REQUIRE_EQ(r.regs["rax"], 7u);
+    REQUIRE_EQ(r.paged_in, 0u);   // completion is not demand paging
+}
+
+TEST_CASE(emu_page_in_refusal_and_budget_still_fault) {
+    // mov eax,[0xDEAD0000] / ret, the source has no such page
+    auto req = base_req({0xA1, 0x00, 0x00, 0xAD, 0xDE, 0x00, 0x00, 0x00, 0x00,
+                         0xC3});
+    req.page_in = fake_pages({});
+    auto r = emulate_run(req);
+    REQUIRE(r.ok);
+    REQUIRE_STR_EQ(r.stopped_reason.c_str(), "invalid_mem_read");
+    REQUIRE(!r.page_in_exhausted);
+
+    // the page exists but the budget is spent
+    req.page_in = fake_pages({{0xDEAD0000, {0x11}}});
+    req.page_in_max = 0;
+    r = emulate_run(req);
+    REQUIRE_STR_EQ(r.stopped_reason.c_str(), "invalid_mem_read");
+    REQUIRE(r.page_in_exhausted);
+
+    req.page_in_max = 1;
+    r = emulate_run(req);
+    REQUIRE_STR_EQ(r.stopped_reason.c_str(), "return");
+    REQUIRE_EQ(r.regs["rax"], 0x11u);
+}
+
+namespace {
+
+// mov ecx,0x11 / call [rip+0x1FF5] (IAT slot 0x402000) / add rax,1 / ret
+run_request_t import_call_req() {
+    auto req = base_req({0xB9, 0x11, 0x00, 0x00, 0x00,
+                         0xFF, 0x15, 0xF5, 0x1F, 0x00, 0x00,
+                         0x48, 0x83, 0xC0, 0x01,
+                         0xC3});
+    req.imports.push_back({0x402000, "kernel32.dll!Sleep"});
+    req.api_ret = 41;
+    req.trace = true;
+    return req;
+}
+
+void require_one_sleep_call(const run_result_t& r) {
+    REQUIRE(r.ok);
+    REQUIRE_STR_EQ(r.stopped_reason.c_str(), "return");
+    REQUIRE_EQ(r.regs.at("rax"), 42u);
+    REQUIRE_EQ(r.total_api_calls, 1u);
+    REQUIRE_EQ(r.api_calls.size(), 1u);
+    REQUIRE_STR_EQ(r.api_calls[0].name.c_str(), "kernel32.dll!Sleep");
+    REQUIRE_EQ(r.api_calls[0].ip, 0x400005ull);
+    REQUIRE_EQ(r.api_calls[0].ret, 0x40000Bull);
+    REQUIRE_EQ(r.api_calls[0].args[0], 0x11ull);
+    bool traced = false;
+    for (const auto& t : r.trace)
+        if (t.text == "api kernel32.dll!Sleep") traced = true;
+    REQUIRE(traced);
+}
+
+} // namespace
+
+TEST_CASE(emu_import_stub_in_mapped_iat) {
+    auto req = import_call_req();
+    emu_mem_region_t iat;
+    iat.addr = 0x402000;
+    iat.bytes.assign(8, 0);
+    req.maps.push_back(iat);
+    require_one_sleep_call(emulate_run(req));
+}
+
+TEST_CASE(emu_import_stub_patched_on_page_in) {
+    // the IAT page holds the on-disk hint/name rva until the stub patch lands
+    auto req = import_call_req();
+    req.page_in = fake_pages({{0x402000, {0x34, 0x12, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}}});
+    auto r = emulate_run(req);
+    require_one_sleep_call(r);
+    REQUIRE_EQ(r.paged_in, 1u);
+}
+
+TEST_CASE(emu_teb_peb_behind_gs) {
+    // mov rax,gs:[0x30] / mov rcx,gs:[0x60] / mov rdx,[rcx+0x10] /
+    // movzx r8d,byte [rcx+2] / ret
+    auto req = base_req({0x65, 0x48, 0x8B, 0x04, 0x25, 0x30, 0x00, 0x00, 0x00,
+                         0x65, 0x48, 0x8B, 0x0C, 0x25, 0x60, 0x00, 0x00, 0x00,
+                         0x48, 0x8B, 0x51, 0x10,
+                         0x44, 0x0F, 0xB6, 0x41, 0x02,
+                         0xC3});
+    req.image_base = 0x140000000;
+    req.regs["r8"] = 0xFF;
+    auto r = emulate_run(req);
+    REQUIRE(r.ok);
+    REQUIRE_STR_EQ(r.stopped_reason.c_str(), "return");
+    REQUIRE(r.teb_mapped);
+    REQUIRE_EQ(r.regs["rax"], r.regs["gs_base"]);
+    REQUIRE_EQ(r.regs["rcx"], r.regs["gs_base"] + 0x2000);
+    REQUIRE_EQ(r.regs["rdx"], 0x140000000ull);
+    REQUIRE_EQ(r.regs["r8"], 0u);             // BeingDebugged
+
+    // a caller gs_base replaces the fake TEB
+    req.regs["gs_base"] = 0x500000;
+    emu_mem_region_t teb;
+    teb.addr = 0x500000;
+    teb.bytes.assign(0x100, 0);
+    teb.bytes[0x30] = 0x77;
+    req.maps.push_back(teb);
+    req.code.resize(9);                       // just the first load
+    req.code.push_back(0xC3);
+    r = emulate_run(req);
+    REQUIRE(!r.teb_mapped);
+    REQUIRE_EQ(r.regs["rax"], 0x77u);
+}
+
+TEST_CASE(emu_dump_and_write_values) {
+    // mov dword [0x500000],0xDEADBEEF / ret
+    auto req = base_req({0xC7, 0x04, 0x25, 0x00, 0x00, 0x50, 0x00,
+                         0xEF, 0xBE, 0xAD, 0xDE,
+                         0xC3});
+    emu_mem_region_t data;
+    data.addr = 0x500000;
+    data.bytes.assign(0x10, 0);
+    req.maps.push_back(data);
+    // untouched source page, an unmapped range, and one straddling the end
+    req.page_in = fake_pages({{0x600000, {0xAA, 0xBB}}});
+    req.dumps = {{0x500000, 8}, {0x600000, 2}, {0x900000, 4}, {0x500FFE, 4}};
+    auto r = emulate_run(req);
+    REQUIRE(r.ok);
+    REQUIRE_STR_EQ(r.stopped_reason.c_str(), "return");
+
+    REQUIRE_EQ(r.writes.size(), 1u);
+    REQUIRE_EQ(r.writes[0].len, 4u);
+    REQUIRE_EQ(r.writes[0].value, 0xDEADBEEFull);
+
+    REQUIRE_EQ(r.memory.size(), 4u);
+    const std::vector<uint8_t> want = {0xEF, 0xBE, 0xAD, 0xDE, 0, 0, 0, 0};
+    REQUIRE(r.memory[0].bytes == want);
+    REQUIRE(r.memory[1].bytes == std::vector<uint8_t>({0xAA, 0xBB}));
+    REQUIRE(r.memory[2].bytes.empty());
+    REQUIRE_EQ(r.memory[3].bytes.size(), 2u);   // cut at the unmapped page
+    REQUIRE_EQ(r.paged_in, 0u);                 // dumps never map pages
+}

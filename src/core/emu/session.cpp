@@ -21,7 +21,14 @@ namespace slop::core::emu {
 
 namespace {
 
+constexpr uint64_t kPageMask   = kPageSize - 1;
 constexpr uint64_t kReturnPage = 0x00110000;   // sentinel RET trampoline
+constexpr uint64_t kStubBase   = 0x00120000;   // one RET per import slot
+constexpr uint64_t kStubStride = 8;
+constexpr uint64_t kTebBase    = kStubBase + kMaxImports * kStubStride;
+constexpr uint64_t kTebSize    = 0x2000;       // x64 TEB is 0x1838 bytes
+constexpr uint64_t kPebBase    = kTebBase + kTebSize;
+constexpr size_t   kMaxApiCalls = 1024;
 
 struct reg_alias_t { const char* name; int uc_reg; };
 
@@ -33,6 +40,7 @@ constexpr reg_alias_t kRegAliases[] = {
     {"r11", UC_X86_REG_R11}, {"r12", UC_X86_REG_R12}, {"r13", UC_X86_REG_R13},
     {"r14", UC_X86_REG_R14}, {"r15", UC_X86_REG_R15},
     {"rip", UC_X86_REG_RIP}, {"rflags", UC_X86_REG_EFLAGS},
+    {"fs_base", UC_X86_REG_FS_BASE}, {"gs_base", UC_X86_REG_GS_BASE},
 };
 
 bool lookup_reg(const std::string& name, int* out) {
@@ -87,7 +95,98 @@ struct run_ctx_t {
     uint64_t cur_ip        = 0;
     std::string cur_text;
     uint64_t last_event_ip = 0;
+
+    std::map<uint64_t, uint64_t> slot_stubs;   // IAT slot va -> stub va
+    uint64_t stub_end = kStubBase;             // kStubBase: no stubs
+    std::vector<run_result_t::api_call_t> api_calls;
+    size_t total_api_calls = 0;
+
+    size_t paged_in          = 0;
+    bool   page_in_exhausted = false;
+    std::vector<uint8_t> page_buf = std::vector<uint8_t>(kPageSize);
 };
+
+// The source is caller code running under a C callback, nothing may unwind
+// through unicorn
+bool fetch_page(const run_request_t& req, uint64_t page, uint8_t* out) noexcept {
+    if (!req.page_in) return false;
+    try {
+        return req.page_in(page, out);
+    } catch (...) {
+        return false;
+    }
+}
+
+// Point every IAT slot in [lo, hi) at its stub. Unmapped slots fail quietly
+// and get patched when their page comes in
+void patch_slots(uc_engine* uc, const run_ctx_t& c, uint64_t lo, uint64_t hi) {
+    for (auto it = c.slot_stubs.lower_bound(lo);
+         it != c.slot_stubs.end() && it->first < hi; ++it)
+        uc_mem_write(uc, it->first, &it->second, sizeof(it->second));
+}
+
+// Map every page an unmapped access touches from the page source. False
+// leaves the access faulting
+bool page_in_range(uc_engine* uc, run_ctx_t* c, uint64_t address, int size) {
+    if (!c->req->page_in) return false;
+    const uint64_t first = address & ~kPageMask;
+    uint64_t last = (address + static_cast<uint64_t>(size > 1 ? size - 1 : 0)) & ~kPageMask;
+    if (last < first) last = first;   // wrapped at the top of the address space
+    for (uint64_t page = first;; page += kPageSize) {
+        // a straddling access can fault with one of its pages already mapped
+        uint8_t probe = 0;
+        if (uc_mem_read(uc, page, &probe, 1) != UC_ERR_OK) {
+            if (c->paged_in >= c->req->page_in_max) {
+                c->page_in_exhausted = true;
+                return false;
+            }
+            if (!fetch_page(*c->req, page, c->page_buf.data())) return false;
+            if (uc_mem_map(uc, page, kPageSize, UC_PROT_ALL) != UC_ERR_OK ||
+                uc_mem_write(uc, page, c->page_buf.data(), kPageSize) != UC_ERR_OK)
+                return false;
+            patch_slots(uc, *c, page, page + kPageSize);
+            ++c->paged_in;
+        }
+        if (page == last) return true;
+    }
+}
+
+// A call through a stubbed IAT slot landed here: log it, set the return
+// value, and let the stub's RET go back to the caller
+void on_import(uc_engine* uc, run_ctx_t* c, uint64_t address) {
+    const size_t idx = static_cast<size_t>((address - kStubBase) / kStubStride);
+    const import_slot_t& slot = c->req->imports[idx];
+    const std::string& name = slot.name;
+
+    ++c->total_api_calls;
+    if (c->api_calls.size() < kMaxApiCalls) {
+        run_result_t::api_call_t call;
+        call.ip   = c->cur_ip;   // still the instruction that got us here
+        call.name = name;
+        uint64_t rsp = 0;
+        uc_reg_read(uc, UC_X86_REG_RSP, &rsp);
+        uc_mem_read(uc, rsp, &call.ret, sizeof(call.ret));
+        static constexpr int kArgRegs[4] = {UC_X86_REG_RCX, UC_X86_REG_RDX,
+                                            UC_X86_REG_R8,  UC_X86_REG_R9};
+        for (int i = 0; i < 4; ++i) uc_reg_read(uc, kArgRegs[i], &call.args[i]);
+        c->api_calls.push_back(std::move(call));
+    }
+
+    uint64_t rax = slot.has_ret ? slot.ret : c->req->api_ret;
+    uc_reg_write(uc, UC_X86_REG_RAX, &rax);
+
+    ++c->instructions;
+    c->cur_ip = address;
+    c->cur_text = "api " + name;
+    if (c->req->trace && c->trace.size() < c->req->trace_max)
+        c->trace.push_back({address, c->cur_text});
+    if (c->taint_on) {
+        // rax is a constant now, and an empty analyze keeps the previous
+        // instruction's dests from being applied a second time
+        c->taint.set_reg(ZYDIS_REGISTER_RAX, false);
+        c->taint.analyze(address, c->cur_text, {});
+    }
+}
 
 void hook_code(uc_engine* uc, uint64_t address, uint32_t size, void* user_data) {
     auto* c = static_cast<run_ctx_t*>(user_data);
@@ -110,6 +209,10 @@ void hook_code(uc_engine* uc, uint64_t address, uint32_t size, void* user_data) 
     if (address >= kReturnPage && address < kReturnPage + 0x1000) {
         c->return_hit = true;
         uc_emu_stop(uc);
+        return;
+    }
+    if (address >= kStubBase && address < c->stub_end) {
+        on_import(uc, c, address);
         return;
     }
 
@@ -189,13 +292,18 @@ void hook_mem_read(uc_engine*, uc_mem_type, uint64_t address, int size,
 }
 
 bool hook_mem_write(uc_engine*, uc_mem_type, uint64_t address, int size,
-                    int64_t, void* user_data) {
+                    int64_t value, void* user_data) {
     auto* c = static_cast<run_ctx_t*>(user_data);
     const bool tainted =
         c->taint_on && c->taint.note_mem_write(address, static_cast<size_t>(size));
     ++c->total_writes;
-    if (c->writes.size() < 2048)
-        c->writes.push_back({c->cur_ip, address, static_cast<size_t>(size)});
+    if (c->writes.size() < 2048) {
+        uint64_t stored = 0;
+        if (size == 8)                stored = static_cast<uint64_t>(value);
+        else if (size > 0 && size < 8) stored = static_cast<uint64_t>(value) &
+                                                ((1ull << (size * 8)) - 1);
+        c->writes.push_back({c->cur_ip, address, static_cast<size_t>(size), stored});
+    }
     if (tainted) {
         // Propagate: the stored bytes themselves become taint carriers
         c->taint.mark_memory(address, static_cast<size_t>(size));
@@ -212,8 +320,13 @@ bool hook_mem_write(uc_engine*, uc_mem_type, uint64_t address, int size,
 
 bool hook_mem_invalid(uc_engine* uc, uc_mem_type access, uint64_t address,
                       int size, int64_t value, void* user_data) {
-    (void)size; (void)value;
+    (void)value;
     auto* c = static_cast<run_ctx_t*>(user_data);
+    // unicorn 2 retries the access when the hook maps the page and returns true
+    const bool unmapped = access == UC_MEM_READ_UNMAPPED ||
+                          access == UC_MEM_WRITE_UNMAPPED ||
+                          access == UC_MEM_FETCH_UNMAPPED;
+    if (unmapped && page_in_range(uc, c, address, size)) return true;
     if (!c->fault) {   // keep the first fault
         const char* what = access == UC_MEM_FETCH_UNMAPPED ? "fetch"
                          : access == UC_MEM_WRITE_UNMAPPED ? "write"
@@ -226,17 +339,80 @@ bool hook_mem_invalid(uc_engine* uc, uc_mem_type access, uint64_t address,
     return false;
 }
 
+// Zeroed TEB + PEB with the fields code reads first: gs:[0x30] self,
+// gs:[0x60] PEB, stack bounds, client ids, PEB.ImageBaseAddress. Everything
+// else reads 0, so PEB.BeingDebugged / NtGlobalFlag checks see a clean process
+bool map_teb(unicorn_t& uc, const run_request_t& req) {
+    if (!uc.map(kTebBase, kTebSize + kPageSize)) return false;
+    std::vector<uint8_t> blk(kTebSize + kPageSize, 0);
+    auto put = [&blk](size_t off, uint64_t v) { std::memcpy(blk.data() + off, &v, sizeof(v)); };
+    put(0x08, req.stack_base + req.stack_size);   // NtTib.StackBase
+    put(0x10, req.stack_base);                    // NtTib.StackLimit
+    put(0x30, kTebBase);                          // NtTib.Self
+    put(0x40, 0x1000);                            // ClientId.UniqueProcess
+    put(0x48, 0x1004);                            // ClientId.UniqueThread
+    put(0x60, kPebBase);                          // ProcessEnvironmentBlock
+    put(kTebSize + 0x10, req.image_base);         // PEB.ImageBaseAddress
+    if (!uc.write(kTebBase, blk.data(), blk.size())) return false;
+    uint64_t gs = kTebBase;
+    return uc_reg_write(uc.handle(), UC_X86_REG_GS_BASE, &gs) == UC_ERR_OK;
+}
+
+// Page by page so a dump running into unmapped memory keeps its readable
+// head. Pages the run never touched still read from the page source
+emu_mem_region_t read_back(const unicorn_t& uc, const run_request_t& req,
+                           const run_request_t::dump_range_t& d) {
+    emu_mem_region_t m;
+    m.addr = d.addr;
+    m.bytes.reserve(d.len);
+    std::vector<uint8_t> page;
+    uint64_t a = d.addr;
+    size_t left = d.len;
+    while (left) {
+        const size_t chunk = std::min<size_t>(left, kPageSize - (a & kPageMask));
+        const size_t at = m.bytes.size();
+        m.bytes.resize(at + chunk);
+        if (!uc.read(a, m.bytes.data() + at, chunk)) {
+            if (page.empty()) page.resize(kPageSize);
+            if (!fetch_page(req, a & ~kPageMask, page.data())) {
+                m.bytes.resize(at);
+                break;
+            }
+            std::memcpy(m.bytes.data() + at, page.data() + (a & kPageMask), chunk);
+        }
+        a += chunk;
+        left -= chunk;
+    }
+    return m;
+}
+
 } // namespace
 
 run_result_t emulate_run(const run_request_t& req) {
     run_result_t res;
     if (req.code.empty()) { res.error = "no code bytes"; return res; }
+    if (req.imports.size() > kMaxImports) {
+        res.error = "too many imports (max 16384)";
+        return res;
+    }
 
     unicorn_t uc;
     if (!uc.ok()) { res.error = "unicorn init failed"; return res; }
 
-    if (!uc.map(req.code_base, req.code.size()) ||
-        !uc.write(req.code_base, req.code.data(), req.code.size())) {
+    if (!uc.map(req.code_base, req.code.size())) {
+        res.error = "code mapping failed (unmapped/overlap?)";
+        return res;
+    }
+    // A slice ending mid-page has to run into the real next bytes, not zero
+    // fill, so the pages it shares come from the source first
+    if (req.page_in) {
+        std::vector<uint8_t> page(kPageSize);
+        const uint64_t lo = req.code_base & ~kPageMask;
+        const uint64_t hi = (req.code_base + req.code.size() + kPageMask) & ~kPageMask;
+        for (uint64_t p = lo; p < hi; p += kPageSize)
+            if (fetch_page(req, p, page.data())) uc.write(p, page.data(), kPageSize);
+    }
+    if (!uc.write(req.code_base, req.code.data(), req.code.size())) {
         res.error = "code mapping failed (unmapped/overlap?)";
         return res;
     }
@@ -258,6 +434,30 @@ run_result_t emulate_run(const run_request_t& req) {
         return res;
     }
 
+    run_ctx_t ctx{};
+    ctx.req = &req;
+
+    // One RET per import, int3 between them so a stray jump into a stub
+    // stops instead of sliding into the next one
+    if (!req.imports.empty()) {
+        const size_t len = req.imports.size() * kStubStride;
+        std::vector<uint8_t> stubs((len + kPageMask) & ~kPageMask, 0xCC);
+        for (size_t i = 0; i < req.imports.size(); ++i) {
+            stubs[i * kStubStride] = kRet;
+            ctx.slot_stubs[req.imports[i].slot] = kStubBase + i * kStubStride;
+        }
+        if (!uc.map(kStubBase, stubs.size()) ||
+            !uc.write(kStubBase, stubs.data(), stubs.size())) {
+            res.error = "import stub mapping failed";
+            return res;
+        }
+        ctx.stub_end = kStubBase + len;
+        patch_slots(uc.handle(), ctx, 0, UINT64_MAX);
+    }
+
+    // Best effort: a caller map over the TEB pages or a caller gs_base wins
+    if (!req.regs.count("gs_base")) res.teb_mapped = map_teb(uc, req);
+
     // Initial RSP with a return-address sentinel so clean leaf routines halt
     // deterministically with stopped_reason="return"
     uint64_t rsp = req.sp_set ? req.sp
@@ -270,8 +470,6 @@ run_result_t emulate_run(const run_request_t& req) {
         return res;
     }
 
-    run_ctx_t ctx{};
-    ctx.req       = &req;
     ctx.taint_on  = !req.taint_sources.empty();
     if (ctx.taint_on) {
         ctx.taint.reset();
@@ -289,7 +487,7 @@ run_result_t emulate_run(const run_request_t& req) {
         int id = 0;
         if (!lookup_reg(name, &id)) {
             res.error = "unknown register '" + name +
-                        "' (use rax..r15, rip, rflags)";
+                        "' (use rax..r15, rip, rflags, fs_base, gs_base)";
             return res;
         }
         uint64_t v = value;
@@ -342,6 +540,10 @@ run_result_t emulate_run(const run_request_t& req) {
     res.trace  = std::move(ctx.trace);
     res.writes = std::move(ctx.writes);
     res.total_writes = ctx.total_writes;
+    res.api_calls = std::move(ctx.api_calls);
+    res.total_api_calls = ctx.total_api_calls;
+    res.paged_in = ctx.paged_in;
+    res.page_in_exhausted = ctx.page_in_exhausted;
     res.fault  = ctx.fault;
 
     if (ctx.cancelled)           res.stopped_reason = "cancelled";
@@ -366,6 +568,8 @@ run_result_t emulate_run(const run_request_t& req) {
         res.error = uc_strerror(err);
     }
     res.ok = true;
+
+    for (const auto& d : req.dumps) res.memory.push_back(read_back(uc, req, d));
 
     if (ctx.taint_on) {
         ctx.taint.boundary();   // flush the final instruction's deferred dests
