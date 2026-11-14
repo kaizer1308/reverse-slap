@@ -59,7 +59,7 @@ struct predicate_batch_t {
     std::vector<predicate_proof_t> proofs;
     int completed_runs = 0; // runs with a usable trace (branch may still fault after)
     int failed_runs = 0;    // runs with no usable trace at all
-    int faulted_runs = 0;   // usable-trace runs that still hit a slice fault
+    int faulted_runs = 0;   // usable-trace runs that still hit a fault
     std::string first_fault;
 };
 

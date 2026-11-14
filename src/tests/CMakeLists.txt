@@ -77,7 +77,10 @@ set_target_properties(slop_tests PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
 )
 
-foreach(filter IN ITEMS decomp hyperion dotnet disasm_accuracy mcp driver abi inject app_perf ipa)
+# emu and taint are the emulator's own cases, the last four the analysis
+# passes that emulate (flattening recovery, predicate proofs, invariants, VM tracing)
+foreach(filter IN ITEMS decomp hyperion dotnet disasm_accuracy mcp driver abi inject app_perf ipa
+                        emu taint recover_ predicate invariants devirt)
     add_test(NAME "slop_tests_${filter}" COMMAND slop_tests)
     set_tests_properties("slop_tests_${filter}" PROPERTIES
         ENVIRONMENT "SLOP_TEST_FILTER=${filter}"

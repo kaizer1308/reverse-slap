@@ -58,8 +58,10 @@ The strings view with search, UTF-16 flagging and xref counts:
   and bounded instruction traces.
 - **Instrumentation:** embedded Frida Core 17.17.0 for local and remote devices,
   spawning, attaching, scripts, messages, RPC, compile, and snapshots.
-- **Emulation:** isolated x86-64 Unicorn execution with register/memory setup,
-  tracing, byte-level taint propagation, and watched output ranges.
+- **Emulation:** isolated x86-64 Unicorn execution that starts like a Windows
+  thread (ring 3, TEB/PEB/TLS, shared user data), models the common imports,
+  names CPU exceptions, and adds tracing, byte-level taint propagation, and
+  watched output ranges.
 - **Network tooling:** WFP capture and manipulation through the optional driver,
   PCAP export, stream reconstruction, connection inspection, and an independent
   localhost HTTP inspection proxy.
@@ -519,12 +521,30 @@ Embedded Frida Core supports:
   or attached-target addresses.
 - Demand paging from the loaded image (relocated when rebased) or the attached
   process, so runs follow calls, jumps and global loads past the code slice.
-- IAT stubs that log every import call with its arguments and return a chosen
-  value per import, plus a TEB/PEB behind `gs`.
+  The flattening, predicate, invariant and VM-trace passes run the same way.
+- A CPU that comes up as Windows hands it to code: ring 3 with the x64
+  selectors, `rflags` 0x202, the default x87/SSE control words, CPUID without a
+  hypervisor bit, and a time stamp counter that follows the instruction count,
+  so a run repeats exactly. `mode=kernel` (the default for a driver image)
+  keeps ring 0. Kernel-half addresses work as code, data and stack.
+- A TEB/PEB behind `gs` (stack bounds, ids, OS version, process heap, the
+  image's TLS template behind `gs:[0x58]`) and `KUSER_SHARED_DATA`.
+- IAT stubs that log every import call with its arguments and result. Imports
+  with a fixed contract behave like the real thing: the memory and string
+  routines, the heap families (a private zeroed heap), TLS/FLS, last error,
+  ids, the clock (`Sleep` moves it), critical sections; the ones that never
+  return stop the run with `exit` or `api_exception`. Everything else returns
+  a chosen value, per import if needed. `syscall` is logged the same way.
+- CPU exceptions reported by vector, NTSTATUS and instruction; privileged
+  instructions fault in user mode. Exception handlers are not dispatched.
+- No AVX: 256-bit instructions are `invalid_insn`, and three-operand VEX.128
+  instructions stop with `unsupported_insn` rather than run as their SSE form.
 - Final-memory dumps and a write log with stored values.
 - Custom register, stack, and memory-map initialization.
 - Instruction-count, target-address, and timeout stopping conditions.
-- Bounded instruction traces and byte-granular taint tracking.
+- Bounded instruction traces (one line per `rep`, with its iteration count)
+  and byte-granular taint tracking through general and XMM registers, flags,
+  the stack and the modeled memory routines.
 - VM identification, handler discovery, opcode maps, execution traces, lifting,
   and pseudocode.
 - CFG recovery, multi-run predicate proofs and invariant discovery, plus IAT

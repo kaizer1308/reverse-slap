@@ -857,6 +857,81 @@ TEST_CASE(devirt_identify_classify_lift_mini_vm) {
     REQUIRE(pc.find("pop()") != std::string::npos);
 }
 
+TEST_CASE(invariants_run_past_the_function_slice) {
+    disasm::engine_t eng;
+    REQUIRE(eng.init());
+    synth_pe s;
+    s.code_va = s.base + 0x1000;
+
+    // g sits below f, so f's forward byte slice never contained it, and it
+    // reads a global in the section's zero-filled tail (rva 0x1800, past the
+    // 0x200 bytes the file holds):
+    //   g: mov eax,[rip+0x7FA] / add eax,41 / ret
+    //   f: call g / add eax,1 / ret
+    const uint64_t g = s.emit({0x8B, 0x05, 0xFA, 0x07, 0x00, 0x00,
+                               0x83, 0xC0, 0x29,
+                               0xC3});
+    const uint64_t f = s.emit({0xE8, 0xF1, 0xFF, 0xFF, 0xFF,
+                               0x83, 0xC0, 0x01,
+                               0xC3});
+    REQUIRE_EQ(g + 6 + 0x7FA, s.base + 0x1800);
+    s.finish();
+
+    auto r = s.ref(eng);
+    auto inv = recover::observe_invariants(r, f, 3);
+    REQUIRE(inv.ok);                     // was "slice emulation faulted"
+    REQUIRE(inv.error.empty());
+    REQUIRE_STR_EQ(inv.stopped_reason.c_str(), "return");
+    bool saw_rax = false;
+    for (const auto& i : inv.invariants)
+        if (i.reg == "rax" && i.value == 42) saw_rax = true;
+    REQUIRE(saw_rax);
+}
+
+TEST_CASE(devirt_trace_reaches_handlers_before_the_entry) {
+    disasm::engine_t eng;
+    REQUIRE(eng.init());
+    synth_pe s;
+    s.code_va = s.base + 0x1000;
+
+    // Both handlers sit below the VM entry. The trace used to map only the
+    // bytes from the entry on, so the first dispatch faulted
+    const uint64_t entry = s.code_va + 0x40;
+    const uint64_t loop  = entry + 2;
+    // H0: push 5 ; mov eax,1 ; jmp loop
+    const uint64_t h0 = s.emit({0x6A, 0x05, 0xB8, 0x01, 0x00, 0x00, 0x00});
+    { auto j = s.jmp_rel8(s.code_va + s.section_bytes.size(), loop); s.emit(j); }
+    // H1: pop r8 ; xor eax,eax ; jmp loop
+    const uint64_t h1 = s.emit({0x41, 0x58, 0x31, 0xC0});
+    { auto j = s.jmp_rel8(s.code_va + s.section_bytes.size(), loop); s.emit(j); }
+    while (s.section_bytes.size() < 0x40) s.section_bytes.push_back(0xCC);
+
+    // vm_entry: xor eax,eax ; jmp [table + eax*8]
+    s.emit({0x31, 0xC0});
+    const size_t jmp_off = s.section_bytes.size();
+    s.emit({0xFF, 0x24, 0xC5, 0, 0, 0, 0});
+    while (s.section_bytes.size() % 8) s.section_bytes.push_back(0x90);
+    const uint64_t table_va = s.code_va + s.section_bytes.size();
+    for (uint64_t h : {h0, h1})
+        for (int b = 0; b < 8; ++b)
+            s.section_bytes.push_back(static_cast<uint8_t>(h >> (8 * b)));
+    for (int b = 0; b < 4; ++b)
+        s.section_bytes[jmp_off + 3 + b] = static_cast<uint8_t>((table_va >> (8 * b)) & 0xFF);
+    s.finish();
+
+    auto r = s.ref(eng);
+    auto tr = devirt::trace_bytecode(r, entry, loop, {h0, h1}, 16);
+    REQUIRE(tr.ok);
+    REQUIRE_GT(tr.dispatcher_hits, 2u);
+    bool saw0 = false, saw1 = false;
+    for (uint32_t op : tr.bytecode) {
+        if (op == 0) saw0 = true;
+        if (op == 1) saw1 = true;
+    }
+    REQUIRE(saw0);
+    REQUIRE(saw1);
+}
+
 TEST_CASE(xray_obfuscation_flags_privileged_junk) {
     disasm::engine_t eng;
     REQUIRE(eng.init());
