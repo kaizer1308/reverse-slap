@@ -129,10 +129,16 @@ add_library(slop_core STATIC
     script/lua_engine.cpp
     emu/taint.hpp
     emu/taint.cpp
+    emu/insn.hpp
+    emu/insn.cpp
     emu/unicorn.hpp
     emu/unicorn.cpp
     emu/session.hpp
     emu/session.cpp
+    emu/winapi.hpp
+    emu/winapi.cpp
+    emu/image.hpp
+    emu/image.cpp
     disasm/engine.hpp
     disasm/engine.cpp
     disasm/pe_parser.hpp

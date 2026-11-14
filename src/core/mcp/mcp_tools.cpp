@@ -35,6 +35,7 @@
 #include "core/analysis/packer_detect.h"
 #include "core/database/database.h"
 #include "core/detect/security.hpp"
+#include "core/emu/image.hpp"
 #include "core/emu/session.hpp"
 #include "core/frida/frida_service.hpp"
 #include "core/memory/aob.hpp"
@@ -824,7 +825,7 @@ const char* hint_for_tool_action(const std::string& tool, const std::string& act
         if (action == "signatures") return "signatures[] are crypto-constant hits (offset is file offset); named_functions[] are analyzer names (RTTI/vtable/thunk included, NOT FLIRT-verified).";
         if (action == "diff") return "count is non-identical functions shown (cap 500); totals{added,removed,modified,identical} cover the full pair. similarity is 0-1.";
     } else if (tool == "emulate") {
-        return "stopped_reason names the halt (return/until/count/timeout/cancelled/invalid_mem_*/invalid_insn/cpu_exception). timeout_ms caps at 30000. regs echo final state; trace[] is bounded by trace_max. Maps are extra regions beyond the code window; imports/IAT are NOT mapped.";
+        return "stopped_reason names the halt (return/until/count/timeout/cancelled/invalid_mem_*/invalid_insn/unsupported_insn/cpu_exception/api_exception/exit/halt); exception{} and exit{} carry the detail. timeout_ms caps at 30000. regs echo final state; trace[] is bounded by trace_max. api_calls[] lists imports and syscalls with the value returned (model=true: the import's real behavior was emulated).";
     } else if (tool == "patch") {
         if (action == "journal") return "patches[] carry va + before/after hex blobs. total is patch records; indexes_dirty=true means static tools rebuild on next call.";
         if (action == "full_pass") return "scores are 0-100 obfuscation ratings; score_reduction=pre-post. steps[] show per-pass success/note. dry_run=true previews without writing.";
@@ -4068,125 +4069,24 @@ json tool_inject(const json& args) {
 
 // tool: emulate
 
-// The loader's view of the shared image: headers, section bytes up to
-// VirtualSize, zero for BSS tails and gaps, and base relocations applied when
-// the session base differs from ImageBase (every ASLR-loaded live module),
-// so absolute pointers in tables and code land in the rebased image
-struct image_view_t {
-    struct reloc_t { uint32_t rva = 0; uint8_t width = 0; };   // width 4 | 8
+// The loader's view of the shared image (emu::image_view_t) is built under
+// the state mutex. The run is off every tool lock, so each demand page is
+// copied under that mutex again and the source goes dry once another image
+// replaces this one
+emu::image_bytes_t image_bytes(const ds::binary_t& bin) {
+    return {&bin.pe, bin.file.data(), bin.file.size(),
+            bin.format == disasm::image_format_t::pe};
+}
 
-    uint64_t hash   = 0;
-    uint64_t extent = 0;            // SizeOfImage, or the section span
-    uint64_t delta  = 0;            // session base - ImageBase, mod 2^64
-    std::vector<reloc_t> relocs;    // sorted by rva, empty when not rebased
-
-    // Raw mapped bytes for [rva, rva + len), no relocation. Caller holds
-    // the state mutex
-    static void copy_mapped(const ds::binary_t& bin, uint64_t rva, size_t len, uint8_t* out) {
-        std::memset(out, 0, len);
-        const uint64_t end = rva + len;
-        if (bin.format == disasm::image_format_t::pe) {
-            uint64_t headers = emu::kPageSize;
-            for (const auto& s : bin.pe.sections)
-                if (s.raw_size) headers = std::min<uint64_t>(headers, s.raw_offset);
-            headers = std::min<uint64_t>(headers, bin.file.size());
-            if (rva < headers)
-                std::memcpy(out, bin.file.data() + rva,
-                            static_cast<size_t>(std::min(end, headers) - rva));
-        }
-        for (const auto& s : bin.pe.sections) {
-            // file bytes past VirtualSize are not mapped by the loader
-            const uint64_t backed = std::min<uint64_t>(
-                s.virtual_size ? s.virtual_size : s.raw_size, s.raw_size);
-            const uint64_t lo = std::max<uint64_t>(rva, s.rva);
-            const uint64_t hi = std::min<uint64_t>(end, s.rva + backed);
-            if (lo >= hi) continue;
-            const uint64_t off = uint64_t{s.raw_offset} + (lo - s.rva);
-            if (off >= bin.file.size()) continue;
-            const uint64_t n = std::min<uint64_t>(hi - lo, bin.file.size() - off);
-            std::memcpy(out + (lo - rva), bin.file.data() + off, static_cast<size_t>(n));
-        }
-    }
-
-    // Caller holds the state mutex
-    static std::shared_ptr<const image_view_t> make(const ds::binary_t& bin) {
-        auto v = std::make_shared<image_view_t>();
-        v->hash   = bin.file_hash;
-        v->extent = bin.pe.size_of_image;
-        if (!v->extent)
-            for (const auto& s : bin.pe.sections)
-                v->extent = std::max<uint64_t>(
-                    v->extent, uint64_t{s.rva} + (s.virtual_size ? s.virtual_size : s.raw_size));
-        v->delta = bin.base - bin.pe.image_base;
-
-        // IMAGE_DIRECTORY_ENTRY_BASERELOC: blocks of {page rva, size, u16
-        // entries}, type in the top 4 bits (3 HIGHLOW, 10 DIR64)
-        const auto& dir = bin.pe.data_dirs[5];
-        if (v->delta == 0 || bin.format != disasm::image_format_t::pe ||
-            !dir.rva || !dir.size || dir.size > (64u << 20))
-            return v;
-        std::vector<uint8_t> raw(dir.size);
-        copy_mapped(bin, dir.rva, raw.size(), raw.data());
-        for (size_t pos = 0; pos + 8 <= raw.size();) {
-            uint32_t page = 0, block = 0;
-            std::memcpy(&page, raw.data() + pos, 4);
-            std::memcpy(&block, raw.data() + pos + 4, 4);
-            if (block < 8 || block > raw.size() - pos) break;
-            for (size_t e = pos + 8; e + 2 <= pos + block; e += 2) {
-                uint16_t entry = 0;
-                std::memcpy(&entry, raw.data() + e, 2);
-                const uint32_t at = page + (entry & 0xFFFu);
-                if ((entry >> 12) == 10)     v->relocs.push_back({at, 8});
-                else if ((entry >> 12) == 3) v->relocs.push_back({at, 4});
-            }
-            pos += block;
-        }
-        std::sort(v->relocs.begin(), v->relocs.end(),
-                  [](const reloc_t& a, const reloc_t& b) { return a.rva < b.rva; });
-        return v;
-    }
-
-    // Relocated mapped bytes for [rva, rva + len). Caller holds the state mutex
-    void read(const ds::binary_t& bin, uint64_t rva, size_t len, uint8_t* out) const {
-        copy_mapped(bin, rva, len, out);
-        if (relocs.empty()) return;
-        // a fixup starting up to 7 bytes before the range still reaches into it
-        const uint64_t from = rva >= 7 ? rva - 7 : 0;
-        auto it = std::lower_bound(relocs.begin(), relocs.end(), from,
-                                   [](const reloc_t& r, uint64_t a) { return r.rva < a; });
-        for (; it != relocs.end() && it->rva < rva + len; ++it) {
-            uint8_t v[8] = {};
-            copy_mapped(bin, it->rva, it->width, v);
-            if (it->width == 8) {
-                uint64_t x = 0;
-                std::memcpy(&x, v, 8);
-                x += delta;
-                std::memcpy(v, &x, 8);
-            } else {
-                uint32_t x = 0;
-                std::memcpy(&x, v, 4);
-                x += static_cast<uint32_t>(delta);
-                std::memcpy(v, &x, 4);
-            }
-            for (uint8_t i = 0; i < it->width; ++i) {
-                const uint64_t at = uint64_t{it->rva} + i;
-                if (at >= rva && at < rva + len) out[at - rva] = v[i];
-            }
-        }
-    }
-};
-
-// Demand pages over the shared image. The run is off every tool lock, so
-// each page is copied under the state mutex and the source goes dry once
-// another image replaces this one
-emu::page_source_t image_page_source(std::shared_ptr<const image_view_t> view) {
-    return [view = std::move(view)](uint64_t page, uint8_t* out) {
+emu::page_source_t image_page_source(std::shared_ptr<const emu::image_view_t> view,
+                                     uint64_t hash) {
+    return [view = std::move(view), hash](uint64_t page, uint8_t* out) {
         std::lock_guard lk(ds::state_mutex());
         const auto& bin = ds::get();
-        if (!bin.ready || bin.file_hash != view->hash || page < bin.base) return false;
+        if (!bin.ready || bin.file_hash != hash || page < bin.base) return false;
         const uint64_t rva = page - bin.base;
         if (rva >= view->extent) return false;
-        view->read(bin, rva, emu::kPageSize, out);
+        view->read(image_bytes(bin), rva, emu::kPageSize, out);
         return true;
     };
 }
@@ -4203,37 +4103,6 @@ uint64_t parse_api_value(const json& v, const std::string& key) {
 std::string lower_ascii(std::string s) {
     for (char& ch : s) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
     return s;
-}
-
-// IAT slots of a PE32+ image, for the emulator's import stubs. returns maps
-// lowercase "func" or "dll!func" to a per-import return value; matched keys
-// are removed so the caller can report the rest
-std::vector<emu::import_slot_t> image_import_slots(const ds::binary_t& bin,
-                                                   std::map<std::string, uint64_t>& returns) {
-    std::vector<emu::import_slot_t> out;
-    if (bin.format != disasm::image_format_t::pe || !bin.pe.pe32plus) return out;
-    std::vector<std::string> used;
-    for (const auto& dll : bin.pe.imports) {
-        for (const auto& fn : dll.functions) {
-            if (!fn.iat_rva) continue;
-            if (out.size() >= emu::kMaxImports) break;
-            emu::import_slot_t slot;
-            slot.slot = bin.base + fn.iat_rva;
-            const std::string func = fn.by_ordinal ? "#" + std::to_string(fn.ordinal) : fn.name;
-            slot.name = dll.dll + "!" + func;
-            for (const std::string& key : {lower_ascii(slot.name), lower_ascii(func)}) {
-                if (auto it = returns.find(key); it != returns.end()) {
-                    slot.has_ret = true;
-                    slot.ret = it->second;
-                    used.push_back(key);
-                    break;
-                }
-            }
-            out.push_back(std::move(slot));
-        }
-    }
-    for (const auto& key : used) returns.erase(key);
-    return out;
 }
 
 json tool_emulate(const json& args, infra::cancel_token_t cancel) {
@@ -4277,6 +4146,9 @@ json tool_emulate(const json& args, infra::cancel_token_t cancel) {
         auto& bin = ds::get();
         if (!bin.ready) fail("no image loaded in reverse-slop (see disasm.loaded)");
         require_x86_image(bin.arch, bin.format, "emulate.run");
+        // the cpu is x86-64 only: 32-bit code would decode as something else
+        if (bin.arch != disasm::image_arch_t::x64)
+            fail("emulate.run runs x64 code only; the loaded image is x86");
         const uint64_t addr = parse_addr(args, "file_addr");
         uint64_t len = args.contains("code_len") ? parse_addr(args, "code_len") : 64;
         if (len == 0 || len > (1ull << 20)) fail("bad code_len");
@@ -4285,14 +4157,20 @@ json tool_emulate(const json& args, infra::cancel_token_t cancel) {
         len = std::min<uint64_t>(len, bin.file.size() - *off);
         // relocated like the demand pages, or a rebased slice keeps
         // ImageBase pointers the pages around it no longer have
-        auto view = image_view_t::make(bin);
+        const emu::image_bytes_t img = image_bytes(bin);
+        auto view = emu::image_view_t::make(img, bin.base);
         req.code.resize(static_cast<size_t>(len));
-        view->read(bin, addr - bin.base, req.code.size(), req.code.data());
+        view->read(img, addr - bin.base, req.code.size(), req.code.data());
         req.code_base  = addr;
         req.image_base = bin.base;
-        if (page_in) req.page_in = image_page_source(std::move(view));
-        if (args.value("stub_imports", true))
-            req.imports = image_import_slots(bin, api_returns);
+        if (img.is_pe) {
+            // a driver runs in ring 0, and the thread gets the image's TLS data
+            req.kernel_mode = emu::image_is_kernel(bin.pe);
+            emu::image_tls(*view, img, bin.base, &req);
+            if (args.value("stub_imports", true))
+                req.imports = emu::image_import_slots(bin.pe, bin.base, &api_returns);
+        }
+        if (page_in) req.page_in = image_page_source(std::move(view), bin.file_hash);
         have_code = true;
     }
     if (!have_code && args.contains("target_addr")) {
@@ -4411,6 +4289,12 @@ json tool_emulate(const json& args, infra::cancel_token_t cancel) {
         }
     }
     if (args.contains("api_ret")) req.api_ret = parse_api_value(args.at("api_ret"), "api_ret");
+    req.api_models = args.value("api_models", true);
+    if (auto it = args.find("mode"); it != args.end()) {
+        const std::string mode = it->is_string() ? it->get<std::string>() : std::string();
+        if (mode != "user" && mode != "kernel") fail("mode must be 'user' or 'kernel'");
+        req.kernel_mode = mode == "kernel";
+    }
     tool_lk.unlock();
 
     auto r = emu::emulate_run(req);
@@ -4425,10 +4309,15 @@ json tool_emulate(const json& args, infra::cancel_token_t cancel) {
     for (const auto& [name, value] : r.regs) regs[name] = value;
     out["regs"] = regs;
 
+    out["mode"] = req.kernel_mode ? "kernel" : "user";
+
     if (!r.trace.empty()) {
         json arr = json::array();
-        for (const auto& t : r.trace)
-            arr.push_back({{"ip", t.ip}, {"text", t.text}});
+        for (const auto& t : r.trace) {
+            json line = {{"ip", t.ip}, {"text", t.text}};
+            if (t.repeat != 1) line["repeat"] = t.repeat;   // iterations of a rep
+            arr.push_back(std::move(line));
+        }
         out["trace"] = arr;
     }
     {
@@ -4439,14 +4328,39 @@ json tool_emulate(const json& args, infra::cancel_token_t cancel) {
         out["writes"] = arr;
         out["total_writes"] = r.total_writes;
     }
-    if (!req.imports.empty()) {
+    if (!req.imports.empty() || r.total_api_calls) {   // syscalls land here too
         json arr = json::array();
         for (const auto& c : r.api_calls)
             arr.push_back({{"ip", c.ip}, {"ret", c.ret}, {"name", c.name},
                            {"args", json::array({c.args[0], c.args[1],
-                                                 c.args[2], c.args[3]})}});
+                                                 c.args[2], c.args[3]})},
+                           {"rax", c.rax}, {"model", c.modeled}});
         out["api_calls"]       = arr;
         out["total_api_calls"] = r.total_api_calls;
+    }
+    if (r.heap_used) out["heap_used"] = r.heap_used;
+    if (r.exit) out["exit"] = {{"api", r.exit->api}, {"code", r.exit->code}};
+    if (r.exception) {
+        json ex = {{"ip", r.exception->ip}, {"code", r.exception->code},
+                   {"name", r.exception->name}};
+        if (r.exception->vector >= 0) ex["vector"] = r.exception->vector;
+        if (!r.exception->insn.empty()) ex["insn"] = r.exception->insn;
+        out["exception"] = ex;
+        const bool avx = r.exception->insn.find("ymm") != std::string::npos ||
+                         r.exception->insn.find("zmm") != std::string::npos ||
+                         r.stopped_reason == "unsupported_insn";
+        if (avx)
+            out["note"] = "the emulated CPU has SSE4.2, AES and BMI1/2 but no AVX: "
+                          "256/512-bit instructions raise invalid_insn, and a "
+                          "three-operand VEX.128 instruction stops the run with "
+                          "unsupported_insn because the core would compute it as "
+                          "its two-operand SSE form. CPUID and "
+                          "IsProcessorFeaturePresent report no AVX, so code that "
+                          "checks takes its SSE path";
+        else if (r.stopped_reason == "cpu_exception" || r.stopped_reason == "api_exception")
+            out["note"] = "exception.code is the NTSTATUS a handler would see. "
+                          "Exception dispatch (SEH/VEH, C++ catch) is not emulated, "
+                          "the run stops at the raising instruction or call";
     }
     if (!api_returns.empty()) {
         json keys = json::array();
@@ -4474,8 +4388,9 @@ json tool_emulate(const json& args, infra::cancel_token_t cancel) {
             out["note"] = "the address is outside the code source: file_addr "
                           "pages come from the loaded image (its sections, "
                           "inside SizeOfImage), target_addr pages from the "
-                          "attached process. Map anything else (heap, other "
-                          "modules, PEB.Ldr) with maps=[{addr,hex}]";
+                          "attached process. Map anything else (other modules, "
+                          "PEB.Ldr, memory an unmodeled import should have "
+                          "returned) with maps=[{addr,hex}]";
         else
             out["note"] = "only the requested code bytes (+ optional maps=) are "
                           "mapped: CALL/JMP to unmapped callees and loads from "
@@ -7810,13 +7725,13 @@ json tool_devirt(const json& args) {
         out["faulted_runs"] = batch.faulted_runs;
         if (!batch.first_fault.empty()) out["first_fault"] = batch.first_fault;
         if (batch.failed_runs > 0 || batch.faulted_runs > 0)
-            out["note"] = "slice emulation faulted on " +
+            out["note"] = "emulation faulted on " +
                           std::to_string(batch.failed_runs + batch.faulted_runs) +
                           "/" + std::to_string(runs) + " runs (" +
                           batch.first_fault + "); seen_runs counts observations "
                           "from usable trace prefixes, so seen=0 with faults "
-                          "means the branch was never reached (unmapped "
-                          "callee/import in the slice), not that it is opaque";
+                          "means the branch was never reached (the run left "
+                          "the image first), not that it is opaque";
         return out;
     }
 
@@ -8624,7 +8539,7 @@ void list_tools(json& out) {
     const char* notes_schema =
         R"({"type":"object","properties":{"action":{"type":"string","enum":["set_comment","get_comment","comments","bookmark_toggle","bookmarks"]},"addr":{"type":"integer"},"text":{"type":"string"}},"required":["action"]})";
     const char* emulate_schema =
-        R"({"type":"object","properties":{"action":{"type":"string","enum":["run"]},"hex":{"type":"string"},"file_addr":{"type":"integer"},"target_addr":{"type":"integer"},"code_len":{"type":"integer","minimum":1,"maximum":1048576},"base":{"type":"integer"},"entry":{"type":"integer"},"stack_base":{"type":"integer"},"stack_size":{"type":"integer","minimum":4096,"maximum":67108864},"sp":{"type":"integer"},"regs":{"type":"object"},"maps":{"type":"array"},"until":{"type":"integer"},"count":{"type":"integer"},"timeout_ms":{"type":"integer","minimum":1,"maximum":30000},"trace":{"type":"boolean"},"trace_max":{"type":"integer","minimum":0,"maximum":16384},"taint":{"type":"array"},"watch_addr":{"type":"integer"},"watch_len":{"type":"integer","minimum":0,"maximum":1048576},"page_in":{"type":"boolean"},"stub_imports":{"type":"boolean"},"api_ret":{"type":["integer","string"]},"api_returns":{"type":"object","additionalProperties":{"type":["integer","string"]}},"dump":{"type":"array","items":{"type":"object","properties":{"addr":{"type":"integer"},"len":{"type":"integer","minimum":1,"maximum":1048576}},"required":["addr","len"]}}},"required":["action"]})";
+        R"({"type":"object","properties":{"action":{"type":"string","enum":["run"]},"hex":{"type":"string"},"file_addr":{"type":"integer"},"target_addr":{"type":"integer"},"code_len":{"type":"integer","minimum":1,"maximum":1048576},"base":{"type":"integer"},"entry":{"type":"integer"},"stack_base":{"type":"integer"},"stack_size":{"type":"integer","minimum":4096,"maximum":67108864},"sp":{"type":"integer"},"regs":{"type":"object"},"maps":{"type":"array"},"until":{"type":"integer"},"count":{"type":"integer"},"timeout_ms":{"type":"integer","minimum":1,"maximum":30000},"trace":{"type":"boolean"},"trace_max":{"type":"integer","minimum":0,"maximum":16384},"taint":{"type":"array"},"watch_addr":{"type":"integer"},"watch_len":{"type":"integer","minimum":0,"maximum":1048576},"page_in":{"type":"boolean"},"stub_imports":{"type":"boolean"},"api_ret":{"type":["integer","string"]},"api_returns":{"type":"object","additionalProperties":{"type":["integer","string"]}},"api_models":{"type":"boolean"},"mode":{"type":"string","enum":["user","kernel"]},"dump":{"type":"array","items":{"type":"object","properties":{"addr":{"type":"integer"},"len":{"type":"integer","minimum":1,"maximum":1048576}},"required":["addr","len"]}}},"required":["action"]})";
     const char* analyze_schema =
         R"({"type":"object","properties":{"action":{"type":"string","enum":["packer","signatures","diff","diff_start","diff_job","diff_cancel"]},"path":{"type":"string"},"path_a":{"type":"string"},"path_b":{"type":"string"},"limit":{"type":"integer"},"timeout_ms":{"type":"integer"},"max_pairs":{"type":"integer"},"id":{"type":"integer"}},"required":["action"]})";
     const char* network_schema =
@@ -8686,7 +8601,7 @@ void list_tools(json& out) {
                    {"description", "Read and edit analyst annotations for the currently loaded binary. set_comment(addr,text), get_comment(addr), and comments manage per-VA comments; bookmark_toggle(addr) and bookmarks manage navigation marks. Data persists by binary hash alongside user symbols and is immediately shared with the UI. Requires a loaded image. set_comment with empty text clears the comment (response cleared=true)."},
                    {"inputSchema", json::parse(notes_schema)}, {"read_only", false}});
     out.push_back({{"name", "emulate"},
-                   {"description", "Emulate x86-64 code in an isolated Unicorn VM. action='run' accepts exactly one practical code source: hex bytes, file_addr from the shared image, or target_addr from attached-process memory; code_len sets the initial slice. With file_addr/target_addr, page_in (default true) maps any other page the code touches from that same source on first use (image sections inside SizeOfImage with base relocations applied when the image is rebased, or live process memory; up to 16 MiB), so calls, jumps and global loads outside the slice keep running; hex runs map only the code and maps. With file_addr on a PE32+ image, stub_imports (default true) points every IAT slot at a stub that returns api_ret (default 0) in rax and logs api_calls (caller ip, return address, import name, rcx/rdx/r8/r9); api_returns={\"InitializeCriticalSectionAndSpinCount\":1,\"kernel32.dll!CreateFileW\":-1} overrides it per import (case-insensitive, unmatched keys come back in api_returns_unmatched). A zeroed TEB/PEB sits at gs_base (self, PEB, stack bounds, ImageBaseAddress; BeingDebugged=0) unless regs sets gs_base. Set base/entry, registers (rax..r15, rip, rflags, fs_base, gs_base), stack, and extra maps as needed. dump=[{addr,len}] (<= 1 MiB total) returns final memory as hex in memory; writes log ip/addr/len/value. Stop with until, count (default 100000), or timeout_ms (default 5000, capped at 30000); MCP notifications/cancelled stops a run early with stopped_reason='cancelled'. Runs do not block other tools. trace enables bounded instruction history (trace_max <= 16384); taint entries mark source byte ranges (<= 1 MiB total), and watch_addr/watch_len selects the output window for byte-granular propagation results. Emulation does not modify the loaded image or live target."},
+                   {"description", "Emulate x86-64 code in an isolated Unicorn VM. action='run' accepts exactly one practical code source: hex bytes, file_addr from the shared image (x64 only), or target_addr from attached-process memory; code_len sets the initial slice. With file_addr/target_addr, page_in (default true) maps any other page the code touches from that same source on first use (image sections inside SizeOfImage with base relocations applied when the image is rebased, or live process memory; up to 16 MiB), so calls, jumps and global loads outside the slice keep running; hex runs map only the code and maps. The CPU starts like a Windows thread: mode='user' (default) is ring 3 with cs=0x33/ss=0x2B, rflags=0x202, x87 cw 0x27F, mxcsr 0x1F80, so privileged instructions (hlt, cli, in/out, rdmsr, mov crN) stop with cpu_exception/privileged_instruction; mode='kernel' is ring 0 (default for a driver image). A TEB/PEB sits at gs_base (self, PEB, stack bounds, ids, TLS pointer with the image's TLS template, ImageBaseAddress, ProcessHeap, OS version 10.0.19045; BeingDebugged=0) unless regs sets gs_base, and KUSER_SHARED_DATA at 0x7FFE0000 is synthesized when the source has none. rdtsc and every clock follow the instruction count, so runs repeat exactly; CPUID reports no hypervisor. With file_addr on a PE32+ image, stub_imports (default true) points every IAT slot at a stub and logs api_calls (caller ip, return address, import name, rcx/rdx/r8/r9, rax returned, model). api_models (default true) gives well-known imports their real behavior: memcpy/memset/memcmp/strlen/strcmp/strcpy and friends, malloc/free/HeapAlloc/VirtualAlloc/ExAllocatePool* from a private 64 MiB zeroed heap, TlsAlloc/FlsAlloc slots, Get/SetLastError and ids from the TEB, GetTickCount/QueryPerformanceCounter/Sleep on the virtual clock, critical sections, EncodePointer, IsDebuggerPresent, IsProcessorFeaturePresent; ExitProcess/exit/abort/TerminateProcess(self)/KeBugCheck stop with stopped_reason='exit', RaiseException/_CxxThrowException with 'api_exception'. Every other import returns api_ret (default 0) in rax; api_returns={\"InitializeCriticalSectionAndSpinCount\":0,\"kernel32.dll!CreateFileW\":-1} overrides one import (wins over its model; case-insensitive, unmatched keys come back in api_returns_unmatched). syscall and int 2Eh are logged in api_calls as syscall:0x<n> and answered with api_ret. Set base/entry, registers (rax..r15, rip, rflags, fs_base, gs_base), stack, and extra maps as needed. dump=[{addr,len}] (<= 1 MiB total) returns final memory as hex in memory; writes log ip/addr/len/value. Stop with until, count (default 100000), or timeout_ms (default 5000, capped at 30000); MCP notifications/cancelled stops a run early with stopped_reason='cancelled'. CPU exceptions stop with cpu_exception and exception{ip,vector,code,name,insn} (code is the NTSTATUS; handlers are not dispatched). The CPU has SSE4.2/AES/BMI but no AVX: 256-bit forms are invalid_insn and three-operand VEX.128 forms stop with unsupported_insn instead of being miscomputed. Runs do not block other tools. trace enables bounded instruction history (trace_max <= 16384; a rep string instruction is one line with repeat=iterations); taint entries mark source byte ranges (<= 1 MiB total), and watch_addr/watch_len selects the output window for byte-granular propagation results (through GPRs, XMM registers, flags, the stack and the modeled memory routines). Emulation does not modify the loaded image or live target."},
                    {"inputSchema", json::parse(emulate_schema)}, {"read_only", true}});
     out.push_back({{"name", "analyze"},
                    {"description", "Run whole-binary read-only analysis. packer uses the shared image or path and reports protector names, entry signatures, entropy, import anomalies, W+X sections, TLS, overlay, crypto constants, and the shared Hyperion verdict when available. signatures requires the analyzed shared session and returns analyzer-derived names in named_functions; names may come from RTTI, vtables, thunks, or signature candidates and are not provenance-verified as FLIRT. diff(path_a,path_b) performs two full Hyperion analyses and reports added, removed, and modified functions with similarity scores, so expect a longer call; for huge binaries use async diff_start(path_a,path_b) then poll diff_job(id) for stage/progress and stop with diff_cancel(id). Check disasm.loaded before shared-session actions."},

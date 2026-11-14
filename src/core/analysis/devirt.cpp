@@ -2,6 +2,7 @@
 
 #include "core/analysis/devirt.hpp"
 
+#include "core/emu/image.hpp"
 #include "core/emu/session.hpp"
 
 #include <algorithm>
@@ -53,7 +54,8 @@ bool is_exec_va(const xray::image_ref_t& img, uint64_t va) {
     return false;
 }
 
-// Emulate the VM entry with deterministic seeds; trace on
+// Emulate the VM entry with deterministic seeds; trace on. Handlers the
+// dispatcher jumps to outside the entry's linear run page in from the image
 emu::run_result_t run_vm(const xray::image_ref_t& img, uint64_t entry_va,
                          uint64_t seed, size_t max_insns) {
     std::vector<uint8_t> bytes;
@@ -91,6 +93,13 @@ emu::run_result_t run_vm(const xray::image_ref_t& img, uint64_t entry_va,
                            "r14", "r15" })
         req.regs[r] = next() | 1;
 
+    const emu::image_bytes_t image{img.pe, img.file->data(), img.file->size(),
+                                   emu::is_pe_file(img.file->data(), img.file->size())};
+    if (!emu::attach_image(&req, image, img.base)) {
+        emu::run_result_t res;
+        res.error = "emulation runs x64 code only";
+        return res;
+    }
     return emu::emulate_run(req);
 }
 

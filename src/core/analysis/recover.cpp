@@ -2,6 +2,7 @@
 
 #include "core/analysis/recover.hpp"
 
+#include "core/emu/image.hpp"
 #include "core/emu/session.hpp"
 
 #include <algorithm>
@@ -83,12 +84,12 @@ void seed_regs(emu::run_request_t& req, uint64_t seed) {
         req.regs[r] = next() | 1;   // never zero: zero-heavy inputs mask branches
 }
 
-// Run the function body under Unicorn with the given seed.
-// Only the function slice is executable; data sections (.rdata/.data/.pdata)
-// are mapped read-only alongside so plain `MOV rax,[rip+...]` / IAT loads do
-// not fault after a handful of instructions. Cross-function CALLs still stop
-// at the callee (not mapped) with invalid_mem_fetch -- that is inherent to
-// slice emulation, and callers surface it with a note.
+// Run the function under Unicorn with the given seed. The run starts on the
+// function's own bytes and pages the rest of the image in on demand, with
+// its imports stubbed, so calls into other functions, global loads and BSS
+// all resolve. What still stops a run is an address outside the image (a
+// heap or stack argument pointer the seed made up, another module), and
+// callers surface that with a note.
 emu::run_result_t run_fn(const xray::image_ref_t& img, uint64_t fn_va,
                          uint64_t seed, bool want_trace) {
     emu::run_request_t req;
@@ -117,28 +118,14 @@ emu::run_result_t run_fn(const xray::image_ref_t& img, uint64_t fn_va,
     req.trace          = want_trace;
     seed_regs(req, seed);
 
-    // Map data sections so static loads resolve. Skip anything overlapping
-    // the code slice, cap per-section bytes to bound Unicorn memory.
-    const uint64_t code_end = fn_va + req.code.size();
-    for (const auto& s : img.pe->sections) {
-        if (s.is_executable() || s.raw_size == 0) continue;
-        const uint64_t va = img.base + s.rva;
-        const uint64_t vend = va + std::max(s.virtual_size, s.raw_size);
-        if (va < code_end && vend > fn_va) continue; // overlap guard
-        auto off = img.pe->rva_to_offset(s.rva);
-        if (!off || *off + s.raw_size > img.file->size()) continue;
-        constexpr size_t kMaxMap = 4u << 20;
-        const size_t take = std::min<size_t>(s.raw_size, kMaxMap);
-        emu::emu_mem_region_t reg;
-        reg.addr = va;
-        reg.bytes.assign(img.file->data() + *off,
-                         img.file->data() + *off + take);
-        req.maps.push_back(std::move(reg));
-        if (req.maps.size() >= 16) break;
+    const emu::image_bytes_t image{img.pe, img.file->data(), img.file->size(),
+                                   emu::is_pe_file(img.file->data(), img.file->size())};
+    if (!emu::attach_image(&req, image, img.base)) {
+        emu::run_result_t res;
+        res.error = "emulation runs x64 code only";
+        return res;
     }
-
-    emu::run_result_t res = emu::emulate_run(req);
-    return res;
+    return emu::emulate_run(req);
 }
 
 } // namespace
@@ -309,8 +296,8 @@ predicate_batch_t prove_predicates_ex(const xray::image_ref_t& img,
             ++faulted_runs;
             if (first_fault.empty())
                 first_fault = "invalid_mem_" + rr.fault->access + " at fault ip " +
-                              std::to_string(rr.fault->ip) + " (slice emulation: only "
-                              "the function slice + data sections are mapped)";
+                              std::to_string(rr.fault->ip) + " (the address is outside "
+                              "the image; only the image's own pages are mapped)";
         }
 
         std::set<uint64_t> counted;
@@ -338,7 +325,7 @@ predicate_batch_t prove_predicates_ex(const xray::image_ref_t& img,
 
     // proven_* keep their original meaning (every requested run observed the
     // branch and agreed); the batch counts + fault note let callers tell "no
-    // observation because the slice faulted first" apart from "observed and
+    // observation because the run faulted first" apart from "observed and
     // mixed". Faults after the branch do not invalidate its observation.
     for (auto& p : out) {
         p.proven_always_taken =
@@ -352,7 +339,7 @@ predicate_batch_t prove_predicates_ex(const xray::image_ref_t& img,
             p.text += " [no dynamic observation: " +
                       std::to_string(failed_runs + faulted_runs) + "/" +
                       std::to_string(p.total_runs) +
-                      " runs unusable (slice-emulation fault" +
+                      " runs unusable (emulation fault" +
                       (faulted_runs > 0 ? " after branch region" : "") +
                       (first_fault.empty() ? "" : ": " + first_fault) + ")]";
         }
@@ -382,8 +369,8 @@ invariant_result_t observe_invariants(const xray::image_ref_t& img,
                         (rr.error.empty() ? rr.stopped_reason : rr.error);
             return res;
         }
-        // Slice emulation stops at the first unmapped callee/import: report
-        // the fault with an IAT note instead of bare invalid_mem_read.
+        // The run left the image (a pointer the seed made up, another
+        // module): report where, instead of a bare invalid_mem_read.
         if (rr.fault) {
             res.instructions_executed = std::max(res.instructions_executed,
                                                  rr.instructions);
@@ -391,14 +378,14 @@ invariant_result_t observe_invariants(const xray::image_ref_t& img,
                 ? std::string("invalid_mem_") + rr.fault->access
                 : res.stopped_reason;
             res.error =
-                "slice emulation faulted after " +
+                "emulation faulted after " +
                 std::to_string(rr.instructions) + " insns at " +
                 std::to_string(rr.fault->ip) + " accessing " +
                 std::to_string(rr.fault->addr) + " (" + rr.fault->access +
-                "); only the function slice + data sections are mapped -- "
-                "calls/jmps to other functions and unmapped IAT/import "
-                "targets stop the run (pass maps= via emulate.run, or use "
-                "devirt handlers for cross-function flow)";
+                "); the image's own pages and import stubs are mapped, an "
+                "address outside the image (heap or stack data behind a "
+                "seeded argument, another module) stops the run (pass maps= "
+                "via emulate.run to supply it)";
             return res;
         }
         res.instructions_executed = std::max(res.instructions_executed,

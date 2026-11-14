@@ -29,20 +29,21 @@ unicorn_t::~unicorn_t() {
 
 bool unicorn_t::map(uint64_t addr, size_t len) {
     if (!uc_ || len == 0) return false;
-    const uint64_t base = addr & ~kPageMask;
-    const uint64_t end  = (addr + len + kPageMask) & ~kPageMask;
+    const uint64_t base = fold_addr(addr) & ~kPageMask;
+    const uint64_t end  = (fold_addr(addr) + len + kPageMask) & ~kPageMask;
+    if (end <= base || end > fold_addr(~0ull) + 1) return false;   // wrapped
     return uc_mem_map(eng(uc_), base, static_cast<size_t>(end - base),
                       UC_PROT_ALL) == UC_ERR_OK;
 }
 
 bool unicorn_t::write(uint64_t addr, const void* data, size_t len) {
     if (!uc_) return false;
-    return uc_mem_write(eng(uc_), addr, data, len) == UC_ERR_OK;
+    return uc_mem_write(eng(uc_), fold_addr(addr), data, len) == UC_ERR_OK;
 }
 
 bool unicorn_t::read(uint64_t addr, void* out, size_t len) const {
     if (!uc_) return false;
-    return uc_mem_read(eng(uc_), addr, out, len) == UC_ERR_OK;
+    return uc_mem_read(eng(uc_), fold_addr(addr), out, len) == UC_ERR_OK;
 }
 
 } // namespace slop::core::emu

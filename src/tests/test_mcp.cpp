@@ -874,6 +874,60 @@ TEST_CASE(mcp_emulate_rejects_bad_input) {
     REQUIRE(is_error);                       // unknown action
 }
 
+TEST_CASE(mcp_emulate_reports_exceptions_syscalls_and_mode) {
+    server_fixture_t fx;
+    bool is_error = true;
+
+    // hlt: a privileged instruction in user mode, the default
+    json payload = fx.call("emulate", {{"action", "run"}, {"hex", "F4C3"}}, is_error);
+    REQUIRE(!is_error);
+    REQUIRE_STR_EQ(payload.value("stopped_reason", "").c_str(), "cpu_exception");
+    REQUIRE_STR_EQ(payload.value("mode", "").c_str(), "user");
+    const auto& ex = payload.at("exception");
+    REQUIRE_STR_EQ(ex.value("name", "").c_str(), "privileged_instruction");
+    REQUIRE_EQ(ex.value("vector", -1), 13);
+    REQUIRE_EQ(ex.value("code", 0u), 0xC0000096u);
+    REQUIRE_EQ(ex.value("ip", 0ull), 0x400000ull);
+
+    // the same bytes as driver code
+    payload = fx.call("emulate", {{"action", "run"}, {"hex", "F4C3"}, {"mode", "kernel"}},
+                      is_error);
+    REQUIRE(!is_error);
+    REQUIRE_STR_EQ(payload.value("stopped_reason", "").c_str(), "halt");
+    REQUIRE_STR_EQ(payload.value("mode", "").c_str(), "kernel");
+    REQUIRE(!payload.contains("exception"));
+
+    payload = fx.call("emulate", {{"action", "run"}, {"hex", "C3"}, {"mode", "ring9"}},
+                      is_error);
+    REQUIRE(is_error);
+
+    // mov eax,0x55 / syscall / ret: logged and answered with api_ret, no imports needed
+    payload = fx.call("emulate", {{"action", "run"}, {"hex", "B8550000000F05C3"},
+                                  {"api_ret", "0xC0000022"}}, is_error);
+    REQUIRE(!is_error);
+    REQUIRE_STR_EQ(payload.value("stopped_reason", "").c_str(), "return");
+    REQUIRE_EQ(payload.value("total_api_calls", 0u), 1u);
+    REQUIRE_STR_EQ(payload.at("api_calls").at(0).value("name", "").c_str(), "syscall:0x55");
+    REQUIRE_EQ(payload.at("regs").value("rax", 0ull), 0xC0000022ull);
+
+    // vpxor xmm0,xmm1,xmm2: refused with a note, not computed as pxor xmm0,xmm2
+    payload = fx.call("emulate", {{"action", "run"}, {"hex", "C5F1EFC2C3"}}, is_error);
+    REQUIRE(!is_error);
+    REQUIRE_STR_EQ(payload.value("stopped_reason", "").c_str(), "unsupported_insn");
+    REQUIRE(payload.value("note", "").find("AVX") != std::string::npos);
+
+    // f3 a4 over 4 bytes: one trace line carrying the iteration count
+    // lea rsi,[rip+0x10] / lea rdi,[rsi+8] / mov ecx,4 / rep movsb / ret
+    payload = fx.call("emulate", {{"action", "run"},
+                                  {"hex", "488D3510000000488D7E08B904000000F3A4C3"},
+                                  {"trace", true}}, is_error);
+    REQUIRE(!is_error);
+    REQUIRE_STR_EQ(payload.value("stopped_reason", "").c_str(), "return");
+    REQUIRE_EQ(payload.at("trace").size(), 5u);
+    REQUIRE_EQ(payload.at("trace").at(3).value("repeat", 0u), 4u);
+    REQUIRE(!payload.at("trace").at(0).contains("repeat"));
+}
+
 TEST_CASE(mcp_emulate_file_addr_runs_past_the_slice_on_rebased_image) {
     // Entry stub is sub rsp / call __security_init_cookie / add rsp / jmp:
     // the old 64-byte window died on the first far branch. Rebased, the
@@ -916,7 +970,18 @@ TEST_CASE(mcp_emulate_file_addr_runs_past_the_slice_on_rebased_image) {
     REQUIRE(!calls.empty());
     REQUIRE(calls.at(0).value("name", "").find('!') != std::string::npos);
     REQUIRE_GE(calls.at(0).value("ip", 0ull), kBase);
+    REQUIRE(calls.at(0).contains("rax"));
     REQUIRE(rebased.at("regs").contains("gs_base"));
+    REQUIRE_STR_EQ(rebased.value("mode", "").c_str(), "user");   // an exe, not a driver
+    // the CRT's lock setup is modeled, so startup gets past it on its own
+    auto modeled_cs_init = [](const json& payload) {
+        for (const auto& c : payload.at("api_calls"))
+            if (c.value("name", "").find("InitializeCriticalSection") != std::string::npos &&
+                c.value("model", false))
+                return true;
+        return false;
+    };
+    REQUIRE(modeled_cs_init(rebased));
     // the headers page comes back through the image source
     REQUIRE_STR_EQ(rebased.at("memory").at(0).value("hex", "").c_str(), "4d5a");
 
@@ -929,12 +994,21 @@ TEST_CASE(mcp_emulate_file_addr_runs_past_the_slice_on_rebased_image) {
 
     // per-import returns, unmatched keys reported back
     const auto [b2, tuned] = run_entry(kBase, {{"api_returns",
-        {{"InitializeCriticalSectionAndSpinCount", 1}, {"nope.dll!Missing", -1}}}});
+        {{"InitializeCriticalSectionAndSpinCount", 0}, {"nope.dll!Missing", -1}}}});
     REQUIRE_EQ(tuned.at("api_returns_unmatched").size(), 1u);
     REQUIRE_STR_EQ(tuned.at("api_returns_unmatched").at(0).get<std::string>().c_str(),
                    "nope.dll!missing");
-    // with critical-section init succeeding the CRT goes on past its failure path
-    REQUIRE_GT(tuned.value("total_api_calls", 0u), rebased.value("total_api_calls", 0u));
+    // a per-import value wins over the import's model: with critical-section
+    // init failing the CRT takes its failure path instead of going on
+    REQUIRE(!modeled_cs_init(tuned));
+    REQUIRE_LT(tuned.value("total_api_calls", 0u), rebased.value("total_api_calls", 0u));
+
+    // api_models=false: every import is the plain api_ret stub, and startup
+    // stops where the first one that had to do something did nothing
+    const auto [b4, plain] = run_entry(kBase, {{"api_models", false}});
+    for (const auto& c : plain.at("api_calls")) REQUIRE(!c.value("model", true));
+    REQUIRE(!plain.contains("heap_used"));
+    REQUIRE_LT(plain.value("total_api_calls", 0u), rebased.value("total_api_calls", 0u));
 
     // page_in=false keeps the old slice-only behavior
     const auto [b3, slice] = run_entry(kBase, {{"code_len", 16}, {"page_in", false},
