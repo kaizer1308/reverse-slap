@@ -8,6 +8,7 @@
 #include "core/runtime/backend_usermode.hpp"
 
 #include <memory>
+#include <mutex>
 
 namespace voyager {
 class device_t;
@@ -89,6 +90,8 @@ private:
     backend_usermode_t                 user_;
     std::unique_ptr<voyager::device_t> dev_;
     bool                               hwbp_supported_ = false;
+    std::mutex                         context_mu_;
+    uint32_t                           context_owner_ = 0;
 };
 
 } // namespace slop::core::runtime

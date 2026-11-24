@@ -8,10 +8,12 @@ session_t::~session_t() {
 }
 
 session_t::session_t(session_t&& other) noexcept
-    : m_handle(other.m_handle)
+    : m_backend(other.m_backend)
+    , m_handle(other.m_handle)
     , m_info(std::move(other.m_info))
     , m_epoch_ms(other.m_epoch_ms)
 {
+    other.m_backend = nullptr;
     other.m_handle = {};
     other.m_epoch_ms = 0;
 }
@@ -19,9 +21,11 @@ session_t::session_t(session_t&& other) noexcept
 session_t& session_t::operator=(session_t&& other) noexcept {
     if (this != &other) {
         close();
+        m_backend  = other.m_backend;
         m_handle   = other.m_handle;
         m_info     = std::move(other.m_info);
         m_epoch_ms = other.m_epoch_ms;
+        other.m_backend  = nullptr;
         other.m_handle   = {};
         other.m_epoch_ms = 0;
     }
@@ -30,10 +34,11 @@ session_t& session_t::operator=(session_t&& other) noexcept {
 
 bool session_t::open(uint32_t pid) {
     close();
-    m_handle = active().attach(pid);
+    m_backend = &active();
+    m_handle = m_backend->attach(pid);
     if (!m_handle.valid()) return false;
     m_info.pid = pid;
-    if (auto procs = active().enum_processes(); procs.ok) {
+    if (auto procs = m_backend->enum_processes(); procs.ok) {
         for (const auto& p : procs.items) {
             if (p.pid == pid) { m_info = p; break; }
         }
@@ -45,8 +50,9 @@ bool session_t::open(uint32_t pid) {
 
 void session_t::close() {
     if (m_handle.valid()) {
-        active().detach(m_handle);
+        m_backend->detach(m_handle);
     }
+    m_backend = nullptr;
     m_handle = {};
     m_info   = {};
     m_epoch_ms = 0;
@@ -72,12 +78,14 @@ int64_t session_t::epoch_ms() const noexcept {
     return m_epoch_ms;
 }
 
-io_result_t session_t::read(uintptr_t addr, void* buf, size_t len) {
-    return active().read_memory(m_handle, addr, buf, len);
+io_result_t session_t::read(uintptr_t addr, void* buf, size_t len) const {
+    if (!m_backend) return {};
+    return m_backend->read_memory(m_handle, addr, buf, len);
 }
 
-io_result_t session_t::write(uintptr_t addr, const void* buf, size_t len) {
-    return active().write_memory(m_handle, addr, buf, len);
+io_result_t session_t::write(uintptr_t addr, const void* buf, size_t len) const {
+    if (!m_backend) return {};
+    return m_backend->write_memory(m_handle, addr, buf, len);
 }
 
 const target_handle_t& session_t::handle() const noexcept {

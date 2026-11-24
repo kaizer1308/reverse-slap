@@ -240,10 +240,10 @@ const char* elevation_name(runtime::elevation_t e) {
     return "unknown";
 }
 
-runtime::session_t& need_session() {
+runtime::session_ref need_session() {
     auto s = process::active_session();
     if (!s || !s->valid()) fail("no target attached (use target.attach first)");
-    return *s;
+    return s;
 }
 
 uint64_t parse_addr(const json& args, const char* key) {
@@ -317,16 +317,16 @@ std::string require_action(const json& args) {
 
 class session_reader_t final : public memory::reader_t {
 public:
-    explicit session_reader_t(runtime::session_t& s) : s_(s) {}
+    explicit session_reader_t(const runtime::session_t& s) : s_(s) {}
     bool read(uintptr_t addr, void* dst, size_t len) override {
         auto io = s_.read(addr, dst, len);
         return io.ok && io.bytes == len;
     }
 private:
-    runtime::session_t& s_;
+    const runtime::session_t& s_;
 };
 
-std::vector<uintptr_t> committed_ranges(runtime::session_t& s) {
+std::vector<uintptr_t> committed_ranges(const runtime::session_t& s) {
     std::vector<uintptr_t> out;
     auto res = runtime::active().enum_regions(s.handle());
     if (!res.ok) return out;
@@ -1361,8 +1361,8 @@ json tool_target(const json& args) {
     }
 
     if (action == "modules") {
-        auto& s = need_session();
-        auto res = runtime::active().enum_modules(s.handle());
+        const auto s = need_session();
+        auto res = runtime::active().enum_modules(s->handle());
         if (!res.ok) fail("module enumeration failed");
         json arr = json::array();
         const size_t cap = std::min(res.items.size(), size_t{2048});
@@ -1377,7 +1377,7 @@ json tool_target(const json& args) {
     }
 
     if (action == "dump_module") {
-        auto& session = need_session();
+        const auto session = need_session();
         if (!args.contains("path") || !args.at("path").is_string())
             fail("dump_module requires output 'path'");
         const std::string output_path = args.at("path").get<std::string>();
@@ -1389,7 +1389,7 @@ json tool_target(const json& args) {
         if (requested_base == 0 && requested_name.empty())
             fail("dump_module requires module 'base' or 'name'");
 
-        auto modules = runtime::active().enum_modules(session.handle());
+        auto modules = runtime::active().enum_modules(session->handle());
         if (!modules.ok) fail("module enumeration failed");
 
         const runtime::module_info_t* selected = nullptr;
@@ -1405,7 +1405,7 @@ json tool_target(const json& args) {
 
         process::module_dump_options_t options;
         options.strict_reads = args.value("strict", true);
-        auto result = process::dump_module_pe(session, *selected, output_path, options);
+        auto result = process::dump_module_pe(*session, *selected, output_path, options);
         if (!result.ok) fail("module dump failed: " + result.error);
 
         bool loaded = false;
@@ -1428,7 +1428,7 @@ json tool_target(const json& args) {
     if (action == "threads") {
         uint32_t pid = 0;
         if (args.contains("pid")) pid = static_cast<uint32_t>(parse_addr(args, "pid"));
-        if (pid == 0) pid = need_session().pid();
+        if (pid == 0) pid = need_session()->pid();
         auto res = runtime::active().enum_threads(pid);
         if (!res.ok) fail("thread enumeration failed");
         json arr = json::array();
@@ -1443,8 +1443,8 @@ json tool_target(const json& args) {
     }
 
     if (action == "regions") {
-        auto& s = need_session();
-        auto res = runtime::active().enum_regions(s.handle());
+        const auto s = need_session();
+        auto res = runtime::active().enum_regions(s->handle());
         if (!res.ok) fail("region enumeration failed");
         json arr = json::array();
         const size_t cap = std::min(res.items.size(), size_t{8192});
@@ -1460,8 +1460,8 @@ json tool_target(const json& args) {
     }
 
     if (action == "handles") {
-        auto& s = need_session();
-        auto res = runtime::active().enum_handles(s.pid());
+        const auto s = need_session();
+        auto res = runtime::active().enum_handles(s->pid());
         if (!res.ok) fail("handle enumeration failed");
         json arr = json::array();
         const size_t cap = std::min(res.items.size(), size_t{2048});
@@ -1708,7 +1708,7 @@ json tool_memory(const json& args) {
         return out;
     }
 
-    auto& s = need_session();
+    const auto s = need_session();
 
     if (action == "write") {
         const uint64_t addr = parse_addr(args, "addr");
@@ -1716,13 +1716,13 @@ json tool_memory(const json& args) {
         auto bytes = hex_decode(args.at("hex").get<std::string>());
         if (bytes.empty()) fail("empty payload");
         if (bytes.size() > (1ull << 20)) fail("write capped at 1 MiB");
-        auto io = s.write(static_cast<uintptr_t>(addr), bytes.data(), bytes.size());
+        auto io = s->write(static_cast<uintptr_t>(addr), bytes.data(), bytes.size());
         if (!io.ok) fail("write failed at requested range");
         return {{"addr", addr}, {"written", io.bytes}};
     }
 
     if (action == "scan" || action == "rescan") {
-        session_reader_t reader(s);
+        session_reader_t reader(*s);
 
         // scan config straight from the request
         memory::scan_config_t cfg;
@@ -1820,7 +1820,7 @@ json tool_memory(const json& args) {
         }
 
         // region set comes from the active backend
-        auto regions = runtime::target_scan_regions(s.handle());
+        auto regions = runtime::target_scan_regions(s->handle());
 
         infra::cancel_token_t tok;
         std::string err;
@@ -1831,11 +1831,11 @@ json tool_memory(const json& args) {
             if (!g_scan.engine.first_scan(reader, std::move(regions), cfg, tok, &err))
                 fail(err.empty() ? "first scan failed" : err);
             g_scan.used = true;
-            g_scan.pid = s.pid();
+            g_scan.pid = s->pid();
         } else {
             if (!g_scan.used)
                 fail("no previous scan to rescan (run memory.scan first)");
-            if (g_scan.pid != s.pid())
+            if (g_scan.pid != s->pid())
                 fail("scan belongs to another target (run memory.scan first)");
             if (!g_scan.engine.next_scan(reader, cfg, tok, &err))
                 fail(err.empty() ? "rescan failed" : err);
@@ -1865,7 +1865,7 @@ json tool_memory(const json& args) {
         std::string err;
         auto pat = memory::aob_compile(args.at("pattern").get<std::string>(), err);
         if (!pat) fail("bad pattern: " + err);
-        session_reader_t reader(s);
+        session_reader_t reader(*s);
 
         memory::scan_config_t rcfg; // region preference carrier
         if (args.contains("begin") && args.contains("end")) {
@@ -1882,7 +1882,7 @@ json tool_memory(const json& args) {
         rcfg.mem_image = args.value("mem_image", true);
         rcfg.mem_mapped = args.value("mem_mapped", true);
         auto regions = memory::filter_regions(
-            runtime::target_scan_regions(s.handle()), rcfg);
+            runtime::target_scan_regions(s->handle()), rcfg);
         if (regions.empty()) fail("no committed ranges");
 
         memory::aob_scan_options_t opt;
@@ -1911,7 +1911,7 @@ json tool_memory(const json& args) {
         const uint64_t len  = parse_addr(args.contains("len") ? args : json{{"len", 4096}}, "len");
         const uint32_t prot = static_cast<uint32_t>(parse_addr(args, "prot"));
         uint32_t old = 0;
-        auto io = runtime::active().protect_memory(s.handle(), static_cast<uintptr_t>(addr),
+        auto io = runtime::active().protect_memory(s->handle(), static_cast<uintptr_t>(addr),
                                                    static_cast<size_t>(len), prot, &old);
         if (!io.ok) fail("protect failed (kernel backend required for cross-process protect)");
         return {{"addr", addr}, {"len", len}, {"old_protect", old}};
@@ -1921,7 +1921,7 @@ json tool_memory(const json& args) {
         const uint64_t len = parse_addr(args, "len");
         if (len == 0 || len > (64ull << 20)) fail("alloc len out of range (1 byte .. 64 MiB)");
         uintptr_t out = 0;
-        auto io = runtime::active().allocate_memory(s.handle(), 0, static_cast<size_t>(len),
+        auto io = runtime::active().allocate_memory(s->handle(), 0, static_cast<size_t>(len),
                                                     0x40 /*PAGE_EXECUTE_READWRITE*/, &out);
         if (!io.ok) fail("alloc failed (kernel backend required for cross-process alloc)");
         return {{"addr", static_cast<uint64_t>(out)}, {"len", len}};
@@ -1929,7 +1929,7 @@ json tool_memory(const json& args) {
 
     if (action == "free") {
         const uint64_t addr = parse_addr(args, "addr");
-        auto io = runtime::active().free_memory(s.handle(), static_cast<uintptr_t>(addr));
+        auto io = runtime::active().free_memory(s->handle(), static_cast<uintptr_t>(addr));
         if (!io.ok) fail("free failed (kernel backend required for cross-process free)");
         return {{"freed", true}};
     }
@@ -1966,7 +1966,7 @@ json tool_memory(const json& args) {
         rcfg.mem_image = args.value("mem_image", true);
         rcfg.mem_mapped = args.value("mem_mapped", true);
         auto regions = memory::filter_regions(
-            runtime::target_scan_regions(s.handle()), rcfg);
+            runtime::target_scan_regions(s->handle()), rcfg);
         if (regions.empty()) fail("no committed ranges");
 
         if (!args.contains("begin") || !args.contains("end")) {
@@ -1991,7 +1991,7 @@ json tool_memory(const json& args) {
             }
         }
 
-        session_reader_t reader(s);
+        session_reader_t reader(*s);
         infra::cancel_token_t tok;
         memory::pointer_scan_stats_t stats{};
         auto chains = memory::pointer_scan(reader, regions, opt, tok, &stats);
@@ -2020,7 +2020,7 @@ json tool_memory(const json& args) {
             args.contains("max_bytes") ? parse_addr(args, "max_bytes") : (16ull << 20),
             infra::limits::max_snapshot_region_bytes);
 
-        session_reader_t reader(s);
+        session_reader_t reader(*s);
         infra::cancel_token_t tok;
         mcp_snapshot_t rec;
         rec.id  = g_snap_next_id++;
@@ -2060,7 +2060,7 @@ json tool_memory(const json& args) {
         if (!eng.ok() && !eng.init()) fail("zydis engine init failed");
 
         std::vector<uint8_t> buf(len);
-        auto io = s.read(static_cast<uintptr_t>(addr), buf.data(), buf.size());
+        auto io = s->read(static_cast<uintptr_t>(addr), buf.data(), buf.size());
         if (!io.ok || io.bytes < len) fail("cannot read signature region");
 
         std::string pat;
@@ -2096,12 +2096,12 @@ json tool_memory(const json& args) {
         if (pat.empty()) fail("nothing decodable at that address");
 
         // check the pattern is unique across memory
-        session_reader_t reader(s);
+        session_reader_t reader(*s);
         infra::cancel_token_t tok;
         memory::aob_stats_t stats{};
         uint64_t hits_total = 0;
         auto regions = memory::filter_regions(
-            runtime::target_scan_regions(s.handle()), memory::scan_config_t{});
+            runtime::target_scan_regions(s->handle()), memory::scan_config_t{});
         if (!regions.empty()) {
             constexpr uint64_t kSpanCap = 512ull << 20;
             const uint64_t lo = regions.front().base;
@@ -2149,7 +2149,7 @@ json tool_memory(const json& args) {
                 }
             }
             if (!begin) {
-                auto ranges = committed_ranges(s);
+                auto ranges = committed_ranges(*s);
                 if (ranges.empty()) fail("no committed ranges and no loaded image");
                 begin = ranges.front();
                 end   = ranges.back();
@@ -2162,7 +2162,7 @@ json tool_memory(const json& args) {
 
         auto& eng = shared_engine();
         std::vector<uint8_t> buf(static_cast<size_t>(cap));
-        auto io = s.read(static_cast<uintptr_t>(begin), buf.data(), buf.size());
+        auto io = s->read(static_cast<uintptr_t>(begin), buf.data(), buf.size());
         if (!io.ok || io.bytes == 0) fail("cannot read target range");
         const size_t limit = std::min<size_t>(args.value("limit", 256u), 1000u);
         auto hits = xray::crypto_range_bytes(begin, buf.data(), io.bytes,
@@ -2950,8 +2950,8 @@ json tool_debugger(const json& args) {
         if (!eng.ok() && !eng.init()) fail("zydis engine init failed");
 
         struct sess_reader final : unwind::reader_t {
-            runtime::session_t& s;
-            explicit sess_reader(runtime::session_t& s_) : s(s_) {}
+            const runtime::session_t& s;
+            explicit sess_reader(const runtime::session_t& s_) : s(s_) {}
             bool read(uint64_t addr, void* dst, size_t len) override {
                 auto io = s.read(static_cast<uintptr_t>(addr), dst, len);
                 return io.ok && io.bytes == len;
@@ -3011,8 +3011,8 @@ json tool_debugger(const json& args) {
         }
 
         struct sess_reader final : unwind::reader_t {
-            runtime::session_t& s;
-            explicit sess_reader(runtime::session_t& s_) : s(s_) {}
+            const runtime::session_t& s;
+            explicit sess_reader(const runtime::session_t& s_) : s(s_) {}
             bool read(uint64_t addr, void* dst, size_t len) override {
                 auto io = s.read(static_cast<uintptr_t>(addr), dst, len);
                 return io.ok && io.bytes == len;
@@ -3423,13 +3423,13 @@ json tool_driver(const json& args) {
 
     if (action == "find_references") {
         // scan for qwords equal to the value
-        auto& s = need_session();
+        const auto s = need_session();
         if (!args.contains("value")) fail("missing value");
         const uint64_t needle = parse_addr(args, "value");
         uint64_t begin = args.contains("begin") ? parse_addr(args, "begin") : 0;
         uint64_t end   = args.contains("end") ? parse_addr(args, "end") : 0;
         if (!begin || !end) {
-            auto ranges = committed_ranges(s);
+            auto ranges = committed_ranges(*s);
             if (ranges.empty()) fail("no committed ranges");
             begin = ranges.front();
             end = ranges.back();
@@ -3448,7 +3448,7 @@ json tool_driver(const json& args) {
             const size_t span = static_cast<size_t>(
                 std::min<uint64_t>(kWindow, end - cursor));
             buf.resize(span);
-            auto io = s.read(static_cast<uintptr_t>(cursor), buf.data(),
+            auto io = s->read(static_cast<uintptr_t>(cursor), buf.data(),
                              buf.size());
             if (!io.ok) { cursor += kWindow; continue; }
             for (size_t i = 0; i + 8 <= buf.size(); i += 4) {
@@ -3464,8 +3464,8 @@ json tool_driver(const json& args) {
     }
 
     if (action == "heap_walk") {
-        auto& s = need_session();
-        auto heaps = process::list_heaps(s.pid());
+        const auto s = need_session();
+        auto heaps = process::list_heaps(s->pid());
         json arr = json::array();
         for (const auto& h : heaps)
             arr.push_back({{"base", h.base}, {"size", h.size},
@@ -3474,10 +3474,10 @@ json tool_driver(const json& args) {
     }
 
     if (action == "heap_blocks") {
-        auto& s = need_session();
+        const auto s = need_session();
         if (!args.contains("base")) fail("missing heap base");
         auto blocks = process::walk_heap_blocks(
-            s.pid(), parse_addr(args, "base"), nullptr,
+            s->pid(), parse_addr(args, "base"), nullptr,
             std::min<size_t>(args.value("limit", 4096u), 100000u));
         json arr = json::array();
         for (const auto& b : blocks)
@@ -7514,7 +7514,7 @@ json tool_types(const json& args) {
         if (!live || !sess || !sess->valid())
             fail("no image data for that address (attach a target or use a mapped VA)");
 
-        struct cb_ctx { runtime::session_t* s; } ctx{sess.get()};
+        struct cb_ctx { const runtime::session_t* s; } ctx{sess.get()};
         auto cb = [](uint64_t addr, void* dst, size_t len, void* user) -> bool {
             auto* c = static_cast<cb_ctx*>(user);
             auto io = c->s->read(static_cast<uintptr_t>(addr), dst, len);

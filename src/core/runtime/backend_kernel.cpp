@@ -143,6 +143,8 @@ target_handle_t& backend_kernel_t::ensure_user_handle(target_handle_t& h) {
 target_handle_t backend_kernel_t::attach(uint32_t pid) {
     if (!connect()) return {};
 
+    std::lock_guard lk(context_mu_);
+    const uint32_t attach_id = ++context_owner_;
     dev_->clear_process_context();
     dev_->set_process_id(pid);
     const uint64_t dtb = dev_->solve_dtb_for_pid(pid);
@@ -162,12 +164,15 @@ target_handle_t backend_kernel_t::attach(uint32_t pid) {
     // braces against PEB-based checks even when nothing is being debugged
     if (infra::settings::stealth_peb_spoof()) dev_->spoof_debug_flags();
 
-    return target_handle_t{ kernel_sentinel(), pid };
+    return target_handle_t{ kernel_sentinel(), pid, attach_id };
 }
 
 void backend_kernel_t::detach(target_handle_t& h) {
-    if (h.valid() && dev_ && dev_->is_connected()) {
-        dev_->clear_process_context();
+    {
+        std::lock_guard lk(context_mu_);
+        if (h.valid() && h.attach_id == context_owner_ && dev_ && dev_->is_connected()) {
+            dev_->clear_process_context();
+        }
     }
     if (h.native != nullptr && h.native != kernel_sentinel()) {
         // A lazy real handle (from ensure_user_handle), close it properly

@@ -6,7 +6,10 @@
 #include "harness.hpp"
 
 #include "core/disasm/binary_state.hpp"
+#include "core/process/target_service.hpp"
 #include "core/script/lua_engine.hpp"
+
+#include <windows.h>
 
 #include <string>
 
@@ -110,6 +113,68 @@ TEST_CASE(lua_no_target_errors_are_lua_errors_not_crashes) {
     // No target attached in unit tests -> must fail cleanly with message
     REQUIRE(!r.ok);
     REQUIRE(r.error.find("no target") != std::string::npos);
+}
+
+TEST_CASE(lua_memory_bindings_use_the_target_and_release_it_on_error) {
+    namespace process = slop::core::process;
+    if (!process::target_attach(GetCurrentProcessId())) {
+        std::printf("  [skip] cannot attach to the test process\n");
+        return;
+    }
+    struct detach_on_exit_t {
+        ~detach_on_exit_t() { slop::core::process::target_detach(); }
+    } cleanup;
+
+    static const char marker[] = "slop-lua-marker";
+    auto r = lua_run("assert(slop.mem.read_hex(" +
+                     std::to_string(reinterpret_cast<uintptr_t>(marker)) + ", " +
+                     std::to_string(sizeof(marker) - 1) + ") == \"slop-lua-marker\")");
+    dump_on_fail(r);
+    REQUIRE(r.ok);
+
+    static volatile uint8_t scratch[4] = {};
+    r = lua_run("assert(slop.mem.write_hex(" +
+                std::to_string(reinterpret_cast<uintptr_t>(&scratch[0])) +
+                R"(, "de ad be ef") == 4))");
+    dump_on_fail(r);
+    REQUIRE(r.ok);
+    REQUIRE_EQ(scratch[0], uint8_t{0xDE});
+    REQUIRE_EQ(scratch[3], uint8_t{0xEF});
+
+    alignas(8) static volatile uint32_t needle = 0x51A7C0DE;
+    const auto needle_at = reinterpret_cast<uintptr_t>(&needle);
+    const uintptr_t needle_page = needle_at & ~uintptr_t{0xFFF};
+    r = lua_run("local hits = slop.mem.scan({ kind = 'exact', width = 'u32', value = " +
+                std::to_string(uint32_t{needle}) + ", begin = " + std::to_string(needle_page) +
+                ", ['end'] = " + std::to_string(needle_page + 0x1000) + " })" +
+                " local found = false" +
+                " for _, at in ipairs(hits) do found = found or at == " +
+                std::to_string(needle_at) +
+                " end assert(found, 'needle not in ' .. #hits .. ' hits')");
+    dump_on_fail(r);
+    REQUIRE(r.ok);
+
+    r = lua_run("local st = slop.target.status() assert(st.attached and st.pid == " +
+                std::to_string(GetCurrentProcessId()) + ")");
+    dump_on_fail(r);
+    REQUIRE(r.ok);
+
+    const auto held = process::active_session();
+    REQUIRE(held != nullptr);
+    const long holders = held.use_count();
+    for (const char* failing : {
+             "slop.mem.read_hex(16, 0)",
+             "slop.mem.read_hex(16, 16)",
+             "slop.mem.write_hex(16, \"zz\")",
+             "slop.mem.write_hex(16, \"00\")",
+             "slop.mem.scan(5)",
+             "slop.disasm.disassemble(16, 4)",
+         }) {
+        r = lua_run(failing);
+        REQUIRE_FALSE(r.ok);
+        if (r.ok) std::printf("  detail: expected an error from %s\n", failing);
+    }
+    REQUIRE_EQ(held.use_count(), holders);
 }
 
 TEST_CASE(lua_timeout_kills_infinite_loop) {

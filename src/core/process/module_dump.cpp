@@ -272,7 +272,7 @@ module_dump_result_t reconstruct_mapped_pe(
 }
 
 module_dump_result_t dump_module_pe(
-    runtime::session_t& session, const runtime::module_info_t& module,
+    const runtime::session_t& session, const runtime::module_info_t& module,
     const std::string& output_path, const module_dump_options_t& options) {
     std::vector<uint8_t> image;
     auto result = reconstruct_mapped_pe(

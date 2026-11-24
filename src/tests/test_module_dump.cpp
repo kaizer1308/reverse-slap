@@ -2,16 +2,20 @@
 
 #include "core/disasm/pe_parser.hpp"
 #include "core/process/module_dump.hpp"
+#include "core/process/target_service.hpp"
 #include "core/runtime/backend_registry.hpp"
 #include "core/runtime/session.hpp"
 
 #include <windows.h>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -85,6 +89,23 @@ slop::core::process::module_read_fn_t reader_for(
         result.bytes = size;
         return result;
     };
+}
+
+struct detach_on_exit_t {
+    ~detach_on_exit_t() { slop::core::process::target_detach(); }
+};
+
+bool attach_to_self() {
+    if (slop::core::process::target_attach(GetCurrentProcessId())) return true;
+    std::printf("  [skip] cannot attach to the test process\n");
+    return false;
+}
+
+bool reads_marker(const slop::core::runtime::session_t& session) {
+    static const uint64_t marker = 0x5E5510A7A11FE5ull;
+    uint64_t seen = 0;
+    const auto io = session.read(reinterpret_cast<uintptr_t>(&marker), &seen, sizeof(seen));
+    return io.ok && seen == marker;
 }
 
 } // namespace
@@ -177,4 +198,81 @@ TEST_CASE(module_dump_captures_live_test_process) {
     std::error_code ec;
     std::filesystem::remove(path, ec);
     session.close();
+}
+
+TEST_CASE(target_session_keeps_working_for_a_holder_after_detach) {
+    using namespace slop::core;
+    const detach_on_exit_t cleanup;
+    if (!attach_to_self()) return;
+    const auto held = process::active_session();
+    REQUIRE(held != nullptr);
+    REQUIRE(held->valid());
+
+    process::target_detach();
+    REQUIRE(process::active_session() == nullptr);
+    REQUIRE(held->valid());
+    REQUIRE_EQ(held->pid(), static_cast<uint32_t>(GetCurrentProcessId()));
+    REQUIRE(reads_marker(*held));
+}
+
+TEST_CASE(target_reattach_leaves_earlier_holders_working) {
+    using namespace slop::core;
+    const detach_on_exit_t cleanup;
+    if (!attach_to_self()) return;
+    auto first = process::active_session();
+    REQUIRE(first != nullptr);
+
+    if (!attach_to_self()) return;
+    const auto second = process::active_session();
+    REQUIRE(second != nullptr);
+    REQUIRE(first != second);
+    REQUIRE(reads_marker(*first));
+
+    first.reset();
+    REQUIRE(second->valid());
+    REQUIRE(reads_marker(*second));
+}
+
+TEST_CASE(target_session_reads_survive_concurrent_reattach) {
+    using namespace slop::core;
+    if (runtime::active_kind() != runtime::backend_kind_t::user_mode) {
+        std::printf("  [skip] the driver holds one process context, a re-attach "
+                    "interrupts reads through an earlier session\n");
+        return;
+    }
+    const detach_on_exit_t cleanup;
+    if (!attach_to_self()) return;
+
+    std::atomic<bool> stop{false};
+    std::atomic<uint64_t> reads{0};
+    std::atomic<uint64_t> bad{0};
+    std::vector<std::thread> readers;
+    for (int i = 0; i < 2; ++i) {
+        readers.emplace_back([&stop, &reads, &bad] {
+            while (!stop.load()) {
+                const auto session = process::active_session();
+                if (!session) continue;
+                for (int burst = 0; burst < 2048 && !stop.load(); ++burst) {
+                    ++reads;
+                    if (!reads_marker(*session)) ++bad;
+                }
+            }
+        });
+    }
+
+    bool attached = true;
+    for (int i = 0; i < 24 && attached; ++i) {
+        const uint64_t mid_burst = reads.load() + 64;
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (reads.load() < mid_burst && std::chrono::steady_clock::now() < deadline)
+            std::this_thread::yield();
+        if (i % 2) process::target_detach();
+        attached = process::target_attach(GetCurrentProcessId());
+    }
+    stop.store(true);
+    for (auto& reader : readers) reader.join();
+
+    REQUIRE(attached);
+    REQUIRE_GT(reads.load(), uint64_t{0});
+    REQUIRE_EQ(bad.load(), uint64_t{0});
 }

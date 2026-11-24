@@ -33,13 +33,14 @@ public:
     int64_t            epoch_ms() const noexcept;
 
     // Hot-path forwarders
-    io_result_t read(uintptr_t addr, void* buf, size_t len);
-    io_result_t write(uintptr_t addr, const void* buf, size_t len);
+    io_result_t read(uintptr_t addr, void* buf, size_t len) const;
+    io_result_t write(uintptr_t addr, const void* buf, size_t len) const;
 
     // Access to underlying handle
     const target_handle_t& handle() const noexcept;
 
 private:
+    backend_t*      m_backend = nullptr;
     target_handle_t m_handle{};
     process_info_t  m_info{};
     int64_t         m_epoch_ms = 0;

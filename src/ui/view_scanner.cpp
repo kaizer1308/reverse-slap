@@ -118,7 +118,7 @@ constexpr value_width_t kWidths[] = {
 
 constexpr int kAlignments[] = { 1, 4, 8 };
 
-using session_ref_t = std::shared_ptr<runtime::session_t>;
+using session_ref_t = runtime::session_ref;
 void DrawWatchTable(const session_ref_t& session);
 void DrawPointerScan(const session_ref_t& session);
 
@@ -315,7 +315,6 @@ void DrawPointerScan(const session_ref_t& session) {
             panels::AppendBootLog("pointer scan: bad target address");
         } else {
             g_pscan = std::make_shared<pointer_shared_t>();
-            auto handle = session->handle();
 
             core::memory::pointer_scan_options_t popt;
             popt.target      = target;
@@ -329,9 +328,9 @@ void DrawPointerScan(const session_ref_t& session) {
             d.label = "pointer scan";
             d.owner = "scanner";
             d.cancellable = true;
-            d.body = [handle, popt](infra::job_context_t& ctx) {
-                runtime::backend_reader_t r(runtime::active(), handle);
-                auto regions = runtime::target_scan_regions(handle);
+            d.body = [session, popt](infra::job_context_t& ctx) {
+                runtime::backend_reader_t r(runtime::active(), session->handle());
+                auto regions = runtime::target_scan_regions(session->handle());
 
                 core::memory::pointer_scan_stats_t total{};
                 auto chains = core::memory::pointer_scan(r, regions, popt,
@@ -456,16 +455,15 @@ void Draw() {
         if (!has_state) {
             if (ImGui::Button("First Scan") && value_ok) {
                 g_scan = std::make_shared<scan_state_t>();
-                auto handle = session->handle();
                 const auto config = cfg;
 
                 infra::job_desc_t d;
                 d.label = "scan: first pass (CE engine)";
                 d.owner = "scanner";
                 d.cancellable = true;
-                d.body = [handle, config](infra::job_context_t& ctx) {
-                    runtime::backend_reader_t r(runtime::active(), handle);
-                    auto regions = runtime::target_scan_regions(handle);
+                d.body = [session, config](infra::job_context_t& ctx) {
+                    runtime::backend_reader_t r(runtime::active(), session->handle());
+                    auto regions = runtime::target_scan_regions(session->handle());
                     std::string err;
                     g_scan->engine.first_scan(r, std::move(regions), config,
                                               ctx.cancel(), &err);
@@ -483,15 +481,14 @@ void Draw() {
                 ++g_passes;
             }
         } else if (ImGui::Button("Next Scan") && value_ok) {
-            auto handle = session->handle();
             const auto config = cfg;
 
             infra::job_desc_t d;
             d.label = "scan: next pass (CE engine)";
             d.owner = "scanner";
             d.cancellable = true;
-            d.body = [handle, config](infra::job_context_t& ctx) {
-                runtime::backend_reader_t r(runtime::active(), handle);
+            d.body = [session, config](infra::job_context_t& ctx) {
+                runtime::backend_reader_t r(runtime::active(), session->handle());
                 std::string err;
                 g_scan->engine.next_scan(r, config, ctx.cancel(), &err);
                 if (!err.empty())

@@ -9,10 +9,11 @@ namespace slop::core::process {
 
 namespace {
 
-// the session is mutated from mcp workers and read from the ui, every
-// access takes the lock and hands out a copy
+// the session is replaced from mcp workers and read from the ui, every
+// access takes the lock and hands out a reference. A published session never
+// changes again, it is torn down when its last holder lets go
 std::mutex g_session_mu;
-std::shared_ptr<runtime::session_t> g_session;
+runtime::session_ref g_session;
 
 } // namespace
 
@@ -27,12 +28,9 @@ void target_shutdown() {
 bool target_attach(uint32_t pid) {
     std::lock_guard lk(g_session_mu);
 
-    // tear the old session down before opening the new one or its destructor
-    // clears the new context
-    if (g_session) {
-        g_session->close();
-        g_session.reset();
-    }
+    // let go of the old session before opening the new one, a reader still
+    // holding it keeps a session that works until that reader is done
+    g_session.reset();
 
     auto s = std::make_shared<runtime::session_t>();
     if (!s->open(pid)) return false;
@@ -42,13 +40,10 @@ bool target_attach(uint32_t pid) {
 
 void target_detach() {
     std::lock_guard lk(g_session_mu);
-    if (g_session) {
-        g_session->close();
-        g_session.reset();
-    }
+    g_session.reset();
 }
 
-std::shared_ptr<runtime::session_t> active_session() {
+runtime::session_ref active_session() {
     std::lock_guard lk(g_session_mu);
     return g_session;
 }
@@ -56,7 +51,7 @@ std::shared_ptr<runtime::session_t> active_session() {
 void target_tick() {
     // Heartbeat: drop the session if the target died. Work on a local copy  
     // the session may be replaced concurrently by an MCP attach
-    std::shared_ptr<runtime::session_t> s;
+    runtime::session_ref s;
     {
         std::lock_guard lk(g_session_mu);
         s = g_session;
@@ -70,10 +65,7 @@ void target_tick() {
                                    [pid](const runtime::process_info_t& p) { return p.pid == pid; });
     if (!alive) {
         std::lock_guard lk(g_session_mu);
-        if (g_session == s) {
-            g_session->close();
-            g_session.reset();
-        }
+        if (g_session == s) g_session.reset();
     }
 }
 

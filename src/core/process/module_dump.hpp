@@ -43,7 +43,7 @@ module_dump_result_t reconstruct_mapped_pe(
 // dump one module through the active session, works with rpm and the
 // driver alike
 module_dump_result_t dump_module_pe(
-    runtime::session_t& session,
+    const runtime::session_t& session,
     const runtime::module_info_t& module,
     const std::string& output_path,
     const module_dump_options_t& options = {});

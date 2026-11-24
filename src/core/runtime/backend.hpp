@@ -95,6 +95,7 @@ struct thread_context_t {
 struct target_handle_t {
     void*    native  = nullptr;
     uint32_t pid     = 0;
+    uint32_t attach_id = 0;
     bool     valid() const noexcept { return native != nullptr && pid != 0; }
 };
 

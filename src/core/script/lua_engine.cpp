@@ -188,22 +188,22 @@ int l_target_status(lua_State* L) {
     lua_pushstring(L, runtime::active_badge());
     lua_setfield(L, -2, "backend");
     auto s = process::active_session();
-    lua_pushboolean(L, session_valid());
+    const bool attached = s && s->valid();
+    lua_pushboolean(L, attached);
     lua_setfield(L, -2, "attached");
-    if (session_valid()) {
-        auto s2 = process::active_session();
-        lua_pushinteger(L, s2->pid());         lua_setfield(L, -2, "pid");
-        lua_pushstring(L, s2->name().c_str()); lua_setfield(L, -2, "name");
+    if (attached) {
+        lua_pushinteger(L, s->pid());         lua_setfield(L, -2, "pid");
+        lua_pushstring(L, s->name().c_str()); lua_setfield(L, -2, "name");
     }
     return 1;
 }
 
 // memory
 
-runtime::session_t& need_session_lua(lua_State* L) {
+runtime::session_ref need_session_lua(lua_State* L) {
     auto s = process::active_session();
     if (!s || !s->valid()) lua_fail(L, "no target attached");
-    return *s;
+    return s;
 }
 
 std::vector<uint8_t> hex_decode_str(const std::string& hex, bool* ok) {
@@ -224,26 +224,26 @@ std::vector<uint8_t> hex_decode_str(const std::string& hex, bool* ok) {
 }
 
 int l_mem_read(lua_State* L) {
-    auto& s = need_session_lua(L);
+    const auto s = need_session_lua(L);
     const uint64_t addr = to_addr(L, 1);
     const uint64_t len = to_addr(L, 2);
     if (len == 0 || len > (1ull << 20)) return lua_fail(L, "bad length");
     std::vector<uint8_t> buf(static_cast<size_t>(len));
-    auto io = s.read(static_cast<uintptr_t>(addr), buf.data(), buf.size());
+    auto io = s->read(static_cast<uintptr_t>(addr), buf.data(), buf.size());
     if (!io.ok) return lua_fail(L, "read failed");
     lua_pushlstring(L, reinterpret_cast<const char*>(buf.data()), buf.size());
     return 1;
 }
 
 int l_mem_write(lua_State* L) {
-    auto& s = need_session_lua(L);
+    const auto s = need_session_lua(L);
     const uint64_t addr = to_addr(L, 1);
     size_t hex_len = 0;
     const char* hex = luaL_checklstring(L, 2, &hex_len);
     bool ok = false;
     auto bytes = hex_decode_str(std::string(hex, hex_len), &ok);
     if (!ok || bytes.empty()) return lua_fail(L, "bad hex payload");
-    auto io = s.write(static_cast<uintptr_t>(addr), bytes.data(), bytes.size());
+    auto io = s->write(static_cast<uintptr_t>(addr), bytes.data(), bytes.size());
     if (!io.ok) return lua_fail(L, "write failed");
     lua_pushinteger(L, static_cast<lua_Integer>(io.bytes));
     return 1;
@@ -264,8 +264,8 @@ memory::value_width_t parse_width(const std::string& w) {
 }
 
 struct lua_reader_t final : memory::reader_t {
-    runtime::session_t& s;
-    explicit lua_reader_t(runtime::session_t& sess) : s(sess) {}
+    const runtime::session_t& s;
+    explicit lua_reader_t(const runtime::session_t& sess) : s(sess) {}
     bool read(uintptr_t addr, void* dst, size_t len) override {
         auto io = s.read(addr, dst, len);
         return io.ok && io.bytes == len;
@@ -273,7 +273,7 @@ struct lua_reader_t final : memory::reader_t {
 };
 
 int l_mem_scan(lua_State* L) {
-    auto& sess = need_session_lua(L);
+    const auto sess = need_session_lua(L);
     luaL_checktype(L, 1, LUA_TTABLE);
 
     auto field_s = [&](const char* k) -> std::optional<std::string> {
@@ -324,10 +324,10 @@ int l_mem_scan(lua_State* L) {
     }
 
     infra::cancel_token_t tok;
-    lua_reader_t reader(sess);
+    lua_reader_t reader(*sess);
 
     // Region set from the active backend (driver ER path under slopdrvr)
-    auto regions = runtime::target_scan_regions(sess.handle());
+    auto regions = runtime::target_scan_regions(sess->handle());
 
     memory::memscan_t engine;
     std::string err;
@@ -353,7 +353,7 @@ disasm::engine_t& shared_engine() {
 }
 
 int l_disasm_disassemble(lua_State* L) {
-    auto& s = need_session_lua(L);
+    const auto s = need_session_lua(L);
     const uint64_t addr = to_addr(L, 1);
     const uint64_t count_req = to_addr(L, 2);
     const int count = static_cast<int>(
@@ -362,7 +362,7 @@ int l_disasm_disassemble(lua_State* L) {
     if (!eng.ok() && !eng.init()) return lua_fail(L, "zydis init failed");
 
     std::vector<uint8_t> buf(static_cast<size_t>(count) * 16 + 16);
-    auto io = s.read(static_cast<uintptr_t>(addr), buf.data(), buf.size());
+    auto io = s->read(static_cast<uintptr_t>(addr), buf.data(), buf.size());
     if (!io.ok) return lua_fail(L, "cannot read code range");
 
     lua_createtable(L, 0, count);

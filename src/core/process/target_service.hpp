@@ -24,7 +24,7 @@ bool target_attach(uint32_t pid);
 void target_detach();
 
 // Returns the active session, or nullptr if none
-std::shared_ptr<runtime::session_t> active_session();
+runtime::session_ref active_session();
 
 // Per-frame tick, drives deferred operations, heartbeat checks
 void target_tick();
