@@ -101,7 +101,7 @@ void reg_write(uc_engine* uc, int id, uint64_t v) { uc_reg_write(uc, id, &v); }
 // The block scan remembers which translation blocks it has looked at, and
 // in a one-bit-per-page hash filter which pages they came from, so a store
 // into code (self-modifying or unpacking) makes it look again
-struct scan_slot_t { uint64_t addr = ~0ull; uint32_t size = 0; };
+struct scan_slot_t { uint64_t addr = ~0ull; uint32_t size = 0; uint64_t gen = 0; };
 constexpr size_t kScanSlots       = 1024;
 constexpr size_t kCodeFilterWords = 1024;
 
@@ -155,7 +155,7 @@ struct run_ctx_t final : api_host_t {
     bool   page_in_exhausted = false;
     std::vector<uint8_t> page_buf = std::vector<uint8_t>(kPageSize);
 
-    uint64_t kuser_va = 0;                     // KUSER_SHARED_DATA once touched
+    std::array<uint64_t, 2> kuser_vas{};       // KUSER_SHARED_DATA once touched
     uint64_t slept_ns = 0;                     // virtual time spent in Sleep
 
     uint64_t heap_next   = kHeapBase + kPageSize;
@@ -173,8 +173,10 @@ struct run_ctx_t final : api_host_t {
 
     // instructions the cpu core would run with the wrong result
     std::array<scan_slot_t, kScanSlots> scanned{};
+    uint64_t scan_gen = 1;
     std::unordered_set<uint64_t> miscomputed;
     std::array<uint64_t, kCodeFilterWords> code_filter{};   // pages holding scanned code
+    std::vector<uint32_t> code_filter_set;
     bool     scanned_any = false;
     std::vector<uint8_t> scan_buf;
 
@@ -212,7 +214,9 @@ struct run_ctx_t final : api_host_t {
     void mark_code(uint64_t addr, uint64_t len) {
         for (uint64_t page = addr >> 12; page <= (addr + len - 1) >> 12; ++page) {
             const size_t bit = code_filter_bit(page);
-            code_filter[bit >> 6] |= 1ull << (bit & 63);
+            uint64_t& word = code_filter[bit >> 6];
+            if (!word) code_filter_set.push_back(static_cast<uint32_t>(bit >> 6));
+            word |= 1ull << (bit & 63);
         }
         scanned_any = true;
     }
@@ -221,9 +225,10 @@ struct run_ctx_t final : api_host_t {
         if (!scanned_any) return;
         for (uint64_t page = addr >> 12; page <= (addr + len - 1) >> 12; ++page) {
             if (!is_code_page(page)) continue;
-            scanned.fill({});
-            miscomputed.clear();
-            code_filter.fill(0);
+            ++scan_gen;
+            if (!miscomputed.empty()) miscomputed.clear();
+            for (const uint32_t w : code_filter_set) code_filter[w] = 0;
+            code_filter_set.clear();
             scanned_any = false;
             return;
         }
@@ -300,14 +305,17 @@ void fill_kuser(uint8_t* page, uint64_t now_ns) {
 void refresh_kuser(run_ctx_t* c) {
     uint8_t clocks[kKuserTickCount + 12] = {};
     put_kuser_clocks(clocks, c->clock_ns());
-    c->uc->write(c->kuser_va + kKuserInterruptTime, clocks + kKuserInterruptTime, 12);
-    c->uc->write(c->kuser_va + kKuserSystemTime, clocks + kKuserSystemTime, 12);
-    c->uc->write(c->kuser_va + kKuserTickCount, clocks + kKuserTickCount, 12);
+    for (const uint64_t va : c->kuser_vas) {
+        if (!va) continue;
+        c->uc->write(va + kKuserInterruptTime, clocks + kKuserInterruptTime, 12);
+        c->uc->write(va + kKuserSystemTime, clocks + kKuserSystemTime, 12);
+        c->uc->write(va + kKuserTickCount, clocks + kKuserTickCount, 12);
+    }
 }
 
 void run_ctx_t::sleep_ns(uint64_t ns) {
     slept_ns += ns;
-    if (kuser_va) refresh_kuser(this);
+    if (kuser_vas[0] || kuser_vas[1]) refresh_kuser(this);
 }
 
 // Bring one unmapped page in: from the page source, or synthesized when it
@@ -335,7 +343,7 @@ bool materialize(run_ctx_t* c, uint64_t page) {
         patch_slots(*c, page, page + kPageSize);
         ++c->paged_in;
     } else {
-        c->kuser_va = page;
+        c->kuser_vas[page == kKuserKernel ? 1 : 0] = page;
     }
     return true;
 }
@@ -803,8 +811,8 @@ void scan_block(run_ctx_t* c, uint64_t address, uint32_t size) {
 void hook_block(uc_engine*, uint64_t address, uint32_t size, void* user_data) {
     auto* c = static_cast<run_ctx_t*>(user_data);
     auto& slot = c->scanned[(address ^ (address >> 10)) & (kScanSlots - 1)];
-    if (slot.addr == address && slot.size == size) return;
-    slot = {address, size};
+    if (slot.addr == address && slot.size == size && slot.gen == c->scan_gen) return;
+    slot = {address, size, c->scan_gen};
     scan_block(c, address, size);
 }
 
@@ -839,7 +847,8 @@ void hook_code(uc_engine* uc, uint64_t address, uint32_t size, void* user_data) 
         uc_emu_stop(uc);
         return;
     }
-    if (address >= kStubBase && address < c->stub_end) {
+    if (address >= kStubBase && address < c->stub_end &&
+        (address - kStubBase) % kStubStride == 0) {
         on_import(uc, c, address);
         return;
     }
@@ -856,7 +865,8 @@ void hook_code(uc_engine* uc, uint64_t address, uint32_t size, void* user_data) 
 
     ++c->instructions;
     c->cur_ip = address;
-    if (c->kuser_va && (c->instructions & kClockRefreshMask) == 0) refresh_kuser(c);
+    if ((c->kuser_vas[0] || c->kuser_vas[1]) &&
+        (c->instructions & kClockRefreshMask) == 0) refresh_kuser(c);
 
     // Instruction text and operands only feed the trace and taint; skip the
     // per-instruction read + decode + format when neither wants them
@@ -1270,10 +1280,16 @@ run_result_t emulate_run(const run_request_t& req) {
 
     // Initial RSP with a return-address sentinel so clean leaf routines halt
     // deterministically with stopped_reason="return"
-    uint64_t rsp = req.sp_set ? req.sp
-                              : req.stack_base + req.stack_size - 0x1000;
-    rsp &= ~0x7ull;
-    rsp -= 8;
+    uint64_t rsp = 0;
+    if (const auto it = req.regs.find("rsp"); it != req.regs.end()) {
+        rsp = it->second;
+    } else {
+        const uint64_t headroom = std::min<uint64_t>(0x1000, req.stack_size / 2);
+        rsp = req.sp_set ? req.sp
+                         : req.stack_base + req.stack_size - headroom;
+        rsp &= ~0x7ull;
+        rsp -= 8;
+    }
     uint64_t ret_sentinel = kReturnPage;
     if (!uc.write(rsp, &ret_sentinel, sizeof(ret_sentinel))) {
         res.error = "stack sentinel write failed";

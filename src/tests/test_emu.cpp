@@ -120,6 +120,26 @@ TEST_CASE(emu_register_seeding_and_data_map) {
     REQUIRE_EQ(r.regs["rax"], 42u);
 }
 
+TEST_CASE(emu_smallest_stack_runs) {
+    auto req = base_req({0xB8, 0x02, 0x00, 0x00, 0x00,
+                         0xC3});
+    req.stack_size = 0x1000;
+    auto r = emulate_run(req);
+    REQUIRE(r.ok);
+    REQUIRE_STR_EQ(r.stopped_reason.c_str(), "return");
+    REQUIRE_EQ(r.regs["rax"], 2u);
+}
+
+TEST_CASE(emu_regs_rsp_is_the_entry_stack_pointer) {
+    auto req = base_req({0x48, 0x89, 0xE0,
+                         0xC3});
+    req.regs["rsp"] = 0x380000;
+    auto r = emulate_run(req);
+    REQUIRE(r.ok);
+    REQUIRE_STR_EQ(r.stopped_reason.c_str(), "return");
+    REQUIRE_EQ(r.regs["rax"], 0x380000ull);
+}
+
 TEST_CASE(taint_propagates_through_memory_load_store) {
     // mov al,[0x500000]      A0 00 00 30 00 00 00 00 00
     // mov [0x500100],al      88 04 25 00 01 30 00
@@ -1011,6 +1031,25 @@ TEST_CASE(emu_shared_user_data_page) {
     REQUIRE_EQ(r.paged_in, 1u);
 }
 
+TEST_CASE(emu_shared_user_data_clocks_advance_at_both_addresses) {
+    auto req = base_req({0x8B, 0x04, 0x25, 0x08, 0x00, 0xFE, 0x7F,
+                         0x48, 0xBB, 0x08, 0x00, 0x00, 0x00, 0x80, 0xF7, 0xFF, 0xFF,
+                         0x8B, 0x1B,
+                         0xB9, 0xA0, 0x86, 0x01, 0x00,
+                         0xFF, 0xC9,
+                         0x75, 0xFC,
+                         0x8B, 0x14, 0x25, 0x08, 0x00, 0xFE, 0x7F,
+                         0x48, 0xBE, 0x08, 0x00, 0x00, 0x00, 0x80, 0xF7, 0xFF, 0xFF,
+                         0x8B, 0x36,
+                         0xC3});
+    req.kernel_mode = true;
+    req.max_instructions = 1000000;
+    auto r = emulate_run(req);
+    REQUIRE_STR_EQ(r.stopped_reason.c_str(), "return");
+    REQUIRE_GT(r.regs["rdx"], r.regs["rax"]);
+    REQUIRE_GT(r.regs["rsi"], r.regs["rbx"]);
+}
+
 TEST_CASE(emu_teb_tls_and_peb_fields) {
     // mov rax,gs:[0x58] / mov rax,[rax+rcx*8] / mov eax,[rax+4] /
     // mov rdx,gs:[0x60] / mov ebx,[rdx+0x118] / mov rsi,[rdx+0x30] /
@@ -1180,6 +1219,28 @@ TEST_CASE(emu_api_model_overrides) {
     REQUIRE_EQ(r.regs["rax"], 0x1234u);
     REQUIRE(!r.api_calls[0].modeled);
     REQUIRE_EQ(r.heap_used, 0u);
+}
+
+TEST_CASE(emu_jump_into_stub_padding_is_not_an_import_call) {
+    auto req = base_req({0x48, 0x8B, 0x04, 0x25, 0x00, 0x20, 0x40, 0x00,
+                         0x48, 0xFF, 0xC0,
+                         0xFF, 0xE0});
+    req.imports.push_back({kIat, "kernel32.dll!GetLastError"});
+    emu_mem_region_t iat;
+    iat.addr = kIat;
+    iat.bytes.assign(0x100, 0);
+    req.maps.push_back(iat);
+    auto r = emulate_run(req);
+    REQUIRE_STR_EQ(r.stopped_reason.c_str(), "cpu_exception");
+    REQUIRE(r.exception.has_value());
+    REQUIRE_STR_EQ(r.exception->name.c_str(), "breakpoint");
+    REQUIRE(r.api_calls.empty());
+    REQUIRE_EQ(r.total_api_calls, 0u);
+
+    req.code.erase(req.code.begin() + 8, req.code.begin() + 11);
+    r = emulate_run(req);
+    REQUIRE_STR_EQ(r.stopped_reason.c_str(), "return");
+    REQUIRE_EQ(r.total_api_calls, 1u);
 }
 
 TEST_CASE(emu_api_model_exit_and_raise_stop_the_run) {
