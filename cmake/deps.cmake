@@ -220,6 +220,10 @@ target_include_directories(slop_lua PUBLIC "${lua_SOURCE_DIR}/src")
 target_compile_definitions(slop_lua PRIVATE
     LUA_USE_WINDOWS
 )
+# lua is built as c++ so its errors are c++ exceptions, a longjmp raise skips
+# or misruns the destructors of the c++ locals in the bindings it leaves
+get_target_property(_slop_lua_sources slop_lua SOURCES)
+set_source_files_properties(${_slop_lua_sources} PROPERTIES LANGUAGE CXX)
 if(MSVC)
     target_compile_options(slop_lua PRIVATE /W0)
 endif()

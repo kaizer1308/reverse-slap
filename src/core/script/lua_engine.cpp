@@ -11,7 +11,9 @@
 #include "core/runtime/backend_registry.hpp"
 #include "core/runtime/scan_bridge.hpp"
 
-#include <lua.hpp>
+#include <lua.h>
+#include <lualib.h>
+#include <lauxlib.h>
 
 #include <algorithm>
 #include <chrono>
@@ -74,8 +76,9 @@ int l_version(lua_State* L) {
 
 // helpers
 
-// raise lua errors from a dedicated noinline frame, longjmp on x64 walks
-// every frame and an inlined raise with c++ locals can crash the unwinder
+// raise lua errors from one place. lua is built as c++ (cmake/deps.cmake), so
+// the error is a c++ exception and the locals of the binding it leaves are
+// destroyed on the way out
 // the message goes through %s so dynamic content is never a format string
 __declspec(noinline) int lua_fail(lua_State* L, const char* msg) {
     return luaL_error(L, "%s", msg);
@@ -96,7 +99,7 @@ void push_str_array(lua_State* L, const std::vector<std::string>& v) {
 // the duration of one binding call (same contract the MCP tools use)
 
 // Requires a loaded image; errors (Lua-level) otherwise. Returns nothing on
-// failure (longjmp out of the binding)
+// failure (the error throws out of the binding)
 __declspec(noinline) bool need_image(lua_State* L) {
     if (ds::has_binary()) return true;
     lua_fail(L, "no image loaded in reverse-slop (slop.image.load a binary first)");
@@ -114,8 +117,8 @@ const char* xref_kind_name_lua(hype::XrefType t) {
     }
 }
 
-// lua errors longjmp past c++ destructors so never raise while a binary
-// lock is alive, capture the error, drop the lock, then raise
+// capture the error, drop the binary lock, then raise, so the lock is never
+// held while a lua error unwinds
 // and while the lock is held read bin fields directly since the helpers
 // re take the same mutex
 hs::session_t* pinned_hype(std::string& err) {
